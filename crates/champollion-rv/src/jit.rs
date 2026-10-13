@@ -13,6 +13,7 @@
 pub mod arm64;
 pub mod code;
 pub mod fault;
+pub mod profile;
 pub mod translate;
 
 use std::collections::HashMap;
@@ -65,6 +66,8 @@ pub struct Jit {
     /// per slot, with guest pc 1 (never a valid pc) marking an empty slot.
     jump_cache: Box<[[u64; 2]; translate::JUMP_CACHE_ENTRIES]>,
     pub stats: Stats,
+    /// Sampling profiler, if enabled with [`Jit::start_profiling`].
+    pub profiler: Option<profile::Profiler>,
 }
 
 /// Counters for `RVRUN_STATS`, to see where time goes outside generated code. The cheap
@@ -141,6 +144,7 @@ impl Jit {
             chaining: true,
             jump_cache: Box::new([[1, 0]; translate::JUMP_CACHE_ENTRIES]),
             stats: Stats::default(),
+            profiler: None,
         };
         jit.reset();
         Ok(jit)
@@ -150,6 +154,9 @@ impl Jit {
     fn reset(&mut self) {
         self.code.reset();
         self.stats.resets += 1;
+        if let Some(p) = &mut self.profiler {
+            p.reset();
+        }
         self.blocks.clear();
         self.unchained.clear();
         self.jump_cache.fill([1, 0]);
@@ -180,6 +187,14 @@ impl Jit {
                 Some(at) => {
                     self.stats.translations += 1;
                     self.blocks.insert(pc, at);
+                    if let Some(p) = &mut self.profiler {
+                        p.blocks.push(profile::BlockInfo {
+                            guest_pc: pc,
+                            guest: block.iter().map(|&(inst, _)| inst).collect(),
+                            host_offset: at,
+                            host_words: t.code.clone(),
+                        });
+                    }
                     for (index, site) in t.sites {
                         self.faults.sites.insert(at + 4 * index, site);
                     }
@@ -193,6 +208,11 @@ impl Jit {
             }
         }
         unreachable!()
+    }
+
+    /// Start sampling generated code (see [`profile`]); report with `profiler.report()`.
+    pub fn start_profiling(&mut self) {
+        self.profiler = Some(profile::Profiler::start(self.code.base() as usize, CODE_SIZE));
     }
 
     /// Link the new block at `at` (guest `pc`) into the graph: exits already waiting for

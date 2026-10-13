@@ -10,6 +10,8 @@
 //! - `RVRUN_STRACE=1` traces every syscall to stderr.
 //! - `RVRUN_STATS=1` prints instructions retired and execution speed on exit.
 //! - `RVRUN_JIT=0` runs on the caching interpreter instead of the JIT.
+//! - `RVRUN_PROF=FILE` samples generated code and writes a report of the hottest blocks to
+//!   FILE (render it with `tools/jitprof.py FILE`).
 
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
@@ -63,6 +65,9 @@ fn main() -> ExitCode {
         match champollion_rv::jit::Jit::new() {
             Ok(mut jit) => {
                 jit.stats.detailed = std::env::var_os("RVRUN_STATS").is_some_and(|v| v != "0");
+                if std::env::var_os("RVRUN_PROF").is_some() {
+                    jit.start_profiling();
+                }
                 main_thread.jit = Some(jit);
             }
             Err(e) => eprintln!("rvrun: JIT unavailable ({e}); interpreting"),
@@ -82,6 +87,12 @@ fn main() -> ExitCode {
             }
         },
     };
+    if let (Some(path), Some(p)) =
+        (std::env::var_os("RVRUN_PROF"), main_thread.jit.as_ref().and_then(|j| j.profiler.as_ref()))
+        && let Err(e) = std::fs::write(&path, p.report(20))
+    {
+        eprintln!("rvrun: cannot write profile: {e}");
+    }
     if std::env::var_os("RVRUN_STATS").is_some_and(|v| v != "0") {
         let secs = start.elapsed().as_secs_f64();
         let n = main_thread.cpu.instret;
