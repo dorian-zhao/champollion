@@ -1,0 +1,9 @@
+# A Rust crate whose unit tests run as a riscv64 musl static-PIE through rvrun, the way
+# `cargo test --target riscv64gc-unknown-linux-musl` with `runner = "rvrun"` does.
+[package]
+name = "rust-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]

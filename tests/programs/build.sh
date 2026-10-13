@@ -35,6 +35,23 @@ sqlite_flags="-DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION"
 rv $sqlite_flags "$cache/$sqlite/shell.c" "$cache/$sqlite/sqlite3.c" -o "$out/sqlite3"
 cc -O2 $sqlite_flags "$cache/$sqlite/shell.c" "$cache/$sqlite/sqlite3.c" -o "$tmp/sqlite3"
 
+# A Rust unit-test binary (static-PIE, Rust std, libtest), as `cargo test` would run it.
+# Needs `rustup target add riscv64gc-unknown-linux-musl`.
+(
+    cd "$here/rust-tests"
+    CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER="$here/rust-tests/zigcc.sh" \
+        cargo test --release --target riscv64gc-unknown-linux-musl --no-run \
+        --message-format=json 2>/dev/null |
+        python3 -I -c 'import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("reason") == "compiler-artifact" and m.get("profile", {}).get("test") and m.get("executable"):
+        print(m["executable"])' |
+        head -1 | xargs -I{} cp {} "$out/rust-tests"
+)
+llvm_strip=/opt/homebrew/opt/llvm/bin/llvm-strip
+[ -x "$llvm_strip" ] && "$llvm_strip" "$out/rust-tests"
+
 # Expected outputs. Scripts must be deterministic (no clocks, no randomness).
 for script in "$here"/*.lua; do
     "$tmp/lua" "$script" > "$script.expected"
