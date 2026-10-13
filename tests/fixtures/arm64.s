@@ -11,6 +11,7 @@ orr x21, x22, x23
 eor x24, x25, x26
 mov x27, x28
 mov w0, w1
+mvn x2, x3
 lsl x2, x3, x4
 lsr x5, x6, x7
 asr x8, x9, x10
@@ -75,3 +76,16 @@ ret
 nop
 brk #0x1234
 dmb ish
+tst x0, #7
+cmp w1, w2
+ldaddal x3, x4, [x5]
+ldclral w6, w7, [x8]
+ldeoral x9, x10, [x11]
+ldsetal w12, w13, [x14]
+ldsmaxal x15, x16, [x17]
+ldsminal w19, w20, [x21]
+ldumaxal x22, x23, [x24]
+lduminal w25, w26, [x27]
+swpal x0, xzr, [x1]
+casal x2, x3, [x4]
+casal w5, w6, [x7]

@@ -60,6 +60,21 @@ impl Cond {
     }
 }
 
+/// LSE atomic operations (`ld<op>al` and `swpal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    Add,
+    /// Bit clear: `[rn] &= !rs`.
+    Clr,
+    Eor,
+    Set,
+    Smax,
+    Smin,
+    Umax,
+    Umin,
+    Swp,
+}
+
 /// Load/store access size and signedness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mem {
@@ -174,6 +189,10 @@ impl Asm {
     /// `mov rd, rm` (64-bit, not involving sp).
     pub fn mov(&mut self, rd: Reg, rm: Reg) {
         self.orr(rd, XZR, rm);
+    }
+    /// `mvn rd, rm`: bitwise not.
+    pub fn mvn(&mut self, rd: Reg, rm: Reg) {
+        self.r3(0xaa20_0000, rd, XZR, rm);
     }
     /// `mov wd, wm`: copies the low 32 bits and zeroes the rest.
     pub fn mov_w(&mut self, rd: Reg, rm: Reg) {
@@ -489,6 +508,40 @@ impl Asm {
     /// Re-point the branch at index `at` (b, bl, b.cond, cbz, cbnz) to index `target`.
     pub fn patch(&mut self, at: usize, target: usize) {
         self.code[at] = encode_branch_to(self.code[at], Self::rel(at, target));
+    }
+
+    /// `tst rn, #imm` (bitmask immediate; `None` if not encodable).
+    pub fn tst_imm(&mut self, rn: Reg, imm: u64) -> Option<()> {
+        self.logical(0xf200_0000, 64, XZR, rn, imm)
+    }
+
+    /// `cmp wn, wm`.
+    pub fn cmp_w(&mut self, rn: Reg, rm: Reg) {
+        self.r3(0x6b00_0000, XZR, rn, rm);
+    }
+
+    /// LSE atomic read-modify-write with acquire+release semantics:
+    /// `rt = [rn]; [rn] = op([rn], rs)`. `wide` selects 64-bit (else 32-bit, zero-extended).
+    pub fn atomic(&mut self, op: AtomicOp, wide: bool, rs: Reg, rt: Reg, rn: Reg) {
+        let size = if wide { 0xc000_0000 } else { 0x8000_0000 };
+        let opc = match op {
+            AtomicOp::Add => 0x0000,
+            AtomicOp::Clr => 0x1000,
+            AtomicOp::Eor => 0x2000,
+            AtomicOp::Set => 0x3000,
+            AtomicOp::Smax => 0x4000,
+            AtomicOp::Smin => 0x5000,
+            AtomicOp::Umax => 0x6000,
+            AtomicOp::Umin => 0x7000,
+            AtomicOp::Swp => 0x8000,
+        };
+        self.emit(size | 0x38e0_0000 | opc | (rs as u32) << 16 | (rn as u32) << 5 | rt as u32);
+    }
+
+    /// `casal rs, rt, [rn]`: if `[rn] == rs` then `[rn] = rt`; `rs` receives the old value.
+    pub fn casal(&mut self, wide: bool, rs: Reg, rt: Reg, rn: Reg) {
+        let base = if wide { 0xc8e0_fc00 } else { 0x88e0_fc00 };
+        self.emit(base | (rs as u32) << 16 | (rn as u32) << 5 | rt as u32);
     }
 
     pub fn nop(&mut self) {

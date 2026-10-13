@@ -335,16 +335,81 @@ mod tests {
     }
 
     #[test]
+    fn atomics_match_the_interpreter() {
+        let (lr_d, sc_d, lr_w, sc_w) = (0b00010, 0b00011, 0b00010, 0b00011);
+        // a1 = DATA. lr/sc success, sc without a reservation, sc to another address,
+        // word AMOs (sign extension), amoand (bit-clear with inverted operand), min/max.
+        let (_, cpu) = same_as_interpreter(&[
+            addi(12, 0, -5),                 // a2 = -5
+            store(3, 11, 12, 0),             // [DATA] = -5
+            amo(lr_d, 0b011, 13, 11, 0),     // lr.d a3, (a1)
+            amo(sc_d, 0b011, 14, 11, 12),    // sc.d a4, a2, (a1): success -> 0
+            amo(sc_d, 0b011, 15, 11, 12),    // sc.d again: no reservation -> 1
+            amo(lr_w, 0b010, 16, 11, 0),     // lr.w a6, (a1): sign-extended
+            addi(5, 11, 8),                  // t0 = DATA + 8
+            amo(sc_w, 0b010, 17, 5, 12),     // sc.w a7, a2, (t0): wrong address -> 1
+            addi(28, 0, 7),                  // t3 = 7 (unpinned)
+            amo(0b10100, 0b010, 29, 11, 28), // amomax.w t4, t3, (a1): old = -5
+            amo(0b01100, 0b011, 30, 11, 28), // amoand.d t5, t3, (a1)
+            amo(0b11100, 0b011, 31, 11, 12), // amomaxu.d t6, a2, (a1)
+            amo(0b00001, 0b011, 0, 11, 28),  // amoswap.d zero, t3, (a1)
+            load(3, 18, 11, 0),              // ld s2, 0(a1)
+            ECALL,
+        ]);
+        assert_eq!((cpu.x[14], cpu.x[15], cpu.x[17]), (0, 1, 1));
+        assert_eq!(cpu.x[16] as i64, -5);
+        assert_eq!(cpu.x[18], 7);
+
+        // A misaligned atomic leaves through the interpreter, which raises the trap.
+        let (trap, _) = same_as_interpreter(&[addi(11, 11, 4), amo(0, 0b011, 13, 11, 12), ECALL]);
+        assert!(matches!(trap, Trap::MisalignedAtomic { .. }));
+
+        // A faulting lr leaves the reservation (and rd) untouched.
+        let (trap, cpu) = same_as_interpreter(&[
+            amo(lr_d, 0b011, 13, 11, 0), // reserve DATA
+            addi(5, 0, 64),
+            amo(lr_d, 0b011, 13, 5, 0), // lr.d from page 0: faults
+            ECALL,
+        ]);
+        assert!(matches!(trap, Trap::LoadFault { .. }));
+        assert_eq!(cpu.reserved_addr, DATA);
+    }
+
+    #[test]
+    fn fp_moves_match_the_interpreter() {
+        let (fld, fsd, flw, fsw) = (0b011, 0b011, 0b010, 0b010);
+        let (_, cpu) = same_as_interpreter(&[
+            addi(12, 0, -1),
+            op_fp(0b11110, 0b01, 0, 1, 12, 0),    // fmv.d.x f1, a2
+            op_fp(0b11110, 0b00, 0, 2, 12, 0),    // fmv.w.x f2, a2: NaN-boxed
+            fstore(fsd, 11, 1, 0),                // fsd f1, 0(a1)
+            fload(flw, 3, 11, 0),                 // flw f3, 0(a1): boxed
+            fstore(fsw, 11, 2, 8),                // fsw f2, 8(a1)
+            fload(fld, 4, 11, 8),                 // fld f4, 8(a1)
+            op_fp(0b11100, 0b00, 0, 13, 3, 0),    // fmv.x.w a3, f3: sign-extended
+            op_fp(0b11100, 0b01, 0, 14, 4, 0),    // fmv.x.d a4, f4
+            op_fp(0b00100, 0b01, 0b001, 5, 1, 1), // fsgnjn.d f5, f1, f1 (fneg)
+            op_fp(0b00100, 0b01, 0b010, 6, 5, 1), // fsgnjx.d f6, f5, f1
+            ECALL,
+        ]);
+        assert_eq!(cpu.f[2], 0xffff_ffff_ffff_ffff);
+        assert_eq!(cpu.x[13], u64::MAX);
+        assert_eq!(cpu.f[5], u64::MAX >> 1);
+    }
+
+    #[test]
     fn untranslated_instructions_fall_back_to_the_interpreter() {
-        // amoadd (not translated yet) between translated instructions.
+        // CSR accesses are not translated: they run on the interpreter mid-stream, and
+        // instret stays exact around them.
+        let csr = |rd: u32, n: u32| n << 20 | 0b010 << 12 | rd << 7 | 0x73; // csrrs rd, n, zero
         let (trap, cpu) = same_as_interpreter(&[
             addi(12, 0, 3),
-            amo(0, 0b011, 13, 11, 12), // amoadd.d a3, a2, (a1)
-            amo(0, 0b011, 13, 11, 12),
-            load(3, 14, 11, 0), // ld a4, 0(a1)
+            csr(13, 0xc02), // rdinstret a3 = 1
+            addi(12, 12, 1),
+            csr(14, 0xc02), // rdinstret a4 = 3
             ECALL,
         ]);
         assert!(matches!(trap, Trap::Ecall { .. }));
-        assert_eq!((cpu.x[13], cpu.x[14]), (3, 6));
+        assert_eq!((cpu.x[12], cpu.x[13], cpu.x[14]), (4, 1, 3));
     }
 }

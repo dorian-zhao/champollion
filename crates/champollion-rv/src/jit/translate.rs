@@ -22,9 +22,11 @@
 
 use std::mem::offset_of;
 
-use super::arm64::{Asm, Cond, Mem, Reg, XZR};
+use super::arm64::{Asm, AtomicOp, Cond, Mem, Reg, XZR};
 use crate::cpu::CpuState;
-use crate::decoder::{AluOp, AluOp32, BranchCond, Inst, LoadWidth, StoreWidth};
+use crate::decoder::{
+    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FWidth, Inst, LoadWidth, SgnjKind, StoreWidth,
+};
 use crate::memory::GUEST_SIZE;
 
 pub const CTX: Reg = 28;
@@ -79,6 +81,15 @@ pub fn x_offset(r: u8) -> u32 {
 }
 const PC: u32 = offset_of!(CpuState, pc) as u32;
 const INSTRET: u32 = offset_of!(CpuState, instret) as u32;
+const RESERVED_ADDR: u32 = offset_of!(CpuState, reserved_addr) as u32;
+const RESERVED_VALUE: u32 = offset_of!(CpuState, reserved_value) as u32;
+/// Upper half of a NaN-boxed single-precision value.
+const NAN_BOX: u64 = 0xffff_ffff_0000_0000;
+const SIGN64: u64 = 1 << 63;
+
+fn f_offset(r: u8) -> u32 {
+    (offset_of!(CpuState, f) + 8 * r as usize) as u32
+}
 /// Guest addresses are masked to the guest address space, so generated code can never touch
 /// host memory outside the reservation, whatever address the guest computes.
 const ADDR_MASK: u64 = GUEST_SIZE - 1;
@@ -102,6 +113,9 @@ pub struct Translation {
 enum Tail {
     /// Continue at a static pc with an exit code.
     Static { pc: u64, code: u64 },
+    /// Leave mid-block to interpret the instruction at `pc`, of which `retired_before`
+    /// instructions of this block had retired (instret is corrected accordingly).
+    Interpret { pc: u64, retired_before: u32 },
     /// Continue at the pc computed into `ADDR`: try the jump cache, else exit.
     Indirect,
 }
@@ -235,9 +249,158 @@ impl Tx {
             }
             // Conservatively a full barrier; mapping pred/succ to dmb variants comes later.
             Inst::Fence { .. } => self.a.dmb_ish(),
+            // F/D data movement: f registers live in CpuState and move as integers.
+            Inst::FLoad { width, rd, rs1, offset } => {
+                self.address(rs1, offset);
+                self.accesses.push((self.a.pos(), pc, self.retired, false));
+                if width == FWidth::D {
+                    self.a.ldr_reg(Mem::U64, DST, MEMBASE, ADDR);
+                } else {
+                    self.a.ldr_reg(Mem::U32, DST, MEMBASE, ADDR);
+                    self.a.orr_imm(DST, DST, NAN_BOX).unwrap();
+                }
+                self.a.str_off(DST, CTX, f_offset(rd));
+            }
+            Inst::FStore { width, rs1, rs2, offset } => {
+                self.a.ldr_off(SRC1, CTX, f_offset(rs2));
+                self.address(rs1, offset);
+                self.accesses.push((self.a.pos(), pc, self.retired, true));
+                let mem = if width == FWidth::D { Mem::U64 } else { Mem::U32 };
+                self.a.str_reg(mem, SRC1, MEMBASE, ADDR);
+            }
+            Inst::FMvFromInt { width, rd, rs1 } => {
+                let v = self.src(rs1, SRC0);
+                if width == FWidth::D {
+                    self.a.str_off(v, CTX, f_offset(rd));
+                } else {
+                    self.a.orr_imm(DST, v, NAN_BOX).unwrap();
+                    self.a.str_off(DST, CTX, f_offset(rd));
+                }
+            }
+            Inst::FMvToInt { width, rd, rs1 } => {
+                if rd != 0 {
+                    let d = self.dst(rd);
+                    if width == FWidth::D {
+                        self.a.ldr_off(d, CTX, f_offset(rs1));
+                    } else {
+                        self.a.ldr_off_w(d, CTX, f_offset(rs1));
+                        self.a.sxtw(d, d);
+                    }
+                    self.commit(rd, d);
+                }
+            }
+            Inst::FSgnj { kind, width: FWidth::D, rd, rs1, rs2 } => {
+                // Single precision needs NaN-box checks; it stays on the interpreter for now.
+                self.a.ldr_off(SRC0, CTX, f_offset(rs1));
+                self.a.ldr_off(SRC1, CTX, f_offset(rs2));
+                match kind {
+                    SgnjKind::Sgnj => {}
+                    SgnjKind::Sgnjn => self.a.eor_imm(SRC1, SRC1, SIGN64).unwrap(),
+                    SgnjKind::Sgnjx => self.a.eor(SRC1, SRC0, SRC1),
+                }
+                self.a.and_imm(SRC1, SRC1, SIGN64).unwrap();
+                self.a.and_imm(SRC0, SRC0, !SIGN64).unwrap();
+                self.a.orr(DST, SRC0, SRC1);
+                self.a.str_off(DST, CTX, f_offset(rd));
+            }
+            Inst::Lr { width, rd, rs1, .. } => {
+                let base = self.src(rs1, SRC0);
+                self.require_aligned(base, width, pc);
+                // Keep the address (rd may be rs1) and record the reservation only after the
+                // load, so a faulting lr leaves the state untouched.
+                self.a.mov(SRC1, base);
+                self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
+                let d = self.dst(rd);
+                self.accesses.push((self.a.pos(), pc, self.retired, false));
+                let mem = if width == AmoWidth::D { Mem::U64 } else { Mem::S32 };
+                self.a.ldr_reg(mem, d, MEMBASE, ADDR);
+                self.a.str_off(SRC1, CTX, RESERVED_ADDR);
+                self.a.str_off(d, CTX, RESERVED_VALUE);
+                self.commit(rd, d);
+            }
+            Inst::Sc { width, rd, rs1, rs2, .. } => self.sc(width, rd, rs1, rs2, pc),
+            Inst::Amo { op, width, rd, rs1, rs2, .. } => {
+                let base = self.src(rs1, SRC0);
+                self.require_aligned(base, width, pc);
+                self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
+                self.a.add(ADDR, MEMBASE, ADDR);
+                let mut v = self.src(rs2, SRC1);
+                let lse = match op {
+                    AmoOp::Swap => AtomicOp::Swp,
+                    AmoOp::Add => AtomicOp::Add,
+                    AmoOp::Xor => AtomicOp::Eor,
+                    AmoOp::Or => AtomicOp::Set,
+                    AmoOp::Min => AtomicOp::Smin,
+                    AmoOp::Max => AtomicOp::Smax,
+                    AmoOp::Minu => AtomicOp::Umin,
+                    AmoOp::Maxu => AtomicOp::Umax,
+                    AmoOp::And => {
+                        // LSE has bit-clear, not and: [m] & v == [m] & !(!v).
+                        self.a.mvn(SRC1, v);
+                        v = SRC1;
+                        AtomicOp::Clr
+                    }
+                };
+                let d = self.dst(rd);
+                let wide = width == AmoWidth::D;
+                self.accesses.push((self.a.pos(), pc, self.retired, true));
+                self.a.atomic(lse, wide, v, if rd == 0 { XZR } else { d }, ADDR);
+                if rd != 0 {
+                    if !wide {
+                        self.a.sxtw(d, d); // word AMOs sign-extend the old value
+                    }
+                    self.commit(rd, d);
+                }
+            }
             _ => return false,
         }
         true
+    }
+
+    /// Leave for the interpreter (which raises the misaligned-atomic trap) unless `base` is
+    /// naturally aligned for `width`.
+    fn require_aligned(&mut self, base: Reg, width: AmoWidth, pc: u64) {
+        let mask = if width == AmoWidth::D { 7 } else { 3 };
+        self.a.tst_imm(base, mask).unwrap();
+        let skip = self.a.pos();
+        self.a.b_cond(Cond::Eq, skip + 2);
+        self.exit(Tail::Interpret { pc, retired_before: self.retired });
+    }
+
+    /// `sc`: succeeds (rd = 0) only if the reservation is for this address and memory still
+    /// holds the reserved value, checked and stored with one `casal`.
+    fn sc(&mut self, width: AmoWidth, rd: u8, rs1: u8, rs2: u8, pc: u64) {
+        let wide = width == AmoWidth::D;
+        let base = self.src(rs1, SRC0);
+        self.require_aligned(base, width, pc);
+        let d = self.dst(rd);
+        self.a.ldr_off(DST, CTX, RESERVED_ADDR);
+        self.a.cmp(DST, base);
+        let to_fail = self.a.pos();
+        self.a.b_cond(Cond::Ne, to_fail); // patched below
+        self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
+        self.a.add(ADDR, MEMBASE, ADDR);
+        let v = self.src(rs2, SRC1);
+        self.a.ldr_off(DST, CTX, RESERVED_VALUE);
+        self.a.mov(SRC0, DST);
+        self.accesses.push((self.a.pos(), pc, self.retired, true));
+        self.a.casal(wide, SRC0, v, ADDR);
+        if wide {
+            self.a.cmp(SRC0, DST);
+        } else {
+            self.a.cmp_w(SRC0, DST);
+        }
+        self.a.cset(d, Cond::Ne);
+        let to_done = self.a.pos();
+        self.a.b(to_done); // patched below
+        let fail = self.a.pos();
+        self.a.patch(to_fail, fail);
+        self.a.movz(d, 1, 0);
+        let done = self.a.pos();
+        self.a.patch(to_done, done);
+        self.commit(rd, d);
+        self.a.movn(SRC0, 0, 0); // NO_RESERVATION
+        self.a.str_off(SRC0, CTX, RESERVED_ADDR);
     }
 
     fn constant(&mut self, rd: u8, v: u64) {
@@ -437,6 +600,15 @@ impl Tx {
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, code as u16, 0);
                 }
+                Tail::Interpret { pc, retired_before } => {
+                    // The block added all its instructions to instret at entry.
+                    self.a.ldr_off(DST, CTX, INSTRET);
+                    self.a.sub_imm(DST, DST, self.retired - retired_before);
+                    self.a.str_off(DST, CTX, INSTRET);
+                    self.a.mov_imm(ADDR, pc);
+                    self.a.str_off(ADDR, CTX, PC);
+                    self.a.movz(EXIT_CODE, exit::INTERPRET as u16, 0);
+                }
                 Tail::Indirect => {
                     // Inline jump-cache probe: on a hit, jump straight to the target's
                     // translation; on a miss, let the dispatcher find it (and fill the slot).
@@ -573,6 +745,7 @@ pub fn translate(
         exits.push((tx.a.pos(), Some(at)));
         tx.exit(Tail::Static { pc: at, code: exit::NEXT });
     }
+    tx.retired = retired;
     tx.a.code[instret_at + 1] = {
         let mut a = Asm::new();
         a.add_imm(DST, DST, retired);

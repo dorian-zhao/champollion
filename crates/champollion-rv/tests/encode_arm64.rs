@@ -1,7 +1,7 @@
 //! Checks the JIT's ARM64 encoder against an assembler: tests/fixtures/arm64.s, assembled
 //! into arm64.bin by build.sh, lists the same instructions this test emits, in order.
 
-use champollion_rv::jit::arm64::{Asm, Cond, LR, Mem, SP, XZR};
+use champollion_rv::jit::arm64::{Asm, AtomicOp, Cond, LR, Mem, SP, XZR};
 
 #[test]
 fn matches_assembler() {
@@ -17,6 +17,7 @@ fn matches_assembler() {
     a.eor(24, 25, 26);
     a.mov(27, 28);
     a.mov_w(0, 1);
+    a.mvn(2, 3);
     a.lslv(2, 3, 4);
     a.lsrv(5, 6, 7);
     a.asrv(8, 9, 10);
@@ -81,10 +82,26 @@ fn matches_assembler() {
     a.nop();
     a.brk(0x1234);
     a.dmb_ish();
+    a.tst_imm(0, 7).unwrap();
+    a.cmp_w(1, 2);
+    a.atomic(AtomicOp::Add, true, 3, 4, 5);
+    a.atomic(AtomicOp::Clr, false, 6, 7, 8);
+    a.atomic(AtomicOp::Eor, true, 9, 10, 11);
+    a.atomic(AtomicOp::Set, false, 12, 13, 14);
+    a.atomic(AtomicOp::Smax, true, 15, 16, 17);
+    a.atomic(AtomicOp::Smin, false, 19, 20, 21);
+    a.atomic(AtomicOp::Umax, true, 22, 23, 24);
+    a.atomic(AtomicOp::Umin, false, 25, 26, 27);
+    a.atomic(AtomicOp::Swp, true, 0, XZR, 1);
+    a.casal(true, 2, 3, 4);
+    a.casal(false, 5, 6, 7);
 
     let source = include_str!("../../../tests/fixtures/arm64.s");
-    let lines: Vec<&str> =
-        source.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).collect();
+    let lines: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('.'))
+        .collect();
     let words: Vec<u32> = include_bytes!("../../../tests/fixtures/arm64.bin")
         .as_chunks::<4>()
         .0

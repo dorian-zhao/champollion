@@ -17,9 +17,10 @@ cc -O2 -frounding-math fp.c -o "$tmp/fp-native"
 for src in *.s; do
     # arm64*.s are host (JIT output) encodings; the rest are RISC-V.
     case $src in
-    arm64*) target=aarch64-linux-musl ;;
+    arm64*) target="aarch64-linux-musl -mcpu=apple_m1" ;; # LSE atomics, as on the host
     *) target=riscv64-linux-musl ;;
     esac
-    zig cc -target "$target" -c "$src" -o "$tmp/obj.o"
+    # shellcheck disable=SC2086 # $target carries a -mcpu flag for arm64
+    zig cc -target $target -c "$src" -o "$tmp/obj.o"
     zig objcopy -O binary -j .text "$tmp/obj.o" "${src%.s}.bin"
 done
