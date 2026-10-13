@@ -1,2 +1,7 @@
-//! Basic-block JIT to arm64 (M4). Intentionally empty until the interpreter passes
-//! `riscv-tests` and can serve as the differential-testing oracle.
+//! Basic-block JIT to arm64 (M4).
+//!
+//! - [`arm64`]: instruction encoder, checked against an assembler.
+//! - [`code`]: executable memory (MAP_JIT and W^X on macOS).
+
+pub mod arm64;
+pub mod code;
