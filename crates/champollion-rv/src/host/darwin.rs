@@ -5,8 +5,8 @@
 //! counterpart, and every Darwin errno going out is translated to Linux.
 
 use std::ffi::CStr;
-use std::io::IoSlice;
 
+use crate::memory::GuestBuf;
 use crate::syscall::{AT_FDCWD, HostOs, Identity, Stat, SysResult, errno};
 
 pub struct DarwinHost;
@@ -161,27 +161,35 @@ fn to_stat(st: &libc::stat) -> Stat {
 }
 
 impl HostOs for DarwinHost {
-    fn read(&mut self, fd: i32, buf: &mut [u8]) -> SysResult {
-        // SAFETY: buf is a valid writable region of buf.len() bytes.
-        check(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) })
+    // Guest buffers go straight to the kernel, which fails with EFAULT instead of crashing
+    // if another guest thread unmaps them mid-call.
+
+    fn read(&self, fd: i32, buf: GuestBuf) -> SysResult {
+        // SAFETY: the kernel validates the destination.
+        check(unsafe { libc::read(fd, buf.ptr.cast(), buf.len) })
     }
 
-    fn write(&mut self, fd: i32, buf: &[u8]) -> SysResult {
-        // SAFETY: buf is a valid readable region of buf.len() bytes.
-        check(unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) })
+    fn write(&self, fd: i32, buf: GuestBuf) -> SysResult {
+        // SAFETY: the kernel validates the source.
+        check(unsafe { libc::write(fd, buf.ptr.cast(), buf.len) })
     }
 
-    fn writev(&mut self, fd: i32, bufs: &[IoSlice<'_>]) -> SysResult {
-        // SAFETY: IoSlice is ABI-compatible with struct iovec on Unix.
+    fn readv(&self, fd: i32, bufs: &[GuestBuf]) -> SysResult {
+        // SAFETY: GuestBuf is layout-compatible with struct iovec; the kernel validates.
+        check(unsafe { libc::readv(fd, bufs.as_ptr().cast(), bufs.len() as i32) })
+    }
+
+    fn writev(&self, fd: i32, bufs: &[GuestBuf]) -> SysResult {
+        // SAFETY: as in readv.
         check(unsafe { libc::writev(fd, bufs.as_ptr().cast(), bufs.len() as i32) })
     }
 
-    fn pread(&mut self, fd: i32, buf: &mut [u8], offset: i64) -> SysResult {
-        // SAFETY: buf is a valid writable region of buf.len() bytes.
-        check(unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) })
+    fn pread(&self, fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
+        // SAFETY: the kernel validates the destination.
+        check(unsafe { libc::pread(fd, buf.ptr.cast(), buf.len, offset) })
     }
 
-    fn openat(&mut self, fd: i32, path: &CStr, flags: i32, mode: u32) -> SysResult {
+    fn openat(&self, fd: i32, path: &CStr, flags: i32, mode: u32) -> SysResult {
         let flags = open_flags(flags)?;
         // SAFETY: path is NUL-terminated.
         check(
@@ -189,12 +197,12 @@ impl HostOs for DarwinHost {
         )
     }
 
-    fn close(&mut self, fd: i32) -> SysResult {
+    fn close(&self, fd: i32) -> SysResult {
         // SAFETY: closing an arbitrary fd is memory-safe.
         check(unsafe { libc::close(fd) } as isize)
     }
 
-    fn fcntl(&mut self, fd: i32, cmd: i32, arg: u64) -> SysResult {
+    fn fcntl(&self, fd: i32, cmd: i32, arg: u64) -> SysResult {
         const F_DUPFD: i32 = 0;
         const F_GETFD: i32 = 1;
         const F_SETFD: i32 = 2;
@@ -215,7 +223,7 @@ impl HostOs for DarwinHost {
         }
     }
 
-    fn lseek(&mut self, fd: i32, offset: i64, whence: i32) -> SysResult {
+    fn lseek(&self, fd: i32, offset: i64, whence: i32) -> SysResult {
         let whence = match whence {
             0..=2 => whence, // SEEK_SET/CUR/END agree
             3 => libc::SEEK_DATA,
@@ -226,7 +234,7 @@ impl HostOs for DarwinHost {
         check(unsafe { libc::lseek(fd, offset, whence) } as isize)
     }
 
-    fn fstat(&mut self, fd: i32) -> Result<Stat, i32> {
+    fn fstat(&self, fd: i32) -> Result<Stat, i32> {
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: st is a valid out-pointer.
         check(unsafe { libc::fstat(fd, st.as_mut_ptr()) } as isize)?;
@@ -234,7 +242,7 @@ impl HostOs for DarwinHost {
         Ok(to_stat(&unsafe { st.assume_init() }))
     }
 
-    fn fstatat(&mut self, fd: i32, path: &CStr, flags: i32) -> Result<Stat, i32> {
+    fn fstatat(&self, fd: i32, path: &CStr, flags: i32) -> Result<Stat, i32> {
         if flags & LINUX_AT_EMPTY_PATH != 0 && path.is_empty() {
             return self.fstat(fd);
         }
@@ -249,7 +257,7 @@ impl HostOs for DarwinHost {
         Ok(to_stat(&unsafe { st.assume_init() }))
     }
 
-    fn clock_gettime(&mut self, clock_id: i32) -> Result<(i64, i64), i32> {
+    fn clock_gettime(&self, clock_id: i32) -> Result<(i64, i64), i32> {
         let clock = match clock_id {
             0 | 5 => libc::CLOCK_REALTIME,       // REALTIME, REALTIME_COARSE
             1 | 6 => libc::CLOCK_MONOTONIC,      // MONOTONIC, MONOTONIC_COARSE
@@ -265,13 +273,20 @@ impl HostOs for DarwinHost {
         Ok((ts.tv_sec, ts.tv_nsec))
     }
 
-    fn getrandom(&mut self, buf: &mut [u8]) -> SysResult {
-        // SAFETY: buf is a valid writable region; arc4random_buf cannot fail.
-        unsafe { libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len()) };
-        Ok(buf.len() as u64)
+    fn getrandom(&self, buf: GuestBuf) -> SysResult {
+        // getentropy is a system call (so a bad buffer is EFAULT, not a crash) limited to
+        // 256 bytes per call.
+        let mut done = 0;
+        while done < buf.len {
+            let n = (buf.len - done).min(256);
+            // SAFETY: the kernel validates the destination.
+            check(unsafe { libc::getentropy(buf.ptr.add(done).cast(), n) } as isize)?;
+            done += n;
+        }
+        Ok(buf.len as u64)
     }
 
-    fn winsize(&mut self, fd: i32) -> Result<[u16; 4], i32> {
+    fn winsize(&self, fd: i32) -> Result<[u16; 4], i32> {
         let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: TIOCGWINSZ writes a struct winsize through the pointer.
         check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } as isize)?;
@@ -335,13 +350,13 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        let mut h = DarwinHost;
+        let h = DarwinHost;
         let fd = h.openat(AT_FDCWD, &cpath, 0, 0).unwrap() as i32;
         let st = h.fstat(fd).unwrap();
         assert_eq!(st.size, 5);
         assert_eq!(st.mode & 0o170000, 0o100000); // S_IFREG
         let mut buf = [0u8; 8];
-        assert_eq!(h.read(fd, &mut buf), Ok(5));
+        assert_eq!(h.read(fd, GuestBuf { ptr: buf.as_mut_ptr(), len: buf.len() }), Ok(5));
         assert_eq!(&buf[..5], b"hello");
         assert_eq!(h.lseek(fd, 1, 0), Ok(1));
         assert_eq!(h.fcntl(fd, 2, 1), Ok(0)); // F_SETFD FD_CLOEXEC

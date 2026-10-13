@@ -30,7 +30,7 @@ pub enum Trap {
 // address misalignment can never occur and has no trap variant.
 
 /// Fetch, decode and execute one instruction.
-pub fn step(cpu: &mut CpuState, mem: &mut impl Memory) -> Result<(), Trap> {
+pub fn step(cpu: &mut CpuState, mem: &impl Memory) -> Result<(), Trap> {
     let pc = cpu.pc;
     let lo = mem.fetch_u16(pc).map_err(Trap::FetchFault)?;
     let len = decoder::inst_len(lo);
@@ -40,7 +40,7 @@ pub fn step(cpu: &mut CpuState, mem: &mut impl Memory) -> Result<(), Trap> {
 }
 
 /// Run until a trap. Returns the trap and the number of instructions retired before it.
-pub fn run(cpu: &mut CpuState, mem: &mut impl Memory, max_steps: u64) -> (Option<Trap>, u64) {
+pub fn run(cpu: &mut CpuState, mem: &impl Memory, max_steps: u64) -> (Option<Trap>, u64) {
     for n in 0..max_steps {
         if let Err(t) = step(cpu, mem) {
             return (Some(t), n);
@@ -50,12 +50,7 @@ pub fn run(cpu: &mut CpuState, mem: &mut impl Memory, max_steps: u64) -> (Option
 }
 
 /// Execute an already-decoded instruction of `len` bytes at `cpu.pc`.
-pub fn execute(
-    cpu: &mut CpuState,
-    mem: &mut impl Memory,
-    inst: Inst,
-    len: u64,
-) -> Result<(), Trap> {
+pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> Result<(), Trap> {
     let pc = cpu.pc;
     let mut next = pc.wrapping_add(len);
     match inst {
@@ -96,40 +91,43 @@ pub fn execute(
         Inst::Op { op, rd, rs1, rs2 } => cpu.set_x(rd, alu(op, cpu.x(rs1), cpu.x(rs2))),
         Inst::OpImm32 { op, rd, rs1, imm } => cpu.set_x(rd, alu32(op, cpu.x(rs1), sext(imm))),
         Inst::Op32 { op, rd, rs1, rs2 } => cpu.set_x(rd, alu32(op, cpu.x(rs1), cpu.x(rs2))),
-        // A single hart executing in order observes its own accesses in order already.
-        Inst::Fence { .. } => {}
+        // The interpreter's own accesses are relaxed atomics, so a full host fence gives
+        // every fence (including fence.tso) at least the ordering it asks for. The JIT will
+        // emit the matching, cheaper `dmb` variant instead.
+        Inst::Fence { .. } => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
         Inst::Ecall => return Err(Trap::Ecall { pc }),
         Inst::Ebreak => return Err(Trap::Ebreak { pc }),
-        // Single hart: every access is already atomic and ordered, so aq/rl need no
-        // action, and a reservation can only be broken by another `sc`.
+        // Atomics map onto host atomics (sequentially consistent, which covers every aq/rl
+        // combination). lr/sc use a value-based reservation and compare-and-swap.
         Inst::Lr { width, rd, rs1, .. } => {
             let addr = atomic_addr(cpu, rs1, width)?;
             let v = load_value(mem, addr, amo_load_width(width))
                 .map_err(|fault| Trap::LoadFault { pc, fault })?;
             cpu.set_x(rd, v);
-            cpu.reservation = Some(addr);
+            cpu.reservation = Some((addr, v));
         }
         Inst::Sc { width, rd, rs1, rs2, .. } => {
             let addr = atomic_addr(cpu, rs1, width)?;
-            if cpu.reservation == Some(addr) {
-                let bytes = cpu.x(rs2).to_le_bytes();
-                mem.write(addr, &bytes[..amo_bytes(width)])
-                    .map_err(|fault| Trap::StoreFault { pc, fault })?;
-                cpu.set_x(rd, 0);
-            } else {
-                cpu.set_x(rd, 1);
-            }
+            let size = amo_bytes(width);
+            let mask = if size == 4 { 0xffff_ffff } else { u64::MAX };
+            let stored = match cpu.reservation {
+                Some((a, v)) if a == addr => mem
+                    .compare_exchange(addr, size, v & mask, cpu.x(rs2) & mask)
+                    .map_err(|fault| Trap::StoreFault { pc, fault })?,
+                _ => false,
+            };
+            cpu.set_x(rd, if stored { 0 } else { 1 });
             cpu.reservation = None;
         }
         Inst::Amo { op, width, rd, rs1, rs2, .. } => {
             let addr = atomic_addr(cpu, rs1, width)?;
-            // AMOs need write permission even though they also read, so a failed read is
-            // reported as a store fault too. rd is written last so faults leave it intact.
-            let old = load_value(mem, addr, amo_load_width(width))
+            let src = cpu.x(rs2);
+            // AMOs need write permission, so any fault is a store fault. rd is written
+            // last so a fault leaves it intact.
+            let old = mem
+                .atomic_update(addr, amo_bytes(width), &mut |old| amo_op(op, width, old, src))
                 .map_err(|fault| Trap::StoreFault { pc, fault })?;
-            let new = amo_op(op, width, old, cpu.x(rs2));
-            mem.write(addr, &new.to_le_bytes()[..amo_bytes(width)])
-                .map_err(|fault| Trap::StoreFault { pc, fault })?;
+            let old = if width == AmoWidth::W { old as i32 as u64 } else { old };
             cpu.set_x(rd, old);
         }
         Inst::FLoad { width, rd, rs1, offset } => {
@@ -195,8 +193,8 @@ fn amo_load_width(width: AmoWidth) -> LoadWidth {
     }
 }
 
-/// New memory value for an AMO. For word ops only the low 32 bits are stored, so min/max
-/// must compare the 32-bit values (signed or unsigned), not the sign-extended ones.
+/// New memory value for an AMO. `old` is the zero-extended memory value; for word ops only
+/// the low 32 bits of the result are stored, and min/max compare 32-bit values.
 fn amo_op(op: AmoOp, width: AmoWidth, old: u64, src: u64) -> u64 {
     let (a, b) = match width {
         AmoWidth::W => (old as i32 as i64, src as i32 as i64),
@@ -340,20 +338,20 @@ mod tests {
     const DATA: u64 = BASE + 0x800;
 
     fn setup(prog: &[u32]) -> (CpuState, FlatMemory) {
-        let mut mem = FlatMemory::new(BASE, 4096);
+        let mem = FlatMemory::new(BASE, 4096);
         mem.load_words(BASE, prog).unwrap();
         (CpuState::new(BASE), mem)
     }
 
     /// Run `prog` with the given initial registers until pc falls off its end.
     fn exec(prog: &[u32], regs: &[(u8, u64)]) -> (CpuState, FlatMemory) {
-        let (mut cpu, mut mem) = setup(prog);
+        let (mut cpu, mem) = setup(prog);
         for &(r, v) in regs {
             cpu.set_x(r, v);
         }
         let end = BASE + 4 * prog.len() as u64;
         while cpu.pc != end {
-            step(&mut cpu, &mut mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
         }
         (cpu, mem)
     }
@@ -516,30 +514,30 @@ mod tests {
         // lr; sc succeeds (rd = 0) and stores.
         let (cpu, mem) = exec(&[lr_d, sc_d], &regs);
         assert_eq!(cpu.x[13], 0);
-        assert_eq!(mem.bytes[0x800], 0x55);
+        assert_eq!(mem.bytes()[0x800], 0x55);
         assert_eq!(cpu.reservation, None);
 
         // sc without lr fails (rd != 0) and does not store.
         let (cpu, mem) = exec(&[sc_d], &regs);
         assert_ne!(cpu.x[13], 0);
-        assert_eq!(mem.bytes[0x800], 0);
+        assert_eq!(mem.bytes()[0x800], 0);
 
         // A second sc fails: the first one consumed the reservation.
         let (cpu, mem) = exec(&[lr_d, sc_d, addi(12, 0, 0x66), sc_d], &regs);
         assert_ne!(cpu.x[13], 0);
-        assert_eq!(mem.bytes[0x800], 0x55);
+        assert_eq!(mem.bytes()[0x800], 0x55);
 
         // sc to a different address than the reservation fails.
         let (cpu, _) = exec(&[lr_d, addi(11, 11, 8), sc_d], &regs);
         assert_ne!(cpu.x[13], 0);
 
         // lr.w sign-extends.
-        let (mut cpu, mut mem) = setup(&[amo(0b00010, 0b010, 10, 11, 0)]);
+        let (mut cpu, mem) = setup(&[amo(0b00010, 0b010, 10, 11, 0)]);
         mem.write(DATA, &0x8000_0000u32.to_le_bytes()).unwrap();
         cpu.set_x(11, DATA);
-        step(&mut cpu, &mut mem).unwrap();
+        step(&mut cpu, &mem).unwrap();
         assert_eq!(cpu.x[10], 0xffff_ffff_8000_0000);
-        assert_eq!(cpu.reservation, Some(DATA));
+        assert_eq!(cpu.reservation, Some((DATA, 0xffff_ffff_8000_0000)));
     }
 
     #[test]
@@ -562,11 +560,11 @@ mod tests {
             (0b11100, w, 0x8000_0000, 0x1_0000_0001, 0x8000_0000), // maxu.w ignores upper rs2 bits
         ];
         for (i, &(f5, f3, before, src, after)) in cases.iter().enumerate() {
-            let (mut cpu, mut mem) = setup(&[amo(f5, f3, 10, 11, 12)]);
+            let (mut cpu, mem) = setup(&[amo(f5, f3, 10, 11, 12)]);
             mem.write(DATA, &before.to_le_bytes()).unwrap();
             cpu.set_x(11, DATA);
             cpu.set_x(12, src);
-            step(&mut cpu, &mut mem).unwrap();
+            step(&mut cpu, &mem).unwrap();
             let mut got = [0; 8];
             mem.read(DATA, &mut got).unwrap();
             let mask = if f3 == w { 0xffff_ffff } else { NEG1 };
@@ -576,13 +574,66 @@ mod tests {
         }
 
         // rd == rs2: the operand is read before rd is overwritten.
-        let (mut cpu, mut mem) = setup(&[amo(0b00000, d, 12, 11, 12)]);
+        let (mut cpu, mem) = setup(&[amo(0b00000, d, 12, 11, 12)]);
         mem.write(DATA, &10u64.to_le_bytes()).unwrap();
         cpu.set_x(11, DATA);
         cpu.set_x(12, 5);
-        step(&mut cpu, &mut mem).unwrap();
+        step(&mut cpu, &mem).unwrap();
         assert_eq!(cpu.x[12], 10);
-        assert_eq!(mem.bytes[0x800], 15);
+        assert_eq!(mem.bytes()[0x800], 15);
+    }
+
+    #[test]
+    fn atomics_hold_across_host_threads() {
+        use crate::memory::{GuestMemory, Prot};
+        const CODE: u64 = 0x10000;
+        const COUNTERS: u64 = 0x20000;
+        const N: u64 = 20_000;
+        let (amoadd_d, lr_d, sc_d) = (0b00000, 0b00010, 0b00011);
+        // a0 = iterations, a1 = counter address, a2 = 1
+        let amo_loop = [
+            amo(amoadd_d, 0b011, 0, 11, 12), // 0x00: amoadd.d zero, a2, (a1)
+            addi(10, 10, -1),                // 0x04: addi a0, a0, -1
+            b(0b001, 10, 0, -8),             // 0x08: bnez a0, 0x00
+        ];
+        let lrsc_loop = [
+            amo(lr_d, 0b011, 5, 11, 0), // 0x00: lr.d t0, (a1)
+            addi(5, 5, 1),              // 0x04: addi t0, t0, 1
+            amo(sc_d, 0b011, 6, 11, 5), // 0x08: sc.d t1, t0, (a1)
+            b(0b001, 6, 0, -12),        // 0x0c: bnez t1, 0x00 (retry)
+            addi(10, 10, -1),           // 0x10: addi a0, a0, -1
+            b(0b001, 10, 0, -20),       // 0x14: bnez a0, 0x00
+        ];
+        let mem = GuestMemory::new().unwrap();
+        mem.map(CODE, 0x1000, Prot::READ | Prot::EXEC).unwrap();
+        mem.map(COUNTERS, 0x1000, Prot::RW).unwrap();
+        let words: Vec<u8> =
+            amo_loop.iter().chain(&lrsc_loop).flat_map(|w| w.to_le_bytes()).collect();
+        mem.write_privileged(CODE, &words).unwrap();
+
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let mem = &mem;
+                s.spawn(move || {
+                    let (entry, len, counter) = if i % 2 == 0 {
+                        (CODE, amo_loop.len(), COUNTERS)
+                    } else {
+                        (CODE + 4 * amo_loop.len() as u64, lrsc_loop.len(), COUNTERS + 8)
+                    };
+                    let mut cpu = CpuState::new(entry);
+                    cpu.set_x(10, N);
+                    cpu.set_x(11, counter);
+                    cpu.set_x(12, 1);
+                    while cpu.pc != entry + 4 * len as u64 {
+                        step(&mut cpu, mem).unwrap();
+                    }
+                });
+            }
+        });
+        let mut b = [0u8; 16];
+        mem.read(COUNTERS, &mut b).unwrap();
+        assert_eq!(u64::from_le_bytes(b[..8].try_into().unwrap()), 4 * N, "amoadd lost updates");
+        assert_eq!(u64::from_le_bytes(b[8..].try_into().unwrap()), 4 * N, "lr/sc lost updates");
     }
 
     #[test]
@@ -593,11 +644,11 @@ mod tests {
             amo(0b00011, 0b010, 10, 11, 12),
             amo(0, 0b010, 10, 11, 12),
         ] {
-            let (mut cpu, mut mem) = setup(&[word]);
+            let (mut cpu, mem) = setup(&[word]);
             cpu.set_x(11, DATA + 2);
             let before = cpu.clone();
             assert_eq!(
-                step(&mut cpu, &mut mem),
+                step(&mut cpu, &mem),
                 Err(Trap::MisalignedAtomic { pc: BASE, addr: DATA + 2 })
             );
             assert_eq!(cpu, before);
@@ -611,7 +662,7 @@ mod tests {
         // 0x04: addi a1, zero, 1  (4 bytes, at a 2-byte-aligned pc)
         // 0x08: c.j +4            -> 0x0c
         // 0x0a: c.addi a0, 1      (callee) ; c.jr ra
-        let (mut cpu, mut mem) = setup(&[]);
+        let (mut cpu, mem) = setup(&[]);
         let halves: [u16; 2] = [0x4515, 0x9282]; // c.li a0, 5 ; c.jalr t0
         let mut bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
         bytes.extend(addi(11, 0, 1).to_le_bytes());
@@ -622,18 +673,18 @@ mod tests {
         mem.write(BASE, &bytes).unwrap();
         cpu.set_x(5, BASE + 0x0a);
 
-        step(&mut cpu, &mut mem).unwrap(); // c.li
+        step(&mut cpu, &mem).unwrap(); // c.li
         assert_eq!((cpu.x[10], cpu.pc), (5, BASE + 2));
-        step(&mut cpu, &mut mem).unwrap(); // c.jalr
+        step(&mut cpu, &mem).unwrap(); // c.jalr
         assert_eq!((cpu.x[1], cpu.pc), (BASE + 4, BASE + 0x0a));
-        run(&mut cpu, &mut mem, 4); // c.addi, c.jr, addi, c.j
+        run(&mut cpu, &mem, 4); // c.addi, c.jr, addi, c.j
         assert_eq!((cpu.x[10], cpu.x[11]), (6, 1));
         assert_eq!(cpu.pc, BASE + 0x0c);
     }
 
     #[test]
     fn fp_loads_stores_and_moves() {
-        let (mut cpu, mut mem) = setup(&[
+        let (mut cpu, mem) = setup(&[
             fload(0b011, 1, 11, 0),            // fld f1, 0(a1)
             fload(0b010, 2, 11, 8),            // flw f2, 8(a1): NaN-boxed
             fstore(0b011, 11, 1, 16),          // fsd f1, 16(a1)
@@ -647,7 +698,7 @@ mod tests {
         mem.write(DATA + 8, &(-2.0f32).to_bits().to_le_bytes()).unwrap();
         cpu.set_x(11, DATA);
         cpu.set_x(13, 0x1234_5678_3f80_0000);
-        run(&mut cpu, &mut mem, 8);
+        run(&mut cpu, &mem, 8);
 
         assert_eq!(cpu.f[1], 1.5f64.to_bits());
         assert_eq!(cpu.f[2], 0xffff_ffff_c000_0000);
@@ -676,10 +727,10 @@ mod tests {
             (sgnj(0b000, 0), 0x3f80_0000, nan_box(0), nan_box(0x7fc0_0000)), // unboxed -> NaN
         ];
         for (i, &(w, a, b, want)) in cases.iter().enumerate() {
-            let (mut cpu, mut mem) = setup(&[w]);
+            let (mut cpu, mem) = setup(&[w]);
             cpu.f[1] = a;
             cpu.f[2] = b;
-            step(&mut cpu, &mut mem).unwrap();
+            step(&mut cpu, &mem).unwrap();
             assert_eq!(cpu.f[3], want, "case {i}");
         }
     }
@@ -715,30 +766,30 @@ mod tests {
 
     #[test]
     fn jal_links_and_jumps() {
-        let (mut cpu, mut mem) = setup(&[
+        let (mut cpu, mem) = setup(&[
             jal(1, 12),     // 0x00: ra = 0x04, -> 0x0c
             addi(10, 0, 1), // 0x04: return lands here
             jal(0, 0),      // 0x08: j . (halt loop)
             addi(11, 0, 2), // 0x0c: "callee"
             jal(5, -12),    // 0x10: t0 = 0x14, -> 0x04
         ]);
-        step(&mut cpu, &mut mem).unwrap();
+        step(&mut cpu, &mem).unwrap();
         assert_eq!(cpu.x[1], BASE + 4);
         assert_eq!(cpu.pc, BASE + 0x0c);
-        run(&mut cpu, &mut mem, 3);
+        run(&mut cpu, &mem, 3);
         assert_eq!(cpu.x[10], 1);
         assert_eq!(cpu.x[11], 2);
         assert_eq!(cpu.x[5], BASE + 0x14);
         assert_eq!(cpu.pc, BASE + 0x08);
         // `j .` spins in place and never writes x0.
-        run(&mut cpu, &mut mem, 10);
+        run(&mut cpu, &mem, 10);
         assert_eq!(cpu.pc, BASE + 0x08);
         assert_eq!(cpu.x[0], 0);
     }
 
     #[test]
     fn jalr_call_and_return() {
-        let (mut cpu, mut mem) = setup(&[
+        let (mut cpu, mem) = setup(&[
             auipc(5, 0),      // 0x00: t0 = BASE
             jalr(1, 5, 0x11), // 0x04: call BASE+0x10 (bit 0 cleared), ra = 0x08
             jal(0, 0),        // 0x08: j .
@@ -746,7 +797,7 @@ mod tests {
             addi(10, 0, 7),   // 0x10: callee
             jalr(0, 1, 0),    // 0x14: ret
         ]);
-        run(&mut cpu, &mut mem, 5);
+        run(&mut cpu, &mem, 5);
         assert_eq!(cpu.x[1], BASE + 8);
         assert_eq!(cpu.x[10], 7);
         assert_eq!(cpu.pc, BASE + 8);
@@ -758,7 +809,7 @@ mod tests {
 
     #[test]
     fn loads_extend_correctly() {
-        let (mut cpu, mut mem) = setup(&[]);
+        let (mut cpu, mem) = setup(&[]);
         mem.write(DATA, &0x8899_aabb_ccdd_eeffu64.to_le_bytes()).unwrap();
         // (funct3, expected)
         let cases = [
@@ -774,7 +825,7 @@ mod tests {
             mem.load_words(BASE, &[load(f3, 10, 11, -8)]).unwrap();
             cpu.pc = BASE;
             cpu.set_x(11, DATA + 8);
-            step(&mut cpu, &mut mem).unwrap();
+            step(&mut cpu, &mem).unwrap();
             assert_eq!(cpu.x[10], want, "funct3 {f3:#05b}");
         }
     }
@@ -787,11 +838,11 @@ mod tests {
             (0b010, 0xaaaa_aaaa_5566_7788),    // sw
             (0b011, 0x1122_3344_5566_7788),    // sd
         ] {
-            let (mut cpu, mut mem) = setup(&[store(f3, 11, 12, 0)]);
+            let (mut cpu, mem) = setup(&[store(f3, 11, 12, 0)]);
             mem.write(DATA, &[0xaa; 8]).unwrap();
             cpu.set_x(11, DATA);
             cpu.set_x(12, 0x1122_3344_5566_7788);
-            step(&mut cpu, &mut mem).unwrap();
+            step(&mut cpu, &mem).unwrap();
             let mut got = [0; 8];
             mem.read(DATA, &mut got).unwrap();
             assert_eq!(u64::from_le_bytes(got), want, "funct3 {f3:#05b}");
@@ -806,7 +857,7 @@ mod tests {
         );
         assert_eq!(cpu.x[10], 0x0102_0304_0506_0708);
         assert_eq!(cpu.x[13], 0x0506);
-        assert_eq!(mem.bytes[0x801..0x809], [8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(mem.bytes()[0x801..0x809], [8, 7, 6, 5, 4, 3, 2, 1]);
     }
 
     #[test]
@@ -831,17 +882,17 @@ mod tests {
             ),
         ];
         for (w, want) in cases {
-            let (mut cpu, mut mem) = setup(&[addi(10, 0, 1), w]);
+            let (mut cpu, mem) = setup(&[addi(10, 0, 1), w]);
             let before = {
-                step(&mut cpu, &mut mem).unwrap();
+                step(&mut cpu, &mem).unwrap();
                 cpu.clone()
             };
-            assert_eq!(step(&mut cpu, &mut mem), Err(want));
+            assert_eq!(step(&mut cpu, &mem), Err(want));
             assert_eq!(cpu, before);
         }
 
-        let (_, mut mem) = setup(&[]);
+        let (_, mem) = setup(&[]);
         let mut cpu = CpuState::new(0x10);
-        assert_eq!(step(&mut cpu, &mut mem), Err(Trap::FetchFault(MemFault { addr: 0x10 })));
+        assert_eq!(step(&mut cpu, &mem), Err(Trap::FetchFault(MemFault { addr: 0x10 })));
     }
 }

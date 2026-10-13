@@ -28,22 +28,23 @@ fn main() -> ExitCode {
     let envp: Vec<Vec<u8>> =
         std::env::vars_os().map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat()).collect();
 
-    let mut host = DarwinHost;
-    let mut proc = match Process::spawn(&file, &argv, &envp, path.as_bytes(), &mut host) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("rvrun: {}: cannot load: {e:?}", path.to_string_lossy());
-            return ExitCode::from(126);
-        }
-    };
+    let host = DarwinHost;
+    let (mut proc, mut main_thread) =
+        match Process::spawn(&file, &argv, &envp, path.as_bytes(), &host) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("rvrun: {}: cannot load: {e:?}", path.to_string_lossy());
+                return ExitCode::from(126);
+            }
+        };
     proc.log.strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
 
-    match proc.run(&mut host) {
+    match proc.run(&mut main_thread, &host) {
         Exit::Status(status) => ExitCode::from(status as u8),
         exit @ Exit::Trap(trap) => {
             // Match the shell convention for a process killed by a signal.
             let sig = exit.signal().unwrap();
-            eprintln!("rvrun: guest killed by signal {sig}: {trap:?}\n{:?}", proc.cpu);
+            eprintln!("rvrun: guest killed by signal {sig}: {trap:?}\n{:?}", main_thread.cpu);
             ExitCode::from(128 + sig as u8)
         }
     }

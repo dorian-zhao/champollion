@@ -9,10 +9,10 @@
 
 use std::collections::HashSet;
 use std::ffi::CStr;
-use std::io::IoSlice;
+use std::sync::Mutex;
 
-use crate::memory::{MemFault, Memory, Prot};
-use crate::process::Process;
+use crate::memory::{GuestBuf, MemFault, Memory, Prot};
+use crate::process::{Process, Thread};
 
 /// Linux errno values (asm-generic), which differ from Darwin's past 34 (and at 11).
 pub mod errno {
@@ -105,50 +105,58 @@ pub struct Identity {
 /// backend translates them, and translates host errno back to Linux errno. Default
 /// implementations return `ENOSYS`, so a backend (or a test fake) can be filled in
 /// incrementally.
+///
+/// Methods take `&self` and the trait requires `Sync`: guest threads call into one shared
+/// backend concurrently, and a call that blocks (a `read` on a pipe) must only block its
+/// own thread. Buffers are [`GuestBuf`]s, validated but not borrowed, so no lock is held
+/// while the host blocks.
 #[allow(unused_variables)]
-pub trait HostOs {
-    fn read(&mut self, fd: i32, buf: &mut [u8]) -> SysResult {
+pub trait HostOs: Sync {
+    fn read(&self, fd: i32, buf: GuestBuf) -> SysResult {
         Err(errno::ENOSYS)
     }
-    fn write(&mut self, fd: i32, buf: &[u8]) -> SysResult {
+    fn write(&self, fd: i32, buf: GuestBuf) -> SysResult {
         Err(errno::ENOSYS)
     }
-    fn writev(&mut self, fd: i32, bufs: &[IoSlice<'_>]) -> SysResult {
+    fn readv(&self, fd: i32, bufs: &[GuestBuf]) -> SysResult {
         Err(errno::ENOSYS)
     }
-    fn pread(&mut self, fd: i32, buf: &mut [u8], offset: i64) -> SysResult {
+    fn writev(&self, fd: i32, bufs: &[GuestBuf]) -> SysResult {
         Err(errno::ENOSYS)
     }
-    fn openat(&mut self, dirfd: i32, path: &CStr, flags: i32, mode: u32) -> SysResult {
+    fn pread(&self, fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
         Err(errno::ENOSYS)
     }
-    fn close(&mut self, fd: i32) -> SysResult {
+    fn openat(&self, dirfd: i32, path: &CStr, flags: i32, mode: u32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn close(&self, fd: i32) -> SysResult {
         Err(errno::ENOSYS)
     }
     /// `fcntl` with a Linux command and, for `F_SETFL`, Linux flag values; `F_GETFL`
     /// returns Linux flag values.
-    fn fcntl(&mut self, fd: i32, cmd: i32, arg: u64) -> SysResult {
+    fn fcntl(&self, fd: i32, cmd: i32, arg: u64) -> SysResult {
         Err(errno::ENOSYS)
     }
-    fn lseek(&mut self, fd: i32, offset: i64, whence: i32) -> SysResult {
+    fn lseek(&self, fd: i32, offset: i64, whence: i32) -> SysResult {
         Err(errno::ENOSYS)
     }
-    fn fstat(&mut self, fd: i32) -> Result<Stat, i32> {
+    fn fstat(&self, fd: i32) -> Result<Stat, i32> {
         Err(errno::ENOSYS)
     }
-    fn fstatat(&mut self, dirfd: i32, path: &CStr, flags: i32) -> Result<Stat, i32> {
+    fn fstatat(&self, dirfd: i32, path: &CStr, flags: i32) -> Result<Stat, i32> {
         Err(errno::ENOSYS)
     }
     /// Returns `(seconds, nanoseconds)` for a Linux clock id.
-    fn clock_gettime(&mut self, clock_id: i32) -> Result<(i64, i64), i32> {
+    fn clock_gettime(&self, clock_id: i32) -> Result<(i64, i64), i32> {
         Err(errno::ENOSYS)
     }
-    fn getrandom(&mut self, buf: &mut [u8]) -> SysResult {
+    fn getrandom(&self, buf: GuestBuf) -> SysResult {
         Err(errno::ENOSYS)
     }
     /// Terminal size as `struct winsize` (rows, cols, xpixel, ypixel); `ENOTTY` if `fd`
     /// is not a terminal.
-    fn winsize(&mut self, fd: i32) -> Result<[u16; 4], i32> {
+    fn winsize(&self, fd: i32) -> Result<[u16; 4], i32> {
         Err(errno::ENOTTY)
     }
     fn identity(&self) -> Identity {
@@ -159,19 +167,22 @@ pub trait HostOs {
     }
 }
 
-/// What the run loop should do after a syscall.
+/// What the run loop should do after a syscall. Exit statuses are already masked to 8 bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Continue,
-    /// The guest exited with this status (already masked to 8 bits).
-    Exit(i32),
+    /// `exit`: end the calling thread only.
+    ExitThread(i32),
+    /// `exit_group`: end the whole process.
+    ExitGroup(i32),
 }
 
-/// Syscall tracing and one-time warnings for unsupported calls.
+/// Syscall tracing and one-time warnings for unsupported calls. Shared by all threads.
 #[derive(Default)]
 pub struct SyscallLog {
+    /// Set before the guest starts; read-only afterwards.
     pub strace: bool,
-    warned: HashSet<u64>,
+    warned: Mutex<HashSet<u64>>,
 }
 
 const IOV_MAX: u64 = 1024;
@@ -185,24 +196,25 @@ fn efault(_: MemFault) -> i32 {
 }
 
 /// Copy a syscall result out to guest memory, which must be writable by the guest.
-fn put(p: &mut Process, addr: u64, bytes: &[u8]) -> Result<(), i32> {
+fn put(p: &Process, addr: u64, bytes: &[u8]) -> Result<(), i32> {
     p.mem.write(addr, bytes).map_err(efault)
 }
 
-/// Handle the `ecall` at `p.cpu.pc`: read the request from the registers, perform it, write
-/// the result to `a0`, and advance past the `ecall`.
-pub fn dispatch(p: &mut Process, host: &mut dyn HostOs) -> Flow {
-    let nr = p.cpu.x[17];
-    let a: [u64; 6] = std::array::from_fn(|i| p.cpu.x[10 + i]);
+/// Handle the `ecall` at `t.cpu.pc`: read the request from the thread's registers, perform
+/// it, write the result to `a0`, and advance past the `ecall`.
+pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
+    let nr = t.cpu.x[17];
+    let a: [u64; 6] = std::array::from_fn(|i| t.cpu.x[10 + i]);
 
     let result = match nr {
         nr::EXIT | nr::EXIT_GROUP => {
             if p.log.strace {
-                eprintln!("[rvrun] exit_group({}) = ?", a[0] as i32);
+                eprintln!("[rvrun {}] {}({}) = ?", t.tid, name(nr).unwrap(), a[0] as i32);
             }
-            return Flow::Exit(a[0] as i32 & 0xff);
+            let status = a[0] as i32 & 0xff;
+            return if nr == nr::EXIT { Flow::ExitThread(status) } else { Flow::ExitGroup(status) };
         }
-        _ => call(p, host, nr, a),
+        _ => call(p, t, host, nr, a),
     };
 
     if p.log.strace {
@@ -211,7 +223,8 @@ pub fn dispatch(p: &mut Process, host: &mut dyn HostOs) -> Flow {
             Err(e) => format!("-{e} ({})", errno_name(e)),
         };
         eprintln!(
-            "[rvrun] {}({:#x}, {:#x}, {:#x}, {:#x}) = {ret}",
+            "[rvrun {}] {}({:#x}, {:#x}, {:#x}, {:#x}) = {ret}",
+            t.tid,
             name(nr).unwrap_or("?"),
             a[0],
             a[1],
@@ -219,53 +232,29 @@ pub fn dispatch(p: &mut Process, host: &mut dyn HostOs) -> Flow {
             a[3]
         );
     }
-    p.cpu.x[10] = match result {
+    t.cpu.x[10] = match result {
         Ok(v) => v,
         Err(e) => (-(e as i64)) as u64,
     };
-    p.cpu.pc += 4;
+    t.cpu.pc += 4;
     Flow::Continue
 }
 
-fn call(p: &mut Process, host: &mut dyn HostOs, nr: u64, a: [u64; 6]) -> SysResult {
+fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) -> SysResult {
     let fd = a[0] as i32;
+    let buf = |addr, len, need| p.mem.host_buf(addr, len, need).map_err(efault);
     match nr {
-        nr::READ => {
-            let buf = p.mem.slice_mut(a[1], a[2], Prot::WRITE).map_err(efault)?;
-            host.read(fd, buf)
+        nr::READ => host.read(fd, buf(a[1], a[2], Prot::WRITE)?),
+        nr::WRITE => host.write(fd, buf(a[1], a[2], Prot::READ)?),
+        nr::READV | nr::WRITEV => {
+            let need = if nr == nr::READV { Prot::WRITE } else { Prot::READ };
+            let bufs = read_iovec(p, a[1], a[2])?
+                .into_iter()
+                .map(|(base, len)| buf(base, len, need))
+                .collect::<Result<Vec<_>, _>>()?;
+            if nr == nr::READV { host.readv(fd, &bufs) } else { host.writev(fd, &bufs) }
         }
-        nr::WRITE => {
-            let buf = p.mem.slice(a[1], a[2], Prot::READ).map_err(efault)?;
-            host.write(fd, buf)
-        }
-        nr::READV => {
-            // Reads into each buffer in turn. Unlike a real readv this is not atomic with
-            // respect to other readers, which only matters once there are threads.
-            let iov = read_iovec(p, a[1], a[2])?;
-            let mut total = 0;
-            for (base, len) in iov {
-                let buf = p.mem.slice_mut(base, len, Prot::WRITE).map_err(efault)?;
-                let n = host.read(fd, buf)?;
-                total += n;
-                if n < len {
-                    break;
-                }
-            }
-            Ok(total)
-        }
-        nr::WRITEV => {
-            let iov = read_iovec(p, a[1], a[2])?;
-            let bufs: Vec<IoSlice> = iov
-                .iter()
-                .map(|&(base, len)| p.mem.slice(base, len, Prot::READ).map(IoSlice::new))
-                .collect::<Result<_, _>>()
-                .map_err(efault)?;
-            host.writev(fd, &bufs)
-        }
-        nr::PREAD64 => {
-            let buf = p.mem.slice_mut(a[1], a[2], Prot::WRITE).map_err(efault)?;
-            host.pread(fd, buf, a[3] as i64)
-        }
+        nr::PREAD64 => host.pread(fd, buf(a[1], a[2], Prot::WRITE)?, a[3] as i64),
         nr::OPENAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
             host.openat(fd, &path, a[2] as i32, a[3] as u32)
@@ -298,10 +287,7 @@ fn call(p: &mut Process, host: &mut dyn HostOs, nr: u64, a: [u64; 6]) -> SysResu
             put(p, a[1], &ts)?;
             Ok(0)
         }
-        nr::GETRANDOM => {
-            let buf = p.mem.slice_mut(a[0], a[1], Prot::WRITE).map_err(efault)?;
-            host.getrandom(buf)
-        }
+        nr::GETRANDOM => host.getrandom(buf(a[0], a[1], Prot::WRITE)?),
         nr::SCHED_GETAFFINITY => {
             // Until threads arrive in M5, report a single CPU, so programs that size
             // thread pools by CPU count start one worker. Linux returns the number of
@@ -330,7 +316,12 @@ fn call(p: &mut Process, host: &mut dyn HostOs, nr: u64, a: [u64; 6]) -> SysResu
             put(p, a[0], &buf)?;
             Ok(0)
         }
-        nr::SET_TID_ADDRESS | nr::GETTID | nr::GETPID => Ok(host.identity().pid as u64),
+        nr::SET_TID_ADDRESS => {
+            t.clear_child_tid = a[0];
+            Ok(t.tid as u64)
+        }
+        nr::GETTID => Ok(t.tid as u64),
+        nr::GETPID => Ok(host.identity().pid as u64),
         nr::GETPPID => Ok(host.identity().ppid as u64),
         nr::GETUID => Ok(host.identity().uid as u64),
         nr::GETEUID => Ok(host.identity().euid as u64),
@@ -355,7 +346,7 @@ fn call(p: &mut Process, host: &mut dyn HostOs, nr: u64, a: [u64; 6]) -> SysResu
         nr::MUNMAP => p.munmap(a[0], a[1]),
         nr::MPROTECT => p.mprotect(a[0], a[1], a[2] as u32),
         _ => {
-            if p.log.warned.insert(nr) {
+            if p.log.warned.lock().unwrap_or_else(|e| e.into_inner()).insert(nr) {
                 eprintln!("rvrun: unsupported syscall {nr} ({})", name(nr).unwrap_or("unknown"));
             }
             Err(errno::ENOSYS)
@@ -368,7 +359,8 @@ fn read_iovec(p: &Process, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, i32
     if count > IOV_MAX {
         return Err(errno::EINVAL);
     }
-    let raw = p.mem.slice(addr, count * 16, Prot::READ).map_err(efault)?;
+    let mut raw = vec![0u8; count as usize * 16];
+    p.mem.read(addr, &mut raw).map_err(efault)?;
     Ok(raw
         .as_chunks::<16>()
         .0
@@ -384,7 +376,7 @@ fn read_iovec(p: &Process, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, i32
 }
 
 /// Write `st` to the guest as the asm-generic `struct stat` used by riscv64 (128 bytes).
-fn write_stat(p: &mut Process, addr: u64, st: &Stat) -> SysResult {
+fn write_stat(p: &Process, addr: u64, st: &Stat) -> SysResult {
     let mut b = Vec::with_capacity(128);
     b.extend(st.dev.to_le_bytes());
     b.extend(st.ino.to_le_bytes());

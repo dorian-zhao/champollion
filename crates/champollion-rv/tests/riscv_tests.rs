@@ -26,10 +26,10 @@ fn fixtures(suite: &str) -> Vec<PathBuf> {
 fn run_test(path: &Path) -> Result<(), String> {
     let file = std::fs::read(path).map_err(|e| e.to_string())?;
     let elf = loader::parse(&file).map_err(|e| format!("load: {e:?}"))?;
-    let mut mem = loader::load_flat(&elf, 0).ok_or("load: no segments")?;
+    let mem = loader::load_flat(&elf, 0).ok_or("load: no segments")?;
     let mut cpu = CpuState::new(elf.entry);
 
-    match run(&mut cpu, &mut mem, MAX_STEPS) {
+    match run(&mut cpu, &mem, MAX_STEPS) {
         (Some(Trap::Ecall { .. }), _) if cpu.x[17] == SYS_EXIT => match cpu.x[10] {
             0 => Ok(()),
             n => Err(format!("failed test case #{n}")),

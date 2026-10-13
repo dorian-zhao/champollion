@@ -15,8 +15,10 @@ pub struct CpuState {
     pub pc: u64,
     /// `fcsr`: `frm` in bits 7:5, `fflags` in bits 4:0.
     pub fcsr: u32,
-    /// Address reserved by the last `lr`, cleared by any `sc`.
-    pub reservation: Option<u64>,
+    /// `(address, value)` loaded by the last `lr`, cleared by any `sc`. `sc` succeeds only
+    /// if memory still holds `value` (checked with a host compare-and-swap), so stores by
+    /// other threads in between make it fail, as on real hardware (except for ABA).
+    pub reservation: Option<(u64, u64)>,
 }
 
 impl CpuState {

@@ -15,6 +15,9 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{MemFault, Memory};
 
@@ -61,13 +64,89 @@ struct Mapping {
     prot: Prot,
 }
 
+/// A validated host view of guest memory, for handing to the host kernel. Layout-compatible
+/// with `struct iovec`.
+///
+/// Guest memory is shared with other guest threads and can be modified or even unmapped
+/// concurrently, so it is deliberately not a Rust slice. Pass it to system calls, which
+/// report `EFAULT` rather than crash if the memory disappears; only touch it from Rust when
+/// no other guest thread can exist (e.g. in single-threaded tests).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GuestBuf {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+/// Non-overlapping guest mappings, keyed by start address. Adjacent mappings are not
+/// merged; nothing depends on that and it keeps splitting simple.
+#[derive(Default)]
+struct Maps(BTreeMap<u64, Mapping>);
+
+impl Maps {
+    fn is_any_mapped(&self, r: Range<u64>) -> bool {
+        self.0.range(..r.end).next_back().is_some_and(|(_, m)| m.end > r.start)
+    }
+
+    /// Check that `[addr, addr + len)` is mapped with at least `need` permissions.
+    fn covering(&self, addr: u64, len: u64, need: Prot) -> Result<(), MemFault> {
+        let end = addr.checked_add(len).filter(|&e| e <= GUEST_SIZE).ok_or(MemFault { addr })?;
+        let mut at = addr;
+        while at < end {
+            match self.0.range(..=at).next_back() {
+                Some((_, m)) if m.end > at && m.prot.contains(need) => at = m.end,
+                _ => return Err(MemFault { addr: at }),
+            }
+        }
+        Ok(())
+    }
+
+    /// Split mappings so that `r`'s boundaries fall on mapping boundaries, then return the
+    /// mappings inside `r`.
+    fn split_out(&mut self, r: Range<u64>) -> Vec<(u64, Mapping)> {
+        for at in [r.start, r.end] {
+            if let Some((&start, &m)) = self.0.range(..at).next_back()
+                && m.end > at
+            {
+                self.0.insert(start, Mapping { end: at, prot: m.prot });
+                self.0.insert(at, m);
+            }
+        }
+        self.0.range(r.start..r.end).map(|(&s, &m)| (s, m)).collect()
+    }
+
+    /// The highest free range of `len` bytes that ends at or below `limit`.
+    fn find_free(&self, len: u64, limit: u64) -> Result<u64, MapError> {
+        let mut hi = limit.min(GUEST_SIZE) & !(GUEST_PAGE_SIZE - 1);
+        // Walk mappings from the top down, looking for a gap of `len` below `hi`.
+        for (&start, m) in self.0.range(..hi).rev() {
+            if m.end <= hi && hi - m.end >= len {
+                return Ok(hi - len);
+            }
+            hi = hi.min(start);
+        }
+        if hi >= len { Ok(hi - len) } else { Err(MapError::NoSpace) }
+    }
+}
+
+/// The guest address space. Shared by all guest threads: every method takes `&self`.
+///
+/// Concurrency: the mapping table sits behind an `RwLock`. Data accesses hold the read lock
+/// for the duration of the access, so a concurrent `munmap` cannot decommit memory under
+/// them, and touch memory only through atomics (plain `ldr`/`str` on arm64 when aligned),
+/// so racing guest threads never cause undefined behavior on the host side. Mapping changes
+/// take the write lock. [`GuestBuf`]s are validated under the lock but used after it is
+/// released, so blocking host I/O never holds it.
 pub struct GuestMemory {
     base: *mut u8,
     host_page: u64,
-    /// Non-overlapping guest mappings, keyed by start address. Adjacent mappings are not
-    /// merged; nothing depends on that and it keeps splitting simple.
-    maps: BTreeMap<u64, Mapping>,
+    maps: RwLock<Maps>,
 }
+
+// SAFETY: `base` points to a reservation owned by this object for its whole lifetime, and
+// all access to the memory behind it is synchronized as described on the type.
+unsafe impl Send for GuestMemory {}
+unsafe impl Sync for GuestMemory {}
 
 impl GuestMemory {
     pub fn new() -> std::io::Result<Self> {
@@ -88,12 +167,20 @@ impl GuestMemory {
         // SAFETY: sysconf has no preconditions.
         let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         assert!(host_page.is_power_of_two() && host_page >= GUEST_PAGE_SIZE);
-        Ok(Self { base: base.cast(), host_page, maps: BTreeMap::new() })
+        Ok(Self { base: base.cast(), host_page, maps: RwLock::default() })
     }
 
-    /// Host address of guest address `addr`. Only meaningful for `addr < GUEST_SIZE`.
+    /// Host address of guest address 0. Guest address `g` is at `host_base() + g`.
     pub fn host_base(&self) -> *mut u8 {
         self.base
+    }
+
+    fn maps(&self) -> RwLockReadGuard<'_, Maps> {
+        self.maps.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn maps_mut(&self) -> RwLockWriteGuard<'_, Maps> {
+        self.maps.write().unwrap_or_else(|e| e.into_inner())
     }
 
     fn check_range(addr: u64, len: u64) -> Result<Range<u64>, MapError> {
@@ -110,74 +197,82 @@ impl GuestMemory {
 
     /// Map `[addr, addr + len)` with `prot`, zero-filled, replacing anything already mapped
     /// there (like `MAP_FIXED`). `addr` and `len` must be 4 KiB aligned.
-    pub fn map(&mut self, addr: u64, len: u64, prot: Prot) -> Result<(), MapError> {
+    pub fn map(&self, addr: u64, len: u64, prot: Prot) -> Result<(), MapError> {
         let r = Self::check_range(addr, len)?;
-        self.unmap(addr, len)?;
-        self.commit_host(r.clone());
-        self.maps.insert(r.start, Mapping { end: r.end, prot });
+        let mut maps = self.maps_mut();
+        self.unmap_locked(&mut maps, r.clone());
+        self.insert_locked(&mut maps, r, prot);
         Ok(())
     }
 
-    /// Unmap `[addr, addr + len)`. Unmapped pages in the range are ignored.
-    pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), MapError> {
+    /// Map `[addr, addr + len)` only if no page of it is mapped yet. Returns whether it
+    /// did. Check and map happen atomically with respect to other threads.
+    pub fn map_if_free(&self, addr: u64, len: u64, prot: Prot) -> Result<bool, MapError> {
         let r = Self::check_range(addr, len)?;
-        let touched = self.split_out(r.clone());
-        for (start, m) in touched {
-            self.maps.remove(&start);
-            self.release(start..m.end);
+        let mut maps = self.maps_mut();
+        if maps.is_any_mapped(r.clone()) {
+            return Ok(false);
         }
+        self.insert_locked(&mut maps, r, prot);
+        Ok(true)
+    }
+
+    /// Map `len` bytes in the highest free range ending at or below `limit`, and return its
+    /// address. Search and map happen atomically with respect to other threads.
+    pub fn map_anywhere(&self, len: u64, limit: u64, prot: Prot) -> Result<u64, MapError> {
+        if len == 0 || !len.is_multiple_of(GUEST_PAGE_SIZE) {
+            return Err(MapError::Invalid);
+        }
+        let mut maps = self.maps_mut();
+        let addr = maps.find_free(len, limit)?;
+        self.insert_locked(&mut maps, addr..addr + len, prot);
+        Ok(addr)
+    }
+
+    /// Unmap `[addr, addr + len)`. Unmapped pages in the range are ignored.
+    pub fn unmap(&self, addr: u64, len: u64) -> Result<(), MapError> {
+        let r = Self::check_range(addr, len)?;
+        self.unmap_locked(&mut self.maps_mut(), r);
         Ok(())
     }
 
     /// Change the permissions of `[addr, addr + len)`, which must be fully mapped.
-    pub fn protect(&mut self, addr: u64, len: u64, prot: Prot) -> Result<(), MapError> {
+    pub fn protect(&self, addr: u64, len: u64, prot: Prot) -> Result<(), MapError> {
         let r = Self::check_range(addr, len)?;
-        if !self.is_fully_mapped(r.clone()) {
+        let mut maps = self.maps_mut();
+        if maps.covering(r.start, len, Prot::NONE).is_err() {
             return Err(MapError::NotMapped);
         }
-        for (start, _) in self.split_out(r) {
-            self.maps.get_mut(&start).unwrap().prot = prot;
+        for (start, _) in maps.split_out(r) {
+            maps.0.get_mut(&start).unwrap().prot = prot;
         }
         Ok(())
     }
 
     /// The highest free, page-aligned range of `len` bytes that ends at or below `limit`.
+    /// Only a snapshot: use [`map_anywhere`](Self::map_anywhere) to claim it.
     pub fn find_free(&self, len: u64, limit: u64) -> Result<u64, MapError> {
         if len == 0 || !len.is_multiple_of(GUEST_PAGE_SIZE) {
             return Err(MapError::Invalid);
         }
-        let mut hi = limit.min(GUEST_SIZE) & !(GUEST_PAGE_SIZE - 1);
-        // Walk mappings from the top down, looking for a gap of `len` below `hi`.
-        for (&start, m) in self.maps.range(..hi).rev() {
-            if m.end <= hi && hi - m.end >= len {
-                return Ok(hi - len);
-            }
-            hi = hi.min(start);
-        }
-        if hi >= len { Ok(hi - len) } else { Err(MapError::NoSpace) }
+        self.maps().find_free(len, limit)
     }
 
-    /// Whether any page of `[addr, addr + len)` is mapped.
+    /// Whether any page of `r` is mapped (a snapshot).
     pub fn is_any_mapped(&self, r: Range<u64>) -> bool {
-        self.maps.range(..r.end).next_back().is_some_and(|(_, m)| m.end > r.start)
+        self.maps().is_any_mapped(r)
     }
 
-    fn is_fully_mapped(&self, r: Range<u64>) -> bool {
-        self.covering(r.start, r.end - r.start, Prot::NONE).is_ok()
+    fn insert_locked(&self, maps: &mut Maps, r: Range<u64>, prot: Prot) {
+        self.commit_host(r.clone());
+        maps.0.insert(r.start, Mapping { end: r.end, prot });
     }
 
-    /// Split mappings so that `r`'s boundaries fall on mapping boundaries, then return the
-    /// mappings inside `r`.
-    fn split_out(&mut self, r: Range<u64>) -> Vec<(u64, Mapping)> {
-        for at in [r.start, r.end] {
-            if let Some((&start, &m)) = self.maps.range(..at).next_back()
-                && m.end > at
-            {
-                self.maps.insert(start, Mapping { end: at, prot: m.prot });
-                self.maps.insert(at, m);
-            }
+    fn unmap_locked(&self, maps: &mut Maps, r: Range<u64>) {
+        for (start, m) in maps.split_out(r) {
+            maps.0.remove(&start);
+            self.release(maps, start..m.end);
         }
-        self.maps.range(r.start..r.end).map(|(&s, &m)| (s, m)).collect()
     }
 
     /// Host-page-aligned range covering guest range `r`.
@@ -202,16 +297,17 @@ impl GuestMemory {
 
     /// Restore the zero invariant for a just-unmapped guest range: decommit host pages no
     /// longer used by any mapping, and zero the bytes of pages still shared with one.
-    fn release(&mut self, r: Range<u64>) {
+    /// Runs under the write lock, so no data access can be in flight.
+    fn release(&self, maps: &Maps, r: Range<u64>) {
         let hp = self.host_page;
         let hr = self.host_pages(r.clone());
         let mut page = hr.start;
         while page < hr.end {
             let p = page..page + hp;
-            if self.is_any_mapped(p.clone()) {
+            if maps.is_any_mapped(p.clone()) {
                 let z = p.start.max(r.start)..p.end.min(r.end);
-                // SAFETY: committed (a mapping shares this host page) and inside the
-                // reservation.
+                // SAFETY: committed (a mapping shares this host page), inside the
+                // reservation, and no access is in flight under the write lock.
                 unsafe {
                     std::ptr::write_bytes(
                         self.base.add(z.start as usize),
@@ -238,57 +334,103 @@ impl GuestMemory {
         }
     }
 
-    /// Check that `[addr, addr + len)` is mapped with at least `need` permissions.
-    fn covering(&self, addr: u64, len: u64, need: Prot) -> Result<(), MemFault> {
-        let end = addr.checked_add(len).filter(|&e| e <= GUEST_SIZE).ok_or(MemFault { addr })?;
-        let mut at = addr;
-        while at < end {
-            match self.maps.range(..=at).next_back() {
-                Some((_, m)) if m.end > at && m.prot.contains(need) => at = m.end,
-                _ => return Err(MemFault { addr: at }),
-            }
+    /// Validate `[addr, addr + len)` for `need` and return it as a [`GuestBuf`].
+    pub fn host_buf(&self, addr: u64, len: u64, need: Prot) -> Result<GuestBuf, MemFault> {
+        if len > 0 {
+            self.maps().covering(addr, len, need)?;
         }
+        // SAFETY: for len > 0 the range is inside the reservation; for len == 0 the
+        // pointer is never dereferenced, and wrapping_add avoids out-of-bounds UB.
+        Ok(GuestBuf { ptr: self.base.wrapping_add(addr as usize), len: len as usize })
+    }
+
+    /// Copy guest memory into `buf` after checking `need`; atomic per aligned access.
+    fn load(&self, addr: u64, buf: &mut [u8], need: Prot) -> Result<(), MemFault> {
+        let maps = self.maps();
+        maps.covering(addr, buf.len() as u64, need)?;
+        // SAFETY: the range is mapped (committed read/write) and stays so while we hold
+        // the read lock; accesses are atomic, so racing guest stores are not UB.
+        unsafe { atomic_copy_out(self.base.add(addr as usize), buf) };
         Ok(())
     }
 
-    /// Borrow guest memory as a host slice after checking `need` permissions.
-    pub fn slice(&self, addr: u64, len: u64, need: Prot) -> Result<&[u8], MemFault> {
-        if len == 0 {
-            return Ok(&[]);
-        }
-        self.covering(addr, len, need)?;
-        // SAFETY: the range is mapped, hence committed read/write and inside the
-        // reservation; the borrow of `self` prevents unmapping while the slice lives.
-        Ok(unsafe { std::slice::from_raw_parts(self.base.add(addr as usize), len as usize) })
-    }
-
-    pub fn slice_mut(&mut self, addr: u64, len: u64, need: Prot) -> Result<&mut [u8], MemFault> {
-        if len == 0 {
-            return Ok(&mut []);
-        }
-        self.covering(addr, len, need)?;
-        // SAFETY: as in `slice`, and `&mut self` makes the borrow exclusive.
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.base.add(addr as usize), len as usize) })
+    fn store(&self, addr: u64, buf: &[u8], need: Prot) -> Result<(), MemFault> {
+        let maps = self.maps();
+        maps.covering(addr, buf.len() as u64, need)?;
+        // SAFETY: as in `load`.
+        unsafe { atomic_copy_in(self.base.add(addr as usize), buf) };
+        Ok(())
     }
 
     /// Write regardless of guest permissions (for the loader and the kernel side of
     /// syscalls). The range must still be mapped.
-    pub fn write_privileged(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemFault> {
-        self.slice_mut(addr, buf.len() as u64, Prot::NONE)?.copy_from_slice(buf);
-        Ok(())
+    pub fn write_privileged(&self, addr: u64, buf: &[u8]) -> Result<(), MemFault> {
+        self.store(addr, buf, Prot::NONE)
     }
 
     /// Read a NUL-terminated string of at most `max` bytes (excluding the NUL).
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<std::ffi::CString, MemFault> {
         let mut out = Vec::new();
         for i in 0..=max as u64 {
-            let b = self.slice(addr + i, 1, Prot::READ)?[0];
-            if b == 0 {
+            let mut b = [0u8];
+            self.load(addr + i, &mut b, Prot::READ)?;
+            if b[0] == 0 {
                 return Ok(std::ffi::CString::new(out).unwrap());
             }
-            out.push(b);
+            out.push(b[0]);
         }
         Err(MemFault { addr })
+    }
+}
+
+/// Copy from shared memory using atomic loads: one access for naturally aligned 1/2/4/8-byte
+/// values, bytewise otherwise.
+///
+/// # Safety
+/// `src..src + buf.len()` must be valid for reads for the duration of the call.
+unsafe fn atomic_copy_out(src: *mut u8, buf: &mut [u8]) {
+    // SAFETY (all arms): `src` is valid per the caller and aligned where a wider atomic is
+    // used.
+    unsafe {
+        match buf.len() {
+            8 if src.cast::<u64>().is_aligned() => {
+                buf.copy_from_slice(&AtomicU64::from_ptr(src.cast()).load(Relaxed).to_le_bytes())
+            }
+            4 if src.cast::<u32>().is_aligned() => {
+                buf.copy_from_slice(&AtomicU32::from_ptr(src.cast()).load(Relaxed).to_le_bytes())
+            }
+            2 if src.cast::<u16>().is_aligned() => {
+                buf.copy_from_slice(&AtomicU16::from_ptr(src.cast()).load(Relaxed).to_le_bytes())
+            }
+            _ => {
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = AtomicU8::from_ptr(src.add(i)).load(Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Counterpart of [`atomic_copy_out`] for stores.
+///
+/// # Safety
+/// `dst..dst + buf.len()` must be valid for writes for the duration of the call.
+unsafe fn atomic_copy_in(dst: *mut u8, buf: &[u8]) {
+    // SAFETY (all arms): as in `atomic_copy_out`.
+    unsafe {
+        match buf.len() {
+            8 if dst.cast::<u64>().is_aligned() => AtomicU64::from_ptr(dst.cast())
+                .store(u64::from_le_bytes(buf.try_into().unwrap()), Relaxed),
+            4 if dst.cast::<u32>().is_aligned() => AtomicU32::from_ptr(dst.cast())
+                .store(u32::from_le_bytes(buf.try_into().unwrap()), Relaxed),
+            2 if dst.cast::<u16>().is_aligned() => AtomicU16::from_ptr(dst.cast())
+                .store(u16::from_le_bytes(buf.try_into().unwrap()), Relaxed),
+            _ => {
+                for (i, &b) in buf.iter().enumerate() {
+                    AtomicU8::from_ptr(dst.add(i)).store(b, Relaxed);
+                }
+            }
+        }
     }
 }
 
@@ -301,18 +443,66 @@ impl Drop for GuestMemory {
 
 impl Memory for GuestMemory {
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
-        buf.copy_from_slice(self.slice(addr, buf.len() as u64, Prot::READ)?);
-        Ok(())
+        self.load(addr, buf, Prot::READ)
     }
 
-    fn write(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemFault> {
-        self.slice_mut(addr, buf.len() as u64, Prot::WRITE)?.copy_from_slice(buf);
-        Ok(())
+    fn write(&self, addr: u64, buf: &[u8]) -> Result<(), MemFault> {
+        self.store(addr, buf, Prot::WRITE)
     }
 
     fn fetch(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
-        buf.copy_from_slice(self.slice(addr, buf.len() as u64, Prot::EXEC)?);
-        Ok(())
+        self.load(addr, buf, Prot::EXEC)
+    }
+
+    fn atomic_update(
+        &self,
+        addr: u64,
+        size: usize,
+        f: &mut dyn FnMut(u64) -> u64,
+    ) -> Result<u64, MemFault> {
+        let maps = self.maps();
+        maps.covering(addr, size as u64, Prot::RW)?;
+        let p = self.base.wrapping_add(addr as usize);
+        assert!(addr.is_multiple_of(size as u64), "atomics must be naturally aligned");
+        // SAFETY: mapped and aligned; the read lock keeps it mapped.
+        let old = unsafe {
+            match size {
+                4 => AtomicU32::from_ptr(p.cast())
+                    .try_update(SeqCst, SeqCst, |v| Some(f(v as u64) as u32))
+                    .unwrap() as u64,
+                8 => AtomicU64::from_ptr(p.cast())
+                    .try_update(SeqCst, SeqCst, |v| Some(f(v)))
+                    .unwrap(),
+                _ => panic!("unsupported atomic size {size}"),
+            }
+        };
+        Ok(old)
+    }
+
+    fn compare_exchange(
+        &self,
+        addr: u64,
+        size: usize,
+        expected: u64,
+        new: u64,
+    ) -> Result<bool, MemFault> {
+        let maps = self.maps();
+        maps.covering(addr, size as u64, Prot::RW)?;
+        let p = self.base.wrapping_add(addr as usize);
+        assert!(addr.is_multiple_of(size as u64), "atomics must be naturally aligned");
+        // SAFETY: mapped and aligned; the read lock keeps it mapped.
+        let ok = unsafe {
+            match size {
+                4 => AtomicU32::from_ptr(p.cast())
+                    .compare_exchange(expected as u32, new as u32, SeqCst, SeqCst)
+                    .is_ok(),
+                8 => AtomicU64::from_ptr(p.cast())
+                    .compare_exchange(expected, new, SeqCst, SeqCst)
+                    .is_ok(),
+                _ => panic!("unsupported atomic size {size}"),
+            }
+        };
+        Ok(ok)
     }
 }
 
@@ -324,7 +514,7 @@ mod tests {
 
     #[test]
     fn map_read_write_unmap() {
-        let mut m = GuestMemory::new().unwrap();
+        let m = GuestMemory::new().unwrap();
         m.map(0x10000, 2 * P, Prot::RW).unwrap();
         m.write(0x10ffe, &[1, 2, 3, 4]).unwrap(); // across the page boundary
         let mut b = [0; 4];
@@ -342,7 +532,7 @@ mod tests {
 
     #[test]
     fn permissions_are_enforced_per_guest_page() {
-        let mut m = GuestMemory::new().unwrap();
+        let m = GuestMemory::new().unwrap();
         // Two guest pages that share one 16 KiB host page.
         m.map(0x20000, P, Prot::READ | Prot::EXEC).unwrap();
         m.map(0x21000, P, Prot::RW).unwrap();
@@ -364,7 +554,7 @@ mod tests {
 
     #[test]
     fn remapping_reads_as_zero() {
-        let mut m = GuestMemory::new().unwrap();
+        let m = GuestMemory::new().unwrap();
         m.map(0x40000, 2 * P, Prot::RW).unwrap();
         m.write(0x40000, &[0xaa; 8192]).unwrap();
         // Unmap one guest page whose host page is still shared with the other one.
@@ -381,7 +571,7 @@ mod tests {
 
     #[test]
     fn protect_splits_mappings() {
-        let mut m = GuestMemory::new().unwrap();
+        let m = GuestMemory::new().unwrap();
         m.map(0x50000, 3 * P, Prot::RW).unwrap();
         m.protect(0x51000, P, Prot::READ).unwrap();
         m.write(0x50000, &[1]).unwrap();
@@ -391,7 +581,7 @@ mod tests {
 
     #[test]
     fn find_free_searches_top_down() {
-        let mut m = GuestMemory::new().unwrap();
+        let m = GuestMemory::new().unwrap();
         let top = 0x100000;
         assert_eq!(m.find_free(P, top), Ok(top - P));
         m.map(top - P, P, Prot::RW).unwrap();
@@ -406,7 +596,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_ranges() {
-        let mut m = GuestMemory::new().unwrap();
+        let m = GuestMemory::new().unwrap();
         assert_eq!(m.map(0x1001, P, Prot::RW), Err(MapError::Invalid));
         assert_eq!(m.map(0x1000, 100, Prot::RW), Err(MapError::Invalid));
         assert_eq!(m.map(0x1000, 0, Prot::RW), Err(MapError::Invalid));
@@ -419,12 +609,59 @@ mod tests {
 
     #[test]
     fn read_cstr() {
-        let mut m = GuestMemory::new().unwrap();
+        let m = GuestMemory::new().unwrap();
         m.map(0x60000, P, Prot::RW).unwrap();
         m.write(0x60ffb, b"abc\0").unwrap();
         assert_eq!(m.read_cstr(0x60ffb, 10).unwrap().as_bytes(), b"abc");
         assert!(m.read_cstr(0x60ffb, 2).is_err()); // too long
         m.write(0x60ffc, b"xyzw").unwrap(); // runs off the mapping
         assert!(m.read_cstr(0x60ffc, 100).is_err());
+    }
+
+    #[test]
+    fn map_if_free_and_map_anywhere() {
+        let m = GuestMemory::new().unwrap();
+        assert_eq!(m.map_if_free(0x70000, P, Prot::RW), Ok(true));
+        assert_eq!(m.map_if_free(0x6f000, 2 * P, Prot::RW), Ok(false), "overlaps");
+        let top = 0x200000;
+        let a = m.map_anywhere(2 * P, top, Prot::RW).unwrap();
+        assert_eq!(a, top - 2 * P);
+        assert_eq!(m.map_anywhere(P, top, Prot::RW), Ok(top - 3 * P));
+    }
+
+    #[test]
+    fn atomics_are_atomic_across_threads() {
+        let m = GuestMemory::new().unwrap();
+        m.map(0x80000, P, Prot::RW).unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..10_000 {
+                        m.atomic_update(0x80000, 8, &mut |v| v + 1).unwrap();
+                        m.atomic_update(0x80008, 4, &mut |v| v + 1).unwrap();
+                    }
+                });
+            }
+        });
+        let mut b = [0u8; 12];
+        m.read(0x80000, &mut b).unwrap();
+        assert_eq!(u64::from_le_bytes(b[..8].try_into().unwrap()), 80_000);
+        assert_eq!(u32::from_le_bytes(b[8..].try_into().unwrap()), 80_000);
+
+        assert_eq!(m.compare_exchange(0x80008, 4, 80_000, 1), Ok(true));
+        assert_eq!(m.compare_exchange(0x80008, 4, 80_000, 2), Ok(false));
+        assert!(m.atomic_update(0x90000, 4, &mut |v| v).is_err(), "unmapped");
+    }
+
+    #[test]
+    fn host_buf_validates_then_points_into_the_reservation() {
+        let m = GuestMemory::new().unwrap();
+        m.map(0xa0000, P, Prot::READ).unwrap();
+        let b = m.host_buf(0xa0010, 16, Prot::READ).unwrap();
+        assert_eq!(b.ptr, m.host_base().wrapping_add(0xa0010));
+        assert_eq!(b.len, 16);
+        assert!(m.host_buf(0xa0010, 16, Prot::WRITE).is_err());
+        assert!(m.host_buf(0xa0ff0, 32, Prot::READ).is_err());
+        assert!(m.host_buf(0xb0000, 0, Prot::READ).is_ok(), "empty buffers need no mapping");
     }
 }

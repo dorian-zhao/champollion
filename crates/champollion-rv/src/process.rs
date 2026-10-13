@@ -1,4 +1,9 @@
-//! A guest process: CPU state, address space, and the kernel-side state that goes with them.
+//! A guest process and its threads.
+//!
+//! [`Process`] is everything guest threads share: the address space, the program break,
+//! and syscall logging. It is `Sync` and only ever used through `&Process`, so M5 can run
+//! one host thread per guest thread against the same `Process`. [`Thread`] is per-thread:
+//! registers (including the `lr` reservation) and the tid bookkeeping of `clone`.
 //!
 //! Guest address-space layout (2^38 bytes, like Sv39 user space):
 //!
@@ -18,7 +23,9 @@
 use crate::cpu::CpuState;
 use crate::interpreter::{self, Trap};
 use crate::loader::{self, LoadError, StackInit, auxv};
-use crate::memory::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestMemory, MapError, Prot};
+use std::sync::Mutex;
+
+use crate::memory::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Prot};
 use crate::syscall::{self, Flow, HostOs, SysResult, SyscallLog, errno};
 
 pub const STACK_TOP: u64 = GUEST_SIZE;
@@ -77,11 +84,23 @@ impl Exit {
 }
 
 pub struct Process {
-    pub cpu: CpuState,
     pub mem: GuestMemory,
-    brk_start: u64,
-    brk: u64,
+    brk: Mutex<Brk>,
     pub log: SyscallLog,
+}
+
+struct Brk {
+    start: u64,
+    cur: u64,
+}
+
+/// One guest thread.
+pub struct Thread {
+    pub cpu: CpuState,
+    pub tid: u32,
+    /// Set by `set_tid_address`; on thread exit the kernel zeroes it and wakes futex
+    /// waiters (M5, for `pthread_join`).
+    pub clear_child_tid: u64,
 }
 
 fn page_up(a: u64) -> Option<u64> {
@@ -89,25 +108,27 @@ fn page_up(a: u64) -> Option<u64> {
 }
 
 impl Process {
-    /// Load a static executable and set up its stack, ready to run from the entry point.
+    /// Load a static executable and set up its stack. Returns the process and its main
+    /// thread, ready to run from the entry point. The main thread's tid is the pid.
     pub fn spawn(
         file: &[u8],
         argv: &[Vec<u8>],
         envp: &[Vec<u8>],
         execfn: &[u8],
-        host: &mut dyn HostOs,
-    ) -> Result<Self, SpawnError> {
+        host: &dyn HostOs,
+    ) -> Result<(Self, Thread), SpawnError> {
         let elf = loader::parse(file).map_err(SpawnError::Load)?;
         if elf.span().is_none_or(|(_, hi)| hi > MMAP_TOP) {
             return Err(SpawnError::BadLayout);
         }
-        let mut mem = GuestMemory::new().map_err(SpawnError::Reserve)?;
-        let brk = loader::map_elf(&mut mem, &elf).map_err(SpawnError::Map)?;
+        let mem = GuestMemory::new().map_err(SpawnError::Reserve)?;
+        let brk = loader::map_elf(&mem, &elf).map_err(SpawnError::Map)?;
         mem.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::RW).map_err(SpawnError::Map)?;
 
         let id = host.identity();
         let mut random = [0u8; 16];
-        let _ = host.getrandom(&mut random);
+        let rbuf = GuestBuf { ptr: random.as_mut_ptr(), len: random.len() };
+        let _ = host.getrandom(rbuf);
         let auxv = [
             (auxv::AT_PHDR, elf.phdr.unwrap_or(0)),
             (auxv::AT_PHENT, 56),
@@ -125,23 +146,29 @@ impl Process {
             (auxv::AT_SECURE, 0),
         ];
         let init = StackInit { argv, envp, execfn, random, auxv: &auxv };
-        let sp = loader::build_stack(&mut mem, STACK_TOP, &init)
+        let sp = loader::build_stack(&mem, STACK_TOP, &init)
             .map_err(|_| SpawnError::Map(MapError::NoSpace))?;
 
         let mut cpu = CpuState::new(elf.entry);
         cpu.x[2] = sp;
-        Ok(Self { cpu, mem, brk_start: brk, brk, log: SyscallLog::default() })
+        let process =
+            Self { mem, brk: Mutex::new(Brk { start: brk, cur: brk }), log: SyscallLog::default() };
+        Ok((process, Thread { cpu, tid: id.pid, clear_child_tid: 0 }))
     }
 
-    /// Run until the guest exits or dies.
-    pub fn run(&mut self, host: &mut dyn HostOs) -> Exit {
+    /// Run `thread` until it exits or dies.
+    ///
+    /// Until `clone` arrives (M5) the main thread is the only one, so `exit` ends the
+    /// process too; afterwards the process ends when its last thread exits.
+    pub fn run(&self, thread: &mut Thread, host: &dyn HostOs) -> Exit {
         loop {
-            match interpreter::run(&mut self.cpu, &mut self.mem, u64::MAX) {
-                (Some(Trap::Ecall { .. }), _) => {
-                    if let Flow::Exit(status) = syscall::dispatch(self, host) {
+            match interpreter::run(&mut thread.cpu, &self.mem, u64::MAX) {
+                (Some(Trap::Ecall { .. }), _) => match syscall::dispatch(self, thread, host) {
+                    Flow::Continue => {}
+                    Flow::ExitThread(status) | Flow::ExitGroup(status) => {
                         return Exit::Status(status);
                     }
-                }
+                },
                 (Some(trap), _) => return Exit::Trap(trap),
                 (None, _) => unreachable!("run() with u64::MAX steps returned"),
             }
@@ -151,21 +178,20 @@ impl Process {
     /// `brk`: move the program break. Returns the new break, or the old one if the
     /// request is out of range or would collide with another mapping (Linux semantics:
     /// failure is signaled by not moving).
-    pub fn brk(&mut self, addr: u64) -> u64 {
-        if addr < self.brk_start || addr > MMAP_TOP {
-            return self.brk;
+    pub fn brk(&self, addr: u64) -> u64 {
+        let mut brk = self.brk.lock().unwrap_or_else(|e| e.into_inner());
+        if addr < brk.start || addr > MMAP_TOP {
+            return brk.cur;
         }
-        let (old_end, new_end) = (page_up(self.brk).unwrap(), page_up(addr).unwrap());
+        let (old_end, new_end) = (page_up(brk.cur).unwrap(), page_up(addr).unwrap());
         if new_end > old_end {
-            if self.mem.is_any_mapped(old_end..new_end)
-                || self.mem.map(old_end, new_end - old_end, Prot::RW).is_err()
-            {
-                return self.brk;
+            if self.mem.map_if_free(old_end, new_end - old_end, Prot::RW) != Ok(true) {
+                return brk.cur;
             }
         } else if new_end < old_end {
             let _ = self.mem.unmap(new_end, old_end - new_end);
         }
-        self.brk = addr;
+        brk.cur = addr;
         addr
     }
 
@@ -173,8 +199,8 @@ impl Process {
     /// that are writable are not, since writes could never reach the file.
     #[allow(clippy::too_many_arguments)]
     pub fn mmap(
-        &mut self,
-        host: &mut dyn HostOs,
+        &self,
+        host: &dyn HostOs,
         addr: u64,
         len: u64,
         prot: u32,
@@ -207,27 +233,40 @@ impl Process {
         let in_range = |a: u64| {
             a.is_multiple_of(GUEST_PAGE_SIZE) && a.checked_add(len).is_some_and(|e| e <= GUEST_SIZE)
         };
-        let start = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+        // Map read/write first so file contents can be copied in, then apply `prot`.
+        // Choosing an address and mapping it is one atomic step, so concurrent mmaps
+        // from other threads cannot pick the same range.
+        let enomem = |_| errno::ENOMEM;
+        let start = if flags & MAP_FIXED_NOREPLACE != 0 {
             if !in_range(addr) {
                 return Err(errno::EINVAL);
             }
-            if flags & MAP_FIXED_NOREPLACE != 0 && self.mem.is_any_mapped(addr..addr + len) {
+            if !self.mem.map_if_free(addr, len, Prot::RW).map_err(enomem)? {
                 return Err(errno::EEXIST);
             }
             addr
-        } else if addr != 0 && in_range(addr) && !self.mem.is_any_mapped(addr..addr + len) {
+        } else if flags & MAP_FIXED != 0 {
+            if !in_range(addr) {
+                return Err(errno::EINVAL);
+            }
+            self.mem.map(addr, len, Prot::RW).map_err(enomem)?;
+            addr
+        } else if addr != 0
+            && in_range(addr)
+            && self.mem.map_if_free(addr, len, Prot::RW) == Ok(true)
+        {
             addr // a usable hint
         } else {
-            self.mem.find_free(len, MMAP_TOP).map_err(|_| errno::ENOMEM)?
+            self.mem.map_anywhere(len, MMAP_TOP, Prot::RW).map_err(enomem)?
         };
 
-        self.mem.map(start, len, Prot::RW).map_err(|_| errno::ENOMEM)?;
         if !anonymous {
             // Copy the file contents in; bytes past EOF stay zero, as with a real mapping.
-            let buf = self.mem.slice_mut(start, len, Prot::NONE).unwrap();
+            let buf = self.mem.host_buf(start, len, Prot::NONE).unwrap();
             let mut done = 0;
-            while done < buf.len() {
-                match host.pread(fd, &mut buf[done..], (offset + done as u64) as i64) {
+            while done < buf.len {
+                let rest = GuestBuf { ptr: buf.ptr.wrapping_add(done), len: buf.len - done };
+                match host.pread(fd, rest, (offset + done as u64) as i64) {
                     Ok(0) => break,
                     Ok(n) => done += n as usize,
                     Err(e) => {
@@ -241,13 +280,13 @@ impl Process {
         Ok(start)
     }
 
-    pub fn munmap(&mut self, addr: u64, len: u64) -> SysResult {
+    pub fn munmap(&self, addr: u64, len: u64) -> SysResult {
         let len = page_up(len).filter(|&l| l != 0).ok_or(errno::EINVAL)?;
         self.mem.unmap(addr, len).map_err(|_| errno::EINVAL)?;
         Ok(0)
     }
 
-    pub fn mprotect(&mut self, addr: u64, len: u64, prot: u32) -> SysResult {
+    pub fn mprotect(&self, addr: u64, len: u64, prot: u32) -> SysResult {
         if prot & !7 != 0 {
             return Err(errno::EINVAL);
         }
@@ -274,38 +313,43 @@ mod tests {
     const RW: u32 = 3;
     const PRIVATE_ANON: u32 = 0x02 | 0x20;
 
-    /// Captures writes; `pread` serves `file`.
+    /// Captures writes; `pread` serves `file`. Single-threaded tests only, so touching
+    /// guest buffers from Rust is fine here.
     #[derive(Default)]
     struct FakeHost {
-        out: Vec<u8>,
+        out: Mutex<Vec<u8>>,
         file: Vec<u8>,
     }
 
     impl HostOs for FakeHost {
-        fn write(&mut self, _fd: i32, buf: &[u8]) -> SysResult {
-            self.out.extend_from_slice(buf);
-            Ok(buf.len() as u64)
+        fn write(&self, _fd: i32, buf: GuestBuf) -> SysResult {
+            // SAFETY: validated guest memory, and no other guest thread exists.
+            let data = unsafe { std::slice::from_raw_parts(buf.ptr, buf.len) };
+            self.out.lock().unwrap().extend_from_slice(data);
+            Ok(buf.len as u64)
         }
-        fn pread(&mut self, _fd: i32, buf: &mut [u8], offset: i64) -> SysResult {
+        fn pread(&self, _fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
             let rest = self.file.get(offset as usize..).unwrap_or(&[]);
-            let n = rest.len().min(buf.len());
-            buf[..n].copy_from_slice(&rest[..n]);
+            let n = rest.len().min(buf.len);
+            // SAFETY: as in `write`.
+            unsafe { std::ptr::copy_nonoverlapping(rest.as_ptr(), buf.ptr, n) };
             Ok(n as u64)
         }
     }
 
-    fn spawn() -> (Process, FakeHost) {
-        let mut host = FakeHost::default();
-        let p = Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", &mut host).unwrap();
-        (p, host)
+    fn spawn() -> (Process, Thread, FakeHost) {
+        let host = FakeHost::default();
+        let (p, t) = Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", &host).unwrap();
+        (p, t, host)
     }
 
     #[test]
     fn spawn_sets_up_registers_and_stack() {
-        let (p, _) = spawn();
+        let (p, t, _) = spawn();
         let elf = loader::parse(HELLO).unwrap();
-        assert_eq!(p.cpu.pc, elf.entry);
-        let sp = p.cpu.x[2];
+        assert_eq!(t.cpu.pc, elf.entry);
+        assert_eq!(t.tid, 0, "FakeHost reports pid 0");
+        let sp = t.cpu.x[2];
         assert!(sp % 16 == 0 && sp < STACK_TOP && sp > STACK_TOP - STACK_SIZE);
         let mut argc = [0u8; 8];
         p.mem.read(sp, &mut argc).unwrap();
@@ -314,7 +358,7 @@ mod tests {
 
     #[test]
     fn brk_grows_and_shrinks() {
-        let (mut p, _) = spawn();
+        let (p, _, _) = spawn();
         let start = p.brk(0);
         assert_eq!(start % P, 0);
         assert_eq!(p.brk(start - 1), start, "below the start: no change");
@@ -332,55 +376,52 @@ mod tests {
         assert_eq!(b, [0], "regrown pages are zero");
 
         // Growing into an existing mapping fails by not moving.
-        p.mmap(&mut FakeHost::default(), start + 4 * P, P, RW, PRIVATE_ANON | 0x10, -1, 0).unwrap();
+        p.mmap(&FakeHost::default(), start + 4 * P, P, RW, PRIVATE_ANON | 0x10, -1, 0).unwrap();
         assert_eq!(p.brk(start + 5 * P), start + 2 * P);
     }
 
     #[test]
     fn mmap_anonymous() {
-        let (mut p, mut h) = spawn();
-        let a = p.mmap(&mut h, 0, 100, RW, PRIVATE_ANON, -1, 0).unwrap();
+        let (p, _, h) = spawn();
+        let a = p.mmap(&h, 0, 100, RW, PRIVATE_ANON, -1, 0).unwrap();
         assert!(a % P == 0 && a + P <= MMAP_TOP);
-        let b = p.mmap(&mut h, 0, 2 * P, 1, PRIVATE_ANON, -1, 0).unwrap();
+        let b = p.mmap(&h, 0, 2 * P, 1, PRIVATE_ANON, -1, 0).unwrap();
         assert!(b + 2 * P <= a, "allocations go top-down without overlap");
         p.mem.write(a + 99, &[1]).unwrap();
         assert!(p.mem.write(b, &[1]).is_err(), "PROT_READ is enforced");
 
         // A free hint is honored; MAP_FIXED replaces; MAP_FIXED_NOREPLACE refuses.
         let hint = 0x2000_0000;
-        assert_eq!(p.mmap(&mut h, hint, P, RW, PRIVATE_ANON, -1, 0), Ok(hint));
+        assert_eq!(p.mmap(&h, hint, P, RW, PRIVATE_ANON, -1, 0), Ok(hint));
         p.mem.write(hint, &[7]).unwrap();
-        assert_eq!(p.mmap(&mut h, hint, P, RW, PRIVATE_ANON | 0x10, -1, 0), Ok(hint));
+        assert_eq!(p.mmap(&h, hint, P, RW, PRIVATE_ANON | 0x10, -1, 0), Ok(hint));
         let mut v = [9u8];
         p.mem.read(hint, &mut v).unwrap();
         assert_eq!(v, [0]);
-        assert_eq!(
-            p.mmap(&mut h, hint, P, RW, PRIVATE_ANON | 0x10_0000, -1, 0),
-            Err(errno::EEXIST)
-        );
+        assert_eq!(p.mmap(&h, hint, P, RW, PRIVATE_ANON | 0x10_0000, -1, 0), Err(errno::EEXIST));
 
-        assert_eq!(p.mmap(&mut h, 0, 0, RW, PRIVATE_ANON, -1, 0), Err(errno::EINVAL));
-        assert_eq!(p.mmap(&mut h, 0, P, RW, 0x20, -1, 0), Err(errno::EINVAL), "no SHARED/PRIVATE");
-        assert_eq!(p.mmap(&mut h, 0, P, RW, PRIVATE_ANON, -1, 1), Err(errno::EINVAL));
-        assert_eq!(p.mmap(&mut h, 0x1001, P, RW, PRIVATE_ANON | 0x10, -1, 0), Err(errno::EINVAL));
+        assert_eq!(p.mmap(&h, 0, 0, RW, PRIVATE_ANON, -1, 0), Err(errno::EINVAL));
+        assert_eq!(p.mmap(&h, 0, P, RW, 0x20, -1, 0), Err(errno::EINVAL), "no SHARED/PRIVATE");
+        assert_eq!(p.mmap(&h, 0, P, RW, PRIVATE_ANON, -1, 1), Err(errno::EINVAL));
+        assert_eq!(p.mmap(&h, 0x1001, P, RW, PRIVATE_ANON | 0x10, -1, 0), Err(errno::EINVAL));
     }
 
     #[test]
     fn mmap_file_copies_contents() {
-        let (mut p, _) = spawn();
-        let mut h = FakeHost { file: b"0123456789".to_vec(), ..Default::default() };
-        let a = p.mmap(&mut h, 0, P, 1, 0x02, 3, 0).unwrap();
+        let (p, _, _) = spawn();
+        let h = FakeHost { file: b"0123456789".to_vec(), ..Default::default() };
+        let a = p.mmap(&h, 0, P, 1, 0x02, 3, 0).unwrap();
         let mut b = [0u8; 12];
         p.mem.read(a, &mut b).unwrap();
         assert_eq!(&b, b"0123456789\0\0", "bytes past EOF are zero");
         // Writable shared file mappings are refused.
-        assert_eq!(p.mmap(&mut h, 0, P, RW, 0x01, 3, 0), Err(errno::ENODEV));
+        assert_eq!(p.mmap(&h, 0, P, RW, 0x01, 3, 0), Err(errno::ENODEV));
     }
 
     #[test]
     fn munmap_and_mprotect() {
-        let (mut p, mut h) = spawn();
-        let a = p.mmap(&mut h, 0, 3 * P, RW, PRIVATE_ANON, -1, 0).unwrap();
+        let (p, _, h) = spawn();
+        let a = p.mmap(&h, 0, 3 * P, RW, PRIVATE_ANON, -1, 0).unwrap();
         assert_eq!(p.munmap(a + P, P), Ok(0));
         assert!(p.mem.write(a + P, &[1]).is_err());
         p.mem.write(a + 2 * P, &[1]).unwrap();
@@ -392,30 +433,32 @@ mod tests {
 
     #[test]
     fn dispatch_reads_registers_and_writes_result() {
-        let (mut p, mut h) = spawn();
-        let buf = p.mmap(&mut h, 0, P, RW, PRIVATE_ANON, -1, 0).unwrap();
+        let (p, mut t, h) = spawn();
+        let buf = p.mmap(&h, 0, P, RW, PRIVATE_ANON, -1, 0).unwrap();
         p.mem.write(buf, b"hi").unwrap();
-        let pc = p.cpu.pc;
+        let pc = t.cpu.pc;
 
-        p.cpu.x[17] = nr::WRITE;
-        p.cpu.x[10..13].copy_from_slice(&[1, buf, 2]);
-        assert_eq!(dispatch(&mut p, &mut h), Flow::Continue);
-        assert_eq!(h.out, b"hi");
-        assert_eq!(p.cpu.x[10], 2);
-        assert_eq!(p.cpu.pc, pc + 4);
+        t.cpu.x[17] = nr::WRITE;
+        t.cpu.x[10..13].copy_from_slice(&[1, buf, 2]);
+        assert_eq!(dispatch(&p, &mut t, &h), Flow::Continue);
+        assert_eq!(*h.out.lock().unwrap(), b"hi");
+        assert_eq!(t.cpu.x[10], 2);
+        assert_eq!(t.cpu.pc, pc + 4);
 
         // Bad pointer -> -EFAULT; unknown syscall -> -ENOSYS.
-        p.cpu.x[17] = nr::WRITE;
-        p.cpu.x[10..13].copy_from_slice(&[1, 0x10, 2]);
-        dispatch(&mut p, &mut h);
-        assert_eq!(p.cpu.x[10] as i64, -(errno::EFAULT as i64));
-        p.cpu.x[17] = 4000;
-        dispatch(&mut p, &mut h);
-        assert_eq!(p.cpu.x[10] as i64, -(errno::ENOSYS as i64));
+        t.cpu.x[17] = nr::WRITE;
+        t.cpu.x[10..13].copy_from_slice(&[1, 0x10, 2]);
+        dispatch(&p, &mut t, &h);
+        assert_eq!(t.cpu.x[10] as i64, -(errno::EFAULT as i64));
+        t.cpu.x[17] = 4000;
+        dispatch(&p, &mut t, &h);
+        assert_eq!(t.cpu.x[10] as i64, -(errno::ENOSYS as i64));
 
-        // exit_group status is masked to 8 bits.
-        p.cpu.x[17] = nr::EXIT_GROUP;
-        p.cpu.x[10] = 0x1_01;
-        assert_eq!(dispatch(&mut p, &mut h), Flow::Exit(1));
+        // Exit statuses are masked to 8 bits; exit ends a thread, exit_group the process.
+        t.cpu.x[17] = nr::EXIT_GROUP;
+        t.cpu.x[10] = 0x1_01;
+        assert_eq!(dispatch(&p, &mut t, &h), Flow::ExitGroup(1));
+        t.cpu.x[17] = nr::EXIT;
+        assert_eq!(dispatch(&p, &mut t, &h), Flow::ExitThread(1));
     }
 }

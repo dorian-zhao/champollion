@@ -154,7 +154,7 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
 /// `extra` zeroed bytes past the end (e.g. room for a stack). Permissions are ignored.
 pub fn load_flat(elf: &Elf, extra: usize) -> Option<FlatMemory> {
     let (lo, hi) = elf.span()?;
-    let mut mem = FlatMemory::new(lo, (hi - lo) as usize + extra);
+    let mem = FlatMemory::new(lo, (hi - lo) as usize + extra);
     for seg in &elf.segments {
         mem.write(seg.vaddr, seg.data).ok()?;
     }
@@ -188,7 +188,7 @@ fn segment_prot(flags: u32) -> Prot {
 ///
 /// If two segments share a page (linkers normally pad to avoid it), the page gets the
 /// union of their permissions.
-pub fn map_elf(mem: &mut GuestMemory, elf: &Elf) -> Result<u64, MapError> {
+pub fn map_elf(mem: &GuestMemory, elf: &Elf) -> Result<u64, MapError> {
     let mut pages: BTreeMap<u64, Prot> = BTreeMap::new();
     for seg in &elf.segments {
         let prot = segment_prot(seg.flags);
@@ -251,14 +251,14 @@ pub struct StackInit<'a> {
 /// sp -> argc, argv[0..argc], NULL, envp[..], NULL, auxv pairs.., AT_NULL 0
 ///       ... padding, 16 random bytes, argv/envp/execfn strings, 8 zero bytes <- top
 /// ```
-pub fn build_stack(mem: &mut GuestMemory, top: u64, init: &StackInit) -> Result<u64, MemFault> {
+pub fn build_stack(mem: &GuestMemory, top: u64, init: &StackInit) -> Result<u64, MemFault> {
     let mut cur = top - 8; // the topmost word stays zero, as on Linux
-    let mut push_bytes = |mem: &mut GuestMemory, bytes: &[u8]| -> Result<u64, MemFault> {
+    let mut push_bytes = |mem: &GuestMemory, bytes: &[u8]| -> Result<u64, MemFault> {
         cur -= bytes.len() as u64;
         mem.write_privileged(cur, bytes)?;
         Ok(cur)
     };
-    let mut push_str = |mem: &mut GuestMemory, s: &[u8]| -> Result<u64, MemFault> {
+    let mut push_str = |mem: &GuestMemory, s: &[u8]| -> Result<u64, MemFault> {
         let mut v = s.to_vec();
         v.push(0);
         push_bytes(mem, &v)
@@ -312,8 +312,8 @@ mod tests {
     #[test]
     fn maps_hello_with_permissions() {
         let elf = parse(HELLO).unwrap();
-        let mut mem = GuestMemory::new().unwrap();
-        let brk = map_elf(&mut mem, &elf).unwrap();
+        let mem = GuestMemory::new().unwrap();
+        let brk = map_elf(&mem, &elf).unwrap();
         assert_eq!(brk % GUEST_PAGE_SIZE, 0);
         assert!(brk >= elf.span().unwrap().1);
 
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn initial_stack_layout() {
-        let mut mem = GuestMemory::new().unwrap();
+        let mem = GuestMemory::new().unwrap();
         let top = 0x10_0000;
         mem.map(top - 0x4000, 0x4000, Prot::RW).unwrap();
         let argv = [b"prog".to_vec(), b"arg one".to_vec()];
@@ -355,7 +355,7 @@ mod tests {
             random: [7; 16],
             auxv: &[(auxv::AT_PAGESZ, 4096)],
         };
-        let sp = build_stack(&mut mem, top, &init).unwrap();
+        let sp = build_stack(&mem, top, &init).unwrap();
         assert_eq!(sp % 16, 0);
 
         let word = |i: u64| {
