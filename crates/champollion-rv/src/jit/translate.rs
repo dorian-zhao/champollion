@@ -163,8 +163,8 @@ enum Tail {
     /// Leave mid-block to interpret the instruction at `pc`, of which `retired_before`
     /// instructions of this block had retired (instret is corrected accordingly).
     Interpret { pc: u64, retired_before: u32 },
-    /// Continue at the pc computed into `ADDR`: try the jump cache, else exit.
-    Indirect,
+    /// Continue at the pc computed into `ADDR` (a jump-cache miss).
+    Dynamic,
 }
 
 /// Number of entries in the jump cache (a power of two): `(guest pc, host code address)`
@@ -259,6 +259,21 @@ impl Tx {
         let at = self.a.pos();
         self.a.b(at); // patched once the tail exists
         self.tails.push((at, tail));
+    }
+
+    /// Jump to the guest pc in `ADDR` through the jump cache: on a hit, straight to the
+    /// cached host code; on a miss, exit to the dispatcher (which fills the slot).
+    fn indirect(&mut self) {
+        self.a.ubfm(DST, ADDR, 1, JUMP_CACHE_BITS); // index = pc[16:1]
+        self.a.mov_imm(SRC0, self.jump_cache);
+        self.a.add_lsl(DST, SRC0, DST, 4);
+        self.a.ldr_off(SRC0, DST, 0);
+        self.a.ldr_off(SRC1, DST, 8);
+        self.a.cmp(SRC0, ADDR);
+        let miss = self.a.pos();
+        self.a.b_cond(Cond::Ne, miss); // patched once the tail exists
+        self.tails.push((miss, Tail::Dynamic));
+        self.a.br(SRC1);
     }
 
     /// Translate one non-control-flow instruction. Returns false if unsupported.
@@ -859,18 +874,7 @@ impl Tx {
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, exit::INTERPRET as u16, 0);
                 }
-                Tail::Indirect => {
-                    // Inline jump-cache probe: on a hit, jump straight to the target's
-                    // translation; on a miss, let the dispatcher find it (and fill the slot).
-                    self.a.ubfm(DST, ADDR, 1, JUMP_CACHE_BITS); // index = pc[16:1]
-                    self.a.mov_imm(SRC0, self.jump_cache);
-                    self.a.add_lsl(DST, SRC0, DST, 4);
-                    self.a.ldr_off(SRC0, DST, 0);
-                    self.a.ldr_off(SRC1, DST, 8);
-                    self.a.cmp(SRC0, ADDR);
-                    let miss = self.a.pos();
-                    self.a.b_cond(Cond::Ne, miss + 2);
-                    self.a.br(SRC1);
+                Tail::Dynamic => {
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, exit::NEXT as u16, 0);
                 }
@@ -948,8 +952,7 @@ pub fn translate(
                 }
                 tx.link(rd, next);
                 retired += 1;
-                exits.push((tx.a.pos(), None));
-                tx.exit(Tail::Indirect);
+                tx.indirect();
                 ended = true;
                 break;
             }
