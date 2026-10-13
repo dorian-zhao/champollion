@@ -548,6 +548,33 @@ mod tests {
     }
 
     #[test]
+    fn compressed_instructions_advance_by_two() {
+        // 0x00: c.li a0, 5        (2 bytes)
+        // 0x02: c.jalr t0         (2 bytes) -> t0 = BASE + 0x0a, ra = BASE + 0x04
+        // 0x04: addi a1, zero, 1  (4 bytes, at a 2-byte-aligned pc)
+        // 0x08: c.j +4            -> 0x0c
+        // 0x0a: c.addi a0, 1      (callee) ; c.jr ra
+        let (mut cpu, mut mem) = setup(&[]);
+        let halves: [u16; 2] = [0x4515, 0x9282]; // c.li a0, 5 ; c.jalr t0
+        let mut bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        bytes.extend(addi(11, 0, 1).to_le_bytes());
+        for h in [0xa011u16, 0x0505, 0x8082] {
+            // c.j +4 ; c.addi a0, 1 ; c.jr ra
+            bytes.extend(h.to_le_bytes());
+        }
+        mem.write(BASE, &bytes).unwrap();
+        cpu.set_x(5, BASE + 0x0a);
+
+        step(&mut cpu, &mut mem).unwrap(); // c.li
+        assert_eq!((cpu.x[10], cpu.pc), (5, BASE + 2));
+        step(&mut cpu, &mut mem).unwrap(); // c.jalr
+        assert_eq!((cpu.x[1], cpu.pc), (BASE + 4, BASE + 0x0a));
+        run(&mut cpu, &mut mem, 4); // c.addi, c.jr, addi, c.j
+        assert_eq!((cpu.x[10], cpu.x[11]), (6, 1));
+        assert_eq!(cpu.pc, BASE + 0x0c);
+    }
+
+    #[test]
     fn branches_signed_vs_unsigned() {
         // a1 = -1, a2 = 1. Each branch skips the following `addi a0, a0, 1` when taken.
         // (funct3, taken)

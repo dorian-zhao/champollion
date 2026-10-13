@@ -2,6 +2,7 @@
 //! Each `tests/fixtures/*.s` lists instructions one per line; the matching `.bin` is the
 //! assembled `.text`.
 
+use champollion_rv::decoder::inst_len;
 use champollion_rv::decoder::{AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, LoadWidth, StoreWidth};
 use champollion_rv::{Inst, decode};
 
@@ -106,8 +107,16 @@ fn check(source: &str, binary: &[u8], expected: &[(&str, Inst)]) {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('.'))
         .collect();
-    let words: Vec<u32> =
-        binary.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+    // Split the byte stream into instructions using the length encoded in the low bits.
+    let mut words = Vec::new();
+    let mut rest = binary;
+    while !rest.is_empty() {
+        let len = inst_len(u16::from_le_bytes([rest[0], rest[1]])) as usize;
+        let mut w = [0u8; 4];
+        w[..len].copy_from_slice(&rest[..len]);
+        words.push(u32::from_le_bytes(w));
+        rest = &rest[len..];
+    }
 
     assert_eq!(lines.len(), words.len(), "fixture .bin is stale; run tests/fixtures/build.sh");
     assert_eq!(lines.len(), expected.len(), "fixture .s and the table are out of sync");
@@ -188,6 +197,70 @@ fn rv64a() {
     check(
         include_str!("../../../tests/fixtures/rv64a.s"),
         include_bytes!("../../../tests/fixtures/rv64a.bin"),
+        &expected,
+    );
+}
+
+#[test]
+fn rv64c() {
+    use AluOp as A;
+    use AluOp32 as W;
+    use BranchCond as C;
+    use Inst::*;
+    use LoadWidth as L;
+    use StoreWidth as S;
+    let expected = [
+        ("c.addi4spn s0, sp, 4", OpImm { op: A::Add, rd: S0, rs1: SP, imm: 4 }),
+        ("c.addi4spn a5, sp, 1020", OpImm { op: A::Add, rd: A5, rs1: SP, imm: 1020 }),
+        ("c.lw a0, 0(a1)", Load { width: L::W, rd: A0, rs1: A1, offset: 0 }),
+        ("c.lw s1, 124(a5)", Load { width: L::W, rd: S1, rs1: A5, offset: 124 }),
+        ("c.ld a0, 0(a1)", Load { width: L::D, rd: A0, rs1: A1, offset: 0 }),
+        ("c.ld a2, 248(s0)", Load { width: L::D, rd: A2, rs1: S0, offset: 248 }),
+        ("c.sw a0, 124(a1)", Store { width: S::W, rs1: A1, rs2: A0, offset: 124 }),
+        ("c.sd a3, 248(a4)", Store { width: S::D, rs1: A4, rs2: A3, offset: 248 }),
+        ("c.nop", OpImm { op: A::Add, rd: ZERO, rs1: ZERO, imm: 0 }),
+        ("c.addi a0, -32", OpImm { op: A::Add, rd: A0, rs1: A0, imm: -32 }),
+        ("c.addi t6, 31", OpImm { op: A::Add, rd: T6, rs1: T6, imm: 31 }),
+        ("c.addiw a0, -1", OpImm32 { op: W::Add, rd: A0, rs1: A0, imm: -1 }),
+        ("c.li ra, 31", OpImm { op: A::Add, rd: RA, rs1: ZERO, imm: 31 }),
+        ("c.li a0, -32", OpImm { op: A::Add, rd: A0, rs1: ZERO, imm: -32 }),
+        ("c.addi16sp sp, -512", OpImm { op: A::Add, rd: SP, rs1: SP, imm: -512 }),
+        ("c.addi16sp sp, 496", OpImm { op: A::Add, rd: SP, rs1: SP, imm: 496 }),
+        ("c.lui a0, 1", Lui { rd: A0, imm: 0x1000 }),
+        ("c.lui t0, 0xfffff", Lui { rd: T0, imm: -0x1000 }),
+        ("c.lui s1, 0x1f", Lui { rd: S1, imm: 0x1f000 }),
+        ("c.srli a0, 1", OpImm { op: A::Srl, rd: A0, rs1: A0, imm: 1 }),
+        ("c.srli a5, 63", OpImm { op: A::Srl, rd: A5, rs1: A5, imm: 63 }),
+        ("c.srai s0, 63", OpImm { op: A::Sra, rd: S0, rs1: S0, imm: 63 }),
+        ("c.andi a1, -32", OpImm { op: A::And, rd: A1, rs1: A1, imm: -32 }),
+        ("c.andi a1, 31", OpImm { op: A::And, rd: A1, rs1: A1, imm: 31 }),
+        ("c.sub s0, s1", Op { op: A::Sub, rd: S0, rs1: S0, rs2: S1 }),
+        ("c.xor a0, a1", Op { op: A::Xor, rd: A0, rs1: A0, rs2: A1 }),
+        ("c.or a2, a3", Op { op: A::Or, rd: A2, rs1: A2, rs2: A3 }),
+        ("c.and a4, a5", Op { op: A::And, rd: A4, rs1: A4, rs2: A5 }),
+        ("c.subw s0, a5", Op32 { op: W::Sub, rd: S0, rs1: S0, rs2: A5 }),
+        ("c.addw a0, a1", Op32 { op: W::Add, rd: A0, rs1: A0, rs2: A1 }),
+        ("c.j -2048", Jal { rd: ZERO, offset: -2048 }),
+        ("c.j 2046", Jal { rd: ZERO, offset: 2046 }),
+        ("c.beqz a0, -256", Branch { cond: C::Eq, rs1: A0, rs2: ZERO, offset: -256 }),
+        ("c.bnez s1, 254", Branch { cond: C::Ne, rs1: S1, rs2: ZERO, offset: 254 }),
+        ("c.slli a0, 1", OpImm { op: A::Sll, rd: A0, rs1: A0, imm: 1 }),
+        ("c.slli t6, 63", OpImm { op: A::Sll, rd: T6, rs1: T6, imm: 63 }),
+        ("c.lwsp ra, 252(sp)", Load { width: L::W, rd: RA, rs1: SP, offset: 252 }),
+        ("c.lwsp a0, 0(sp)", Load { width: L::W, rd: A0, rs1: SP, offset: 0 }),
+        ("c.ldsp ra, 504(sp)", Load { width: L::D, rd: RA, rs1: SP, offset: 504 }),
+        ("c.ldsp a0, 8(sp)", Load { width: L::D, rd: A0, rs1: SP, offset: 8 }),
+        ("c.jr ra", Jalr { rd: ZERO, rs1: RA, offset: 0 }),
+        ("c.mv a0, a1", Op { op: A::Add, rd: A0, rs1: ZERO, rs2: A1 }),
+        ("c.ebreak", Ebreak),
+        ("c.jalr t0", Jalr { rd: RA, rs1: T0, offset: 0 }),
+        ("c.add a0, t6", Op { op: A::Add, rd: A0, rs1: A0, rs2: T6 }),
+        ("c.swsp ra, 252(sp)", Store { width: S::W, rs1: SP, rs2: RA, offset: 252 }),
+        ("c.sdsp s0, 504(sp)", Store { width: S::D, rs1: SP, rs2: S0, offset: 504 }),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/rv64c.s"),
+        include_bytes!("../../../tests/fixtures/rv64c.bin"),
         &expected,
     );
 }

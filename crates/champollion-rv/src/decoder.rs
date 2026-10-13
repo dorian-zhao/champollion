@@ -1,6 +1,6 @@
 //! RISC-V instruction decoder.
 //!
-//! Covers RV64I, M, and A. Immediates are stored already sign-extended (`lui`/`auipc` already
+//! Covers RV64I, M, A, and C (see [`compressed`]). Immediates are stored already sign-extended (`lui`/`auipc` already
 //! shifted left by 12), and branch/jump offsets are byte offsets relative to the
 //! instruction's own pc. Every immediate fits in an `i32`, which keeps [`Inst`] at 8 bytes.
 
@@ -118,10 +118,14 @@ pub enum AmoOp {
     Maxu,
 }
 
+mod compressed;
+
+pub use compressed::decode_compressed;
+
+/// The raw bits of an instruction that is illegal or not supported yet (16 bits for a
+/// compressed instruction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// A 16-bit compressed instruction (C extension); not supported yet.
-    Compressed(u16),
     Illegal(u32),
 }
 
@@ -204,9 +208,11 @@ pub fn inst_len(lo: u16) -> u64 {
     if lo & 0b11 == 0b11 { 4 } else { 2 }
 }
 
+/// Decode one instruction. If the low two bits are not `0b11`, only the low 16 bits are
+/// used and decoded as a compressed instruction.
 pub fn decode(w: u32) -> Result<Inst, DecodeError> {
     if w & 0b11 != 0b11 {
-        return Err(DecodeError::Compressed(w as u16));
+        return decode_compressed(w as u16);
     }
     let illegal = Err(DecodeError::Illegal(w));
     let (rd, rs1, rs2, f3, f7) = (rd(w), rs1(w), rs2(w), funct3(w), funct7(w));
@@ -516,8 +522,24 @@ mod tests {
         for w in illegal {
             assert_eq!(decode(w), Err(DecodeError::Illegal(w)), "{w:#010x}");
         }
-        assert_eq!(decode(0x0000_0001), Err(DecodeError::Compressed(0x0001))); // c.nop
-        assert_eq!(decode(0x0000_0000), Err(DecodeError::Compressed(0))); // defined illegal
+        let illegal_c = [
+            0x0000, // all zeros: defined illegal
+            0x0010, // c.addi4spn with nzuimm = 0
+            0x2000, // c.fld: D, not yet
+            0x8000, // reserved (Zcb loads/stores)
+            0x2001, // c.addiw with rd = 0
+            0x6101, // c.addi16sp with nzimm = 0
+            0x6081, // c.lui with nzimm = 0
+            0x9c41, // c.mulw-shaped: Zcb
+            0x4002, // c.lwsp with rd = 0
+            0x8002, // c.jr with rs1 = 0
+            0xa002, // c.fsdsp: D, not yet
+        ];
+        for h in illegal_c {
+            assert_eq!(decode(h), Err(DecodeError::Illegal(h)), "{h:#06x}");
+        }
+        // Upper bits are ignored when the low 16 bits are a compressed instruction.
+        assert_eq!(decode(0xffff_0001), decode(0x0001));
     }
 
     #[test]

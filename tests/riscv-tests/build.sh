@@ -13,9 +13,10 @@ isa="$root/third_party/riscv-tests/isa"
 # Tests that need extensions we don't support yet.
 skip="rv64ui/fence_i" # Zifencei + self-modifying code (M3)
 
+# build_suite <suite> <cpu> [output-name]
 build_suite() {
-    suite=$1 cpu=$2
-    out="$root/tests/fixtures/$suite"
+    suite=$1 cpu=$2 name_out=${3:-$1}
+    out="$root/tests/fixtures/$name_out"
     rm -rf "$out" && mkdir -p "$out"
     for src in "$isa/$suite"/*.S; do
         name=$(basename "$src" .S)
@@ -30,3 +31,10 @@ build_suite() {
 build_suite rv64ui generic_rv64
 build_suite rv64um generic_rv64+m
 build_suite rv64ua generic_rv64+m+a
+build_suite rv64uc generic_rv64+c
+
+# The same sources again with C enabled: the assembler compresses every eligible
+# instruction, which exercises the C decoder on hundreds of real instruction sequences.
+build_suite rv64ui generic_rv64+c rv64ui-c
+build_suite rv64um generic_rv64+m+c rv64um-c
+build_suite rv64ua generic_rv64+m+a+c rv64ua-c

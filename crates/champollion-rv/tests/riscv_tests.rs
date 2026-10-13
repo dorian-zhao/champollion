@@ -74,3 +74,23 @@ fn rv64um() {
 fn rv64ua() {
     run_suite("rv64ua", 19);
 }
+
+#[test]
+fn rv64uc() {
+    run_suite("rv64uc", 1);
+}
+
+#[test]
+fn rv64ui_compressed() {
+    run_suite("rv64ui-c", 53);
+}
+
+#[test]
+fn rv64um_compressed() {
+    run_suite("rv64um-c", 13);
+}
+
+#[test]
+fn rv64ua_compressed() {
+    run_suite("rv64ua-c", 19);
+}
