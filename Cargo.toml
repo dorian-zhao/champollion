@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/champollion-rv", "crates/rvrun"]
+members = ["crates/champollion-rv", "crates/rvrun", "crates/softfloat"]
 
 [workspace.package]
 version = "0.1.0"

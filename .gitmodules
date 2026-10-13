@@ -1,3 +1,6 @@
 [submodule "third_party/riscv-tests"]
 	path = third_party/riscv-tests
 	url = https://github.com/riscv-software-src/riscv-tests
+[submodule "third_party/berkeley-softfloat-3"]
+	path = third_party/berkeley-softfloat-3
+	url = https://github.com/ucb-bar/berkeley-softfloat-3

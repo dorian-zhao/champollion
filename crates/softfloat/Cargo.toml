@@ -1,0 +1,16 @@
+[package]
+name = "champollion-softfloat"
+description = "Berkeley SoftFloat 3 with RISC-V specialization: reference FP semantics for Champollion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "softfloat"
+
+[lib]
+name = "softfloat"
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true
