@@ -62,6 +62,8 @@ pub enum Exit {
     Status(i32),
     /// Killed by a fault, as Linux would with the signal [`Exit::signal`] returns.
     Trap(Trap),
+    /// Killed by a signal the guest sent itself (e.g. SIGABRT from `abort()`).
+    Signal(i32),
 }
 
 impl Exit {
@@ -73,6 +75,7 @@ impl Exit {
         const SIGSEGV: i32 = 11;
         match self {
             Exit::Status(_) => None,
+            Exit::Signal(sig) => Some(sig),
             Exit::Trap(t) => Some(match t {
                 Trap::IllegalInstruction { .. } | Trap::ReservedRoundingMode { .. } => SIGILL,
                 Trap::Ebreak { .. } => SIGTRAP,
@@ -88,6 +91,8 @@ pub struct Process {
     pub mem: GuestMemory,
     brk: Mutex<Brk>,
     pub log: SyscallLog,
+    /// Absolute path of the executable, for `/proc/self/exe`.
+    pub exe: Vec<u8>,
 }
 
 struct Brk {
@@ -154,8 +159,14 @@ impl Process {
 
         let mut cpu = CpuState::new(elf.entry);
         cpu.x[2] = sp;
-        let process =
-            Self { mem, brk: Mutex::new(Brk { start: brk, cur: brk }), log: SyscallLog::default() };
+        let exe = {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let path = std::ffi::OsStr::from_bytes(execfn);
+            std::fs::canonicalize(path)
+                .map_or_else(|_| execfn.to_vec(), |p| p.into_os_string().into_vec())
+        };
+        let brk = Mutex::new(Brk { start: brk, cur: brk });
+        let process = Self { mem, brk, log: SyscallLog::default(), exe };
         Ok((process, Thread { cpu, tid: id.pid, clear_child_tid: 0, engine: Engine::new() }))
     }
 
@@ -171,6 +182,7 @@ impl Process {
                     Flow::ExitThread(status) | Flow::ExitGroup(status) => {
                         return Exit::Status(status);
                     }
+                    Flow::Killed(sig) => return Exit::Signal(sig),
                 },
                 (Some(trap), _) => return Exit::Trap(trap),
                 (None, _) => unreachable!("run() with u64::MAX steps returned"),
@@ -281,6 +293,73 @@ impl Process {
         }
         self.mem.protect(start, len, Prot(prot)).unwrap();
         Ok(start)
+    }
+
+    /// `mremap`: resize a mapping in place if the pages after it are free, otherwise move
+    /// it (with `MREMAP_MAYMOVE`), or put it at `new_addr` (with `MREMAP_FIXED`).
+    pub fn mremap(
+        &self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        flags: u32,
+        new_addr: u64,
+    ) -> SysResult {
+        const MAYMOVE: u32 = 1;
+        const FIXED: u32 = 2;
+        let old_len = page_up(old_len).ok_or(errno::EINVAL)?;
+        let new_len = page_up(new_len).filter(|&l| l != 0).ok_or(errno::EINVAL)?;
+        if !old.is_multiple_of(GUEST_PAGE_SIZE)
+            || flags & !(MAYMOVE | FIXED) != 0
+            || (flags & FIXED != 0 && flags & MAYMOVE == 0)
+            || old_len == 0
+        {
+            return Err(errno::EINVAL);
+        }
+        // The whole old range must be one protection, which the new pages inherit.
+        let prot = self.mem.page_prot(old).ok_or(errno::EFAULT)?;
+        let fixed = flags & FIXED != 0;
+        if !fixed {
+            if new_len <= old_len {
+                if new_len < old_len {
+                    self.mem.unmap(old + new_len, old_len - new_len).map_err(|_| errno::EINVAL)?;
+                }
+                return Ok(old);
+            }
+            let tail = old + old_len;
+            if self.mem.map_if_free(tail, new_len - old_len, prot) == Ok(true) {
+                return Ok(old);
+            }
+            if flags & MAYMOVE == 0 {
+                return Err(errno::ENOMEM);
+            }
+        }
+        let dst = if fixed {
+            if !new_addr.is_multiple_of(GUEST_PAGE_SIZE) {
+                return Err(errno::EINVAL);
+            }
+            self.mem.map(new_addr, new_len, prot).map_err(|_| errno::EINVAL)?;
+            new_addr
+        } else {
+            self.mem.map_anywhere(new_len, MMAP_TOP, prot).map_err(|_| errno::ENOMEM)?
+        };
+        self.mem.copy_privileged(old, dst, old_len.min(new_len)).map_err(|_| errno::EFAULT)?;
+        self.mem.unmap(old, old_len).map_err(|_| errno::EINVAL)?;
+        Ok(dst)
+    }
+
+    /// `madvise`: only `MADV_DONTNEED` changes semantics (private pages read as zero
+    /// afterwards); every other advice is a hint we may ignore.
+    pub fn madvise(&self, addr: u64, len: u64, advice: u32) -> SysResult {
+        const MADV_DONTNEED: u32 = 4;
+        if !addr.is_multiple_of(GUEST_PAGE_SIZE) {
+            return Err(errno::EINVAL);
+        }
+        let len = page_up(len).ok_or(errno::EINVAL)?;
+        if advice == MADV_DONTNEED && len > 0 {
+            self.mem.zero_privileged(addr, len).map_err(|_| errno::ENOMEM)?;
+        }
+        Ok(0)
     }
 
     pub fn munmap(&self, addr: u64, len: u64) -> SysResult {

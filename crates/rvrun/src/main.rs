@@ -48,6 +48,10 @@ fn main() -> ExitCode {
         eprintln!("[rvrun] {n} instructions in {secs:.3} s = {:.1} MIPS", n as f64 / secs / 1e6);
     }
     match exit {
+        Exit::Signal(sig) => {
+            eprintln!("rvrun: guest killed by signal {sig}");
+            ExitCode::from(128 + sig as u8)
+        }
         Exit::Status(status) => ExitCode::from(status as u8),
         exit @ Exit::Trap(trap) => {
             // Match the shell convention for a process killed by a signal.

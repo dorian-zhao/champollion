@@ -4,3 +4,6 @@
 [submodule "third_party/berkeley-softfloat-3"]
 	path = third_party/berkeley-softfloat-3
 	url = https://github.com/ucb-bar/berkeley-softfloat-3
+[submodule "third_party/lua"]
+	path = third_party/lua
+	url = https://github.com/lua/lua

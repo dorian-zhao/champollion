@@ -26,44 +26,117 @@ pub mod errno {
     pub const ENODEV: i32 = 19;
     pub const EINVAL: i32 = 22;
     pub const ENOTTY: i32 = 25;
+    pub const ESRCH: i32 = 3;
+    pub const ERANGE: i32 = 34;
     pub const ENOSYS: i32 = 38;
 }
 
-/// Linux RISC-V syscall numbers (asm-generic table).
-pub mod nr {
-    pub const FCNTL: u64 = 25;
-    pub const IOCTL: u64 = 29;
-    pub const OPENAT: u64 = 56;
-    pub const CLOSE: u64 = 57;
-    pub const LSEEK: u64 = 62;
-    pub const READ: u64 = 63;
-    pub const WRITE: u64 = 64;
-    pub const READV: u64 = 65;
-    pub const WRITEV: u64 = 66;
-    pub const PREAD64: u64 = 67;
-    pub const NEWFSTATAT: u64 = 79;
-    pub const FSTAT: u64 = 80;
-    pub const EXIT: u64 = 93;
-    pub const EXIT_GROUP: u64 = 94;
-    pub const SET_TID_ADDRESS: u64 = 96;
-    pub const CLOCK_GETTIME: u64 = 113;
-    pub const RT_SIGACTION: u64 = 134;
-    pub const RT_SIGPROCMASK: u64 = 135;
-    pub const SCHED_GETAFFINITY: u64 = 123;
-    pub const UNAME: u64 = 160;
-    pub const GETPID: u64 = 172;
-    pub const GETPPID: u64 = 173;
-    pub const GETUID: u64 = 174;
-    pub const GETEUID: u64 = 175;
-    pub const GETGID: u64 = 176;
-    pub const GETEGID: u64 = 177;
-    pub const GETTID: u64 = 178;
-    pub const BRK: u64 = 214;
-    pub const MUNMAP: u64 = 215;
-    pub const MMAP: u64 = 222;
-    pub const MPROTECT: u64 = 226;
-    pub const RISCV_FLUSH_ICACHE: u64 = 259;
-    pub const GETRANDOM: u64 = 278;
+/// Declares the syscall table once: `nr::NAME` constants plus [`name`] for traces and
+/// warnings. Entries without an implementation are listed too, so warnings can name them.
+macro_rules! syscalls {
+    ($($id:ident = $num:literal $name:literal,)*) => {
+        /// Linux RISC-V syscall numbers (asm-generic table).
+        pub mod nr {
+            $(pub const $id: u64 = $num;)*
+        }
+
+        pub fn name(n: u64) -> Option<&'static str> {
+            match n {
+                $($num => Some($name),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+syscalls! {
+    GETCWD = 17 "getcwd",
+    DUP = 23 "dup",
+    DUP3 = 24 "dup3",
+    FCNTL = 25 "fcntl",
+    IOCTL = 29 "ioctl",
+    MKDIRAT = 34 "mkdirat",
+    UNLINKAT = 35 "unlinkat",
+    RENAMEAT = 38 "renameat",
+    FTRUNCATE = 46 "ftruncate",
+    FACCESSAT = 48 "faccessat",
+    CHDIR = 49 "chdir",
+    FCHDIR = 50 "fchdir",
+    FCHMOD = 52 "fchmod",
+    FCHMODAT = 53 "fchmodat",
+    OPENAT = 56 "openat",
+    CLOSE = 57 "close",
+    PIPE2 = 59 "pipe2",
+    GETDENTS64 = 61 "getdents64",
+    LSEEK = 62 "lseek",
+    READ = 63 "read",
+    WRITE = 64 "write",
+    READV = 65 "readv",
+    WRITEV = 66 "writev",
+    PREAD64 = 67 "pread64",
+    PWRITE64 = 68 "pwrite64",
+    PPOLL = 73 "ppoll",
+    READLINKAT = 78 "readlinkat",
+    NEWFSTATAT = 79 "newfstatat",
+    FSTAT = 80 "fstat",
+    FSYNC = 82 "fsync",
+    FDATASYNC = 83 "fdatasync",
+    UTIMENSAT = 88 "utimensat",
+    EXIT = 93 "exit",
+    EXIT_GROUP = 94 "exit_group",
+    SET_TID_ADDRESS = 96 "set_tid_address",
+    FUTEX = 98 "futex",
+    SET_ROBUST_LIST = 99 "set_robust_list",
+    NANOSLEEP = 101 "nanosleep",
+    CLOCK_GETTIME = 113 "clock_gettime",
+    CLOCK_NANOSLEEP = 115 "clock_nanosleep",
+    SCHED_GETAFFINITY = 123 "sched_getaffinity",
+    SCHED_YIELD = 124 "sched_yield",
+    KILL = 129 "kill",
+    TKILL = 130 "tkill",
+    TGKILL = 131 "tgkill",
+    RT_SIGACTION = 134 "rt_sigaction",
+    RT_SIGPROCMASK = 135 "rt_sigprocmask",
+    UNAME = 160 "uname",
+    GETRUSAGE = 165 "getrusage",
+    UMASK = 166 "umask",
+    GETPID = 172 "getpid",
+    GETPPID = 173 "getppid",
+    GETUID = 174 "getuid",
+    GETEUID = 175 "geteuid",
+    GETGID = 176 "getgid",
+    GETEGID = 177 "getegid",
+    GETTID = 178 "gettid",
+    SOCKET = 198 "socket",
+    SOCKETPAIR = 199 "socketpair",
+    BIND = 200 "bind",
+    LISTEN = 201 "listen",
+    ACCEPT = 202 "accept",
+    CONNECT = 203 "connect",
+    GETSOCKNAME = 204 "getsockname",
+    GETPEERNAME = 205 "getpeername",
+    SENDTO = 206 "sendto",
+    RECVFROM = 207 "recvfrom",
+    SETSOCKOPT = 208 "setsockopt",
+    GETSOCKOPT = 209 "getsockopt",
+    SHUTDOWN = 210 "shutdown",
+    SENDMSG = 211 "sendmsg",
+    RECVMSG = 212 "recvmsg",
+    BRK = 214 "brk",
+    MUNMAP = 215 "munmap",
+    MREMAP = 216 "mremap",
+    CLONE = 220 "clone",
+    EXECVE = 221 "execve",
+    MMAP = 222 "mmap",
+    MPROTECT = 226 "mprotect",
+    MADVISE = 233 "madvise",
+    WAIT4 = 260 "wait4",
+    RISCV_FLUSH_ICACHE = 259 "riscv_flush_icache",
+    PRLIMIT64 = 261 "prlimit64",
+    RENAMEAT2 = 276 "renameat2",
+    GETRANDOM = 278 "getrandom",
+    RSEQ = 293 "rseq",
+    FACCESSAT2 = 439 "faccessat2",
 }
 
 /// Result of a syscall: `Ok(value)` or `Err(linux_errno)` (positive).
@@ -88,6 +161,28 @@ pub struct Stat {
     pub atime: (i64, i64),
     pub mtime: (i64, i64),
     pub ctime: (i64, i64),
+}
+
+/// A POSIX record lock with Linux `l_type` values (`F_RDLCK` 0, `F_WRLCK` 1, `F_UNLCK` 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Flock {
+    pub typ: i16,
+    pub whence: i16,
+    pub start: i64,
+    pub len: i64,
+    pub pid: i32,
+}
+
+/// The parts of `struct rusage` we report; times are `(seconds, microseconds)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rusage {
+    pub utime: (i64, i64),
+    pub stime: (i64, i64),
+    pub maxrss_kib: i64,
+    pub minflt: i64,
+    pub majflt: i64,
+    pub nvcsw: i64,
+    pub nivcsw: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -160,6 +255,87 @@ pub trait HostOs: Sync {
     fn winsize(&self, fd: i32) -> Result<[u16; 4], i32> {
         Err(errno::ENOTTY)
     }
+    fn pwrite(&self, fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn unlinkat(&self, dirfd: i32, path: &CStr, flags: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn renameat2(
+        &self,
+        olddirfd: i32,
+        old: &CStr,
+        newdirfd: i32,
+        new: &CStr,
+        flags: u32,
+    ) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn mkdirat(&self, dirfd: i32, path: &CStr, mode: u32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn faccessat(&self, dirfd: i32, path: &CStr, mode: i32, flags: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn readlinkat(&self, dirfd: i32, path: &CStr, buf: GuestBuf) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn getcwd(&self) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    fn chdir(&self, path: &CStr) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn fchdir(&self, fd: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn dup(&self, fd: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `dup3`; `flags` may contain Linux `O_CLOEXEC`.
+    fn dup3(&self, old: i32, new: i32, flags: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `pipe2`; `flags` are Linux `O_CLOEXEC`/`O_NONBLOCK`.
+    fn pipe2(&self, flags: i32) -> Result<[i32; 2], i32> {
+        Err(errno::ENOSYS)
+    }
+    fn ftruncate(&self, fd: i32, len: i64) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn fsync(&self, fd: i32, data_only: bool) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn fchmod(&self, fd: i32, mode: u32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn fchmodat(&self, dirfd: i32, path: &CStr, mode: u32, flags: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn umask(&self, mask: u32) -> u32 {
+        0o022
+    }
+    /// Record locks: `F_GETLK`/`F_SETLK`/`F_SETLKW` (Linux command numbers 5/6/7) with the
+    /// lock in host-neutral form. `F_GETLK` updates `lock` in place.
+    fn lock(&self, fd: i32, cmd: i32, lock: &mut Flock) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Sleep for `(seconds, nanoseconds)` on the host.
+    fn nanosleep(&self, duration: (i64, i64)) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Resource usage of the process (`who` = 0) or its children (-1).
+    fn getrusage(&self, who: i32) -> Result<Rusage, i32> {
+        Err(errno::ENOSYS)
+    }
+    /// `(soft, hard)` limit for a Linux `RLIMIT_*` resource; `u64::MAX` is unlimited.
+    fn getrlimit(&self, resource: u32) -> Result<(u64, u64), i32> {
+        Err(errno::ENOSYS)
+    }
+    /// Send a Linux signal number to another host process.
+    fn kill(&self, pid: i32, sig: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
     fn identity(&self) -> Identity {
         Identity::default()
     }
@@ -176,6 +352,9 @@ pub enum Flow {
     ExitThread(i32),
     /// `exit_group`: end the whole process.
     ExitGroup(i32),
+    /// The process sent itself a signal whose default action terminates it (`abort()`
+    /// does this with SIGABRT). Handlers arrive with signals in M5.
+    Killed(i32),
 }
 
 /// Syscall tracing and one-time warnings for unsupported calls. Shared by all threads.
@@ -196,6 +375,69 @@ fn efault(_: MemFault) -> i32 {
     errno::EFAULT
 }
 
+const F_GETLK: i32 = 5;
+const F_SETLK: i32 = 6;
+const F_SETLKW: i32 = 7;
+
+/// Whether sending `sig` to ourselves must end the process now: its default action
+/// terminates, and handlers are not supported yet. Returns the signal if so.
+fn signal_to_self(to_self: bool, sig: i32) -> Option<i32> {
+    // Default action ignore: SIGCHLD 17, SIGCONT 18, SIGURG 23, SIGWINCH 28. Signal 0 only
+    // checks that the target exists.
+    const IGNORED: [i32; 5] = [0, 17, 18, 23, 28];
+    (to_self && !IGNORED.contains(&sig) && (1..=64).contains(&sig)).then_some(sig)
+}
+
+fn read_timespec(p: &Process, addr: u64) -> Result<(i64, i64), i32> {
+    let mut b = [0u8; 16];
+    p.mem.read(addr, &mut b).map_err(efault)?;
+    let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(b[8..].try_into().unwrap());
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(errno::EINVAL);
+    }
+    Ok((sec, nsec))
+}
+
+/// asm-generic `struct flock`: l_type, l_whence (i16), l_start, l_len (i64), l_pid (i32).
+fn read_flock(p: &Process, addr: u64) -> Result<Flock, i32> {
+    let mut b = [0u8; 32];
+    p.mem.read(addr, &mut b).map_err(efault)?;
+    Ok(Flock {
+        typ: i16::from_le_bytes([b[0], b[1]]),
+        whence: i16::from_le_bytes([b[2], b[3]]),
+        start: i64::from_le_bytes(b[8..16].try_into().unwrap()),
+        len: i64::from_le_bytes(b[16..24].try_into().unwrap()),
+        pid: i32::from_le_bytes(b[24..28].try_into().unwrap()),
+    })
+}
+
+fn write_flock(p: &Process, addr: u64, l: &Flock) -> Result<(), i32> {
+    let mut b = [0u8; 32];
+    b[0..2].copy_from_slice(&l.typ.to_le_bytes());
+    b[2..4].copy_from_slice(&l.whence.to_le_bytes());
+    b[8..16].copy_from_slice(&l.start.to_le_bytes());
+    b[16..24].copy_from_slice(&l.len.to_le_bytes());
+    b[24..28].copy_from_slice(&l.pid.to_le_bytes());
+    put(p, addr, &b)
+}
+
+/// Linux `struct rusage` (144 bytes): two timevals, then 14 longs starting with ru_maxrss
+/// (in KiB).
+fn linux_rusage(ru: &Rusage) -> Vec<u8> {
+    let mut b = Vec::with_capacity(144);
+    for (sec, usec) in [ru.utime, ru.stime] {
+        b.extend(sec.to_le_bytes());
+        b.extend(usec.to_le_bytes());
+    }
+    let longs =
+        [ru.maxrss_kib, 0, 0, 0, ru.minflt, ru.majflt, 0, 0, 0, 0, 0, 0, ru.nvcsw, ru.nivcsw];
+    for v in longs {
+        b.extend(v.to_le_bytes());
+    }
+    b
+}
+
 /// Copy a syscall result out to guest memory, which must be writable by the guest.
 fn put(p: &Process, addr: u64, bytes: &[u8]) -> Result<(), i32> {
     p.mem.write(addr, bytes).map_err(efault)
@@ -214,6 +456,29 @@ pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
             }
             let status = a[0] as i32 & 0xff;
             return if nr == nr::EXIT { Flow::ExitThread(status) } else { Flow::ExitGroup(status) };
+        }
+        nr::KILL | nr::TKILL | nr::TGKILL => {
+            let pid = host.identity().pid as i64;
+            let (target, sig) = match nr {
+                nr::KILL => (a[0] as i32 as i64, a[1] as i32),
+                nr::TKILL => (a[0] as i32 as i64, a[1] as i32),
+                _ => (a[1] as i32 as i64, a[2] as i32),
+            };
+            let to_self = target == pid || (nr == nr::KILL && target == 0);
+            match signal_to_self(to_self, sig) {
+                Some(sig) => {
+                    if p.log.strace {
+                        eprintln!(
+                            "[rvrun {}] {}(..., {sig}) = ? (fatal)",
+                            t.tid,
+                            name(nr).unwrap()
+                        );
+                    }
+                    return Flow::Killed(sig);
+                }
+                None if to_self => Ok(0),
+                None => host.kill(target as i32, sig),
+            }
         }
         _ => call(p, t, host, nr, a),
     };
@@ -245,6 +510,7 @@ pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
 fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) -> SysResult {
     let fd = a[0] as i32;
     let buf = |addr, len, need| p.mem.host_buf(addr, len, need).map_err(efault);
+    let cstr = |addr| p.mem.read_cstr(addr, PATH_MAX).map_err(efault);
     match nr {
         nr::READ => host.read(fd, buf(a[1], a[2], Prot::WRITE)?),
         nr::WRITE => host.write(fd, buf(a[1], a[2], Prot::READ)?),
@@ -262,7 +528,17 @@ fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) ->
             host.openat(fd, &path, a[2] as i32, a[3] as u32)
         }
         nr::CLOSE => host.close(fd),
-        nr::FCNTL => host.fcntl(fd, a[1] as i32, a[2]),
+        nr::FCNTL => match a[1] as i32 {
+            cmd @ (F_GETLK | F_SETLK | F_SETLKW) => {
+                let mut lock = read_flock(p, a[2])?;
+                let r = host.lock(fd, cmd, &mut lock)?;
+                if cmd == F_GETLK {
+                    write_flock(p, a[2], &lock)?;
+                }
+                Ok(r)
+            }
+            cmd => host.fcntl(fd, cmd, a[2]),
+        },
         nr::LSEEK => host.lseek(fd, a[1] as i64, a[2] as i32),
         nr::FSTAT => {
             let st = host.fstat(fd)?;
@@ -350,7 +626,106 @@ fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) ->
             p.mem.invalidate_caches();
             Ok(0)
         }
+        nr::PWRITE64 => host.pwrite(fd, buf(a[1], a[2], Prot::READ)?, a[3] as i64),
+        nr::UNLINKAT => host.unlinkat(fd, &cstr(a[1])?, a[2] as i32),
+        nr::RENAMEAT => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, 0),
+        nr::RENAMEAT2 => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, a[4] as u32),
+        nr::MKDIRAT => host.mkdirat(fd, &cstr(a[1])?, a[2] as u32),
+        nr::FACCESSAT => host.faccessat(fd, &cstr(a[1])?, a[2] as i32, 0),
+        nr::FACCESSAT2 => host.faccessat(fd, &cstr(a[1])?, a[2] as i32, a[3] as i32),
+        nr::READLINKAT => {
+            let path = cstr(a[1])?;
+            // There is no /proc on macOS; answer the one entry nearly every program asks.
+            if path.as_bytes() == b"/proc/self/exe" {
+                let n = p.exe.len().min(a[3] as usize);
+                put(p, a[2], &p.exe[..n])?;
+                return Ok(n as u64);
+            }
+            host.readlinkat(fd, &path, buf(a[2], a[3], Prot::WRITE)?)
+        }
+        nr::GETCWD => {
+            // Linux returns the length including the terminating NUL.
+            let mut cwd = host.getcwd()?;
+            cwd.push(0);
+            if cwd.len() as u64 > a[1] {
+                return Err(errno::ERANGE);
+            }
+            put(p, a[0], &cwd)?;
+            Ok(cwd.len() as u64)
+        }
+        nr::CHDIR => host.chdir(&cstr(a[0])?),
+        nr::FCHDIR => host.fchdir(fd),
+        nr::DUP => host.dup(fd),
+        nr::DUP3 => host.dup3(fd, a[1] as i32, a[2] as i32),
+        nr::PIPE2 => {
+            let fds = host.pipe2(a[1] as i32)?;
+            let bytes: Vec<u8> = fds.iter().flat_map(|f| f.to_le_bytes()).collect();
+            put(p, a[0], &bytes)?;
+            Ok(0)
+        }
+        nr::FTRUNCATE => host.ftruncate(fd, a[1] as i64),
+        nr::FSYNC => host.fsync(fd, false),
+        nr::FDATASYNC => host.fsync(fd, true),
+        nr::FCHMOD => host.fchmod(fd, a[1] as u32),
+        nr::FCHMODAT => host.fchmodat(fd, &cstr(a[1])?, a[2] as u32, 0),
+        nr::UMASK => Ok(host.umask(a[0] as u32) as u64),
+        nr::NANOSLEEP => {
+            host.nanosleep(read_timespec(p, a[0])?)?;
+            if a[1] != 0 {
+                put(p, a[1], &[0; 16])?; // no signals yet, so never interrupted
+            }
+            Ok(0)
+        }
+        nr::CLOCK_NANOSLEEP => {
+            const TIMER_ABSTIME: u64 = 1;
+            let (sec, nsec) = read_timespec(p, a[2])?;
+            let duration = if a[1] & TIMER_ABSTIME != 0 {
+                let (now_s, now_ns) = host.clock_gettime(a[0] as i32)?;
+                let total = (sec - now_s) * 1_000_000_000 + (nsec - now_ns);
+                if total <= 0 {
+                    return Ok(0);
+                }
+                (total / 1_000_000_000, total % 1_000_000_000)
+            } else {
+                host.clock_gettime(a[0] as i32)?; // validate the clock id
+                (sec, nsec)
+            };
+            host.nanosleep(duration)?;
+            Ok(0)
+        }
+        nr::SCHED_YIELD => {
+            std::thread::yield_now();
+            Ok(0)
+        }
+        nr::GETRUSAGE => {
+            const RUSAGE_THREAD: i32 = 1;
+            let who = a[0] as i32;
+            let ru = host.getrusage(if who == RUSAGE_THREAD { 0 } else { who })?;
+            put(p, a[1], &linux_rusage(&ru))?;
+            Ok(0)
+        }
+        nr::PRLIMIT64 => {
+            // Only the calling process (pid 0 or our own pid) is supported. New limits are
+            // accepted and ignored: we do not enforce them.
+            if a[0] != 0 && a[0] != host.identity().pid as u64 {
+                return Err(errno::ESRCH);
+            }
+            if a[3] != 0 {
+                const RLIMIT_STACK: u32 = 3;
+                let (soft, hard) = if a[1] as u32 == RLIMIT_STACK {
+                    (crate::process::STACK_SIZE, u64::MAX)
+                } else {
+                    host.getrlimit(a[1] as u32)?
+                };
+                let mut bytes = soft.to_le_bytes().to_vec();
+                bytes.extend(hard.to_le_bytes());
+                put(p, a[3], &bytes)?;
+            }
+            Ok(0)
+        }
         nr::BRK => Ok(p.brk(a[0])),
+        nr::MREMAP => p.mremap(a[0], a[1], a[2], a[3] as u32, a[4]),
+        nr::MADVISE => p.madvise(a[0], a[1], a[2] as u32),
         nr::MMAP => p.mmap(host, a[0], a[1], a[2] as u32, a[3] as u32, a[4] as i32, a[5]),
         nr::MUNMAP => p.munmap(a[0], a[1]),
         nr::MPROTECT => p.mprotect(a[0], a[1], a[2] as u32),
@@ -407,68 +782,6 @@ fn write_stat(p: &Process, addr: u64, st: &Stat) -> SysResult {
     debug_assert_eq!(b.len(), 128);
     put(p, addr, &b)?;
     Ok(0)
-}
-
-pub fn name(nr: u64) -> Option<&'static str> {
-    Some(match nr {
-        nr::FCNTL => "fcntl",
-        nr::IOCTL => "ioctl",
-        nr::OPENAT => "openat",
-        nr::CLOSE => "close",
-        nr::LSEEK => "lseek",
-        nr::READ => "read",
-        nr::WRITE => "write",
-        nr::READV => "readv",
-        nr::WRITEV => "writev",
-        nr::PREAD64 => "pread64",
-        nr::NEWFSTATAT => "newfstatat",
-        nr::FSTAT => "fstat",
-        nr::EXIT => "exit",
-        nr::EXIT_GROUP => "exit_group",
-        nr::SET_TID_ADDRESS => "set_tid_address",
-        nr::CLOCK_GETTIME => "clock_gettime",
-        nr::RT_SIGACTION => "rt_sigaction",
-        nr::RT_SIGPROCMASK => "rt_sigprocmask",
-        nr::SCHED_GETAFFINITY => "sched_getaffinity",
-        nr::UNAME => "uname",
-        nr::GETPID => "getpid",
-        nr::GETPPID => "getppid",
-        nr::GETUID => "getuid",
-        nr::GETEUID => "geteuid",
-        nr::GETGID => "getgid",
-        nr::GETEGID => "getegid",
-        nr::GETTID => "gettid",
-        nr::BRK => "brk",
-        nr::MUNMAP => "munmap",
-        nr::MMAP => "mmap",
-        nr::MPROTECT => "mprotect",
-        nr::RISCV_FLUSH_ICACHE => "riscv_flush_icache",
-        nr::GETRANDOM => "getrandom",
-        // Not implemented yet, but common enough to name in warnings.
-        17 => "getcwd",
-        23 => "dup",
-        24 => "dup3",
-        35 => "unlinkat",
-        48 => "faccessat",
-        49 => "chdir",
-        59 => "pipe2",
-        61 => "getdents64",
-        73 => "ppoll",
-        78 => "readlinkat",
-        98 => "futex",
-        99 => "set_robust_list",
-        101 => "nanosleep",
-        124 => "sched_yield",
-        129 => "kill",
-        131 => "tgkill",
-        220 => "clone",
-        221 => "execve",
-        233 => "madvise",
-        260 => "wait4",
-        261 => "prlimit64",
-        293 => "rseq",
-        _ => return None,
-    })
 }
 
 fn errno_name(e: i32) -> &'static str {

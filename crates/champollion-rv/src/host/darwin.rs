@@ -7,7 +7,7 @@
 use std::ffi::CStr;
 
 use crate::memory::GuestBuf;
-use crate::syscall::{AT_FDCWD, HostOs, Identity, Stat, SysResult, errno};
+use crate::syscall::{AT_FDCWD, Flock, HostOs, Identity, Rusage, Stat, SysResult, errno};
 
 pub struct DarwinHost;
 
@@ -34,7 +34,62 @@ mod linux_o {
 }
 
 const LINUX_AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+const LINUX_AT_REMOVEDIR: i32 = 0x200;
+const LINUX_AT_EACCESS: i32 = 0x200;
 const LINUX_AT_EMPTY_PATH: i32 = 0x1000;
+
+/// Linux signal number -> Darwin. 1–6, 8–9, 11, 13–15, and 21–28 agree.
+fn darwin_signal(sig: i32) -> Option<i32> {
+    Some(match sig {
+        0..=6 | 8 | 9 | 11 | 13..=15 | 21..=28 => sig,
+        7 => libc::SIGBUS,
+        10 => libc::SIGUSR1,
+        12 => libc::SIGUSR2,
+        17 => libc::SIGCHLD,
+        18 => libc::SIGCONT,
+        19 => libc::SIGSTOP,
+        20 => libc::SIGTSTP,
+        29 => libc::SIGIO,
+        31 => libc::SIGSYS,
+        _ => return None, // SIGSTKFLT, SIGPWR, real-time signals
+    })
+}
+
+/// Linux `RLIMIT_*` -> Darwin, or `None` for limits Darwin does not have.
+fn darwin_rlimit(resource: u32) -> Option<libc::c_int> {
+    Some(match resource {
+        0 => libc::RLIMIT_CPU,
+        1 => libc::RLIMIT_FSIZE,
+        2 => libc::RLIMIT_DATA,
+        3 => libc::RLIMIT_STACK,
+        4 => libc::RLIMIT_CORE,
+        5 => libc::RLIMIT_RSS,
+        6 => libc::RLIMIT_NPROC,
+        7 => libc::RLIMIT_NOFILE,
+        8 => libc::RLIMIT_MEMLOCK,
+        9 => libc::RLIMIT_AS,
+        _ => return None,
+    })
+}
+
+/// Set FD_CLOEXEC / O_NONBLOCK on `fd` per Linux `O_CLOEXEC` / `O_NONBLOCK` bits.
+fn apply_fd_flags(fd: i32, linux_flags: i32) -> SysResult {
+    // SAFETY: fcntl on a descriptor we just created.
+    unsafe {
+        if linux_flags & linux_o::CLOEXEC != 0 {
+            check(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) as isize)?;
+        }
+        if linux_flags & linux_o::NONBLOCK != 0 {
+            let fl = check(libc::fcntl(fd, libc::F_GETFL) as isize)? as i32;
+            check(libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) as isize)?;
+        }
+    }
+    Ok(0)
+}
+
+fn timeval(tv: libc::timeval) -> (i64, i64) {
+    (tv.tv_sec, tv.tv_usec as i64)
+}
 
 fn open_flags(linux: i32) -> Result<i32, i32> {
     use linux_o::*;
@@ -291,6 +346,221 @@ impl HostOs for DarwinHost {
         // SAFETY: TIOCGWINSZ writes a struct winsize through the pointer.
         check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } as isize)?;
         Ok([ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel])
+    }
+
+    fn pwrite(&self, fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
+        // SAFETY: the kernel validates the source.
+        check(unsafe { libc::pwrite(fd, buf.ptr.cast(), buf.len, offset) })
+    }
+
+    fn unlinkat(&self, fd: i32, path: &CStr, flags: i32) -> SysResult {
+        if flags & !LINUX_AT_REMOVEDIR != 0 {
+            return Err(errno::EINVAL);
+        }
+        let dflags = if flags & LINUX_AT_REMOVEDIR != 0 { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: path is NUL-terminated.
+        check(unsafe { libc::unlinkat(dirfd(fd), path.as_ptr(), dflags) } as isize)
+    }
+
+    fn renameat2(&self, ofd: i32, old: &CStr, nfd: i32, new: &CStr, flags: u32) -> SysResult {
+        const NOREPLACE: u32 = 1;
+        const EXCHANGE: u32 = 2;
+        let dflags = match flags {
+            0 => 0,
+            NOREPLACE => libc::RENAME_EXCL,
+            EXCHANGE => libc::RENAME_SWAP,
+            _ => return Err(errno::EINVAL),
+        };
+        // SAFETY: both paths are NUL-terminated.
+        check(unsafe {
+            libc::renameatx_np(dirfd(ofd), old.as_ptr(), dirfd(nfd), new.as_ptr(), dflags)
+        } as isize)
+    }
+
+    fn mkdirat(&self, fd: i32, path: &CStr, mode: u32) -> SysResult {
+        // SAFETY: path is NUL-terminated.
+        check(unsafe { libc::mkdirat(dirfd(fd), path.as_ptr(), mode as libc::mode_t) } as isize)
+    }
+
+    fn faccessat(&self, fd: i32, path: &CStr, mode: i32, flags: i32) -> SysResult {
+        if flags & LINUX_AT_EMPTY_PATH != 0 && path.is_empty() {
+            return self.fstat(fd).map(|_| 0); // existence check of the fd itself
+        }
+        let mut dflags = 0;
+        if flags & LINUX_AT_EACCESS != 0 {
+            dflags |= libc::AT_EACCESS;
+        }
+        if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+            dflags |= libc::AT_SYMLINK_NOFOLLOW;
+        }
+        // SAFETY: path is NUL-terminated.
+        check(unsafe { libc::faccessat(dirfd(fd), path.as_ptr(), mode, dflags) } as isize)
+    }
+
+    fn readlinkat(&self, fd: i32, path: &CStr, buf: GuestBuf) -> SysResult {
+        // SAFETY: path is NUL-terminated; the kernel validates the destination.
+        check(unsafe { libc::readlinkat(dirfd(fd), path.as_ptr(), buf.ptr.cast(), buf.len) })
+    }
+
+    fn getcwd(&self) -> Result<Vec<u8>, i32> {
+        use std::os::unix::ffi::OsStringExt;
+        std::env::current_dir()
+            .map(|p| p.into_os_string().into_vec())
+            .map_err(|e| linux_errno(e.raw_os_error().unwrap_or(libc::EIO)))
+    }
+
+    fn chdir(&self, path: &CStr) -> SysResult {
+        // SAFETY: path is NUL-terminated.
+        check(unsafe { libc::chdir(path.as_ptr()) } as isize)
+    }
+
+    fn fchdir(&self, fd: i32) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::fchdir(fd) } as isize)
+    }
+
+    fn dup(&self, fd: i32) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::dup(fd) } as isize)
+    }
+
+    fn dup3(&self, old: i32, new: i32, flags: i32) -> SysResult {
+        if old == new || flags & !linux_o::CLOEXEC != 0 {
+            return Err(errno::EINVAL);
+        }
+        // SAFETY: no pointers.
+        let fd = check(unsafe { libc::dup2(old, new) } as isize)? as i32;
+        apply_fd_flags(fd, flags)?;
+        Ok(fd as u64)
+    }
+
+    fn pipe2(&self, flags: i32) -> Result<[i32; 2], i32> {
+        if flags & !(linux_o::CLOEXEC | linux_o::NONBLOCK) != 0 {
+            return Err(errno::EINVAL);
+        }
+        let mut fds = [0i32; 2];
+        // SAFETY: fds has room for two descriptors.
+        check(unsafe { libc::pipe(fds.as_mut_ptr()) } as isize)?;
+        for fd in fds {
+            apply_fd_flags(fd, flags)?;
+        }
+        Ok(fds)
+    }
+
+    fn ftruncate(&self, fd: i32, len: i64) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::ftruncate(fd, len) } as isize)
+    }
+
+    fn fsync(&self, fd: i32, _data_only: bool) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::fsync(fd) } as isize)
+    }
+
+    fn fchmod(&self, fd: i32, mode: u32) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::fchmod(fd, mode as libc::mode_t) } as isize)
+    }
+
+    fn fchmodat(&self, fd: i32, path: &CStr, mode: u32, flags: i32) -> SysResult {
+        let dflags =
+            if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
+        // SAFETY: path is NUL-terminated.
+        check(unsafe { libc::fchmodat(dirfd(fd), path.as_ptr(), mode as libc::mode_t, dflags) }
+            as isize)
+    }
+
+    fn umask(&self, mask: u32) -> u32 {
+        // SAFETY: no pointers.
+        unsafe { libc::umask(mask as libc::mode_t) as u32 }
+    }
+
+    fn lock(&self, fd: i32, cmd: i32, lock: &mut Flock) -> SysResult {
+        let dcmd = match cmd {
+            5 => libc::F_GETLK,
+            6 => libc::F_SETLK,
+            7 => libc::F_SETLKW,
+            _ => return Err(errno::EINVAL),
+        };
+        let dtype = match lock.typ {
+            0 => libc::F_RDLCK,
+            1 => libc::F_WRLCK,
+            2 => libc::F_UNLCK,
+            _ => return Err(errno::EINVAL),
+        };
+        let mut fl = libc::flock {
+            l_start: lock.start,
+            l_len: lock.len,
+            l_pid: lock.pid,
+            l_type: dtype,
+            l_whence: lock.whence,
+        };
+        // SAFETY: fl is a valid struct flock for the duration of the call.
+        let r = check(unsafe { libc::fcntl(fd, dcmd, &mut fl) } as isize)?;
+        if cmd == 5 {
+            lock.typ = match fl.l_type {
+                libc::F_RDLCK => 0,
+                libc::F_WRLCK => 1,
+                _ => 2,
+            };
+            (lock.whence, lock.start, lock.len, lock.pid) =
+                (fl.l_whence, fl.l_start, fl.l_len, fl.l_pid);
+        }
+        Ok(r)
+    }
+
+    fn nanosleep(&self, (sec, nsec): (i64, i64)) -> SysResult {
+        let mut req = libc::timespec { tv_sec: sec, tv_nsec: nsec };
+        let mut rem = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // Host signals (none reach the guest yet) just restart the remaining sleep.
+        // SAFETY: valid timespec pointers.
+        while unsafe { libc::nanosleep(&req, &mut rem) } != 0 {
+            if last_errno() != 4 {
+                return Err(last_errno());
+            }
+            req = rem;
+        }
+        Ok(0)
+    }
+
+    fn getrusage(&self, who: i32) -> Result<Rusage, i32> {
+        let dwho = match who {
+            0 => libc::RUSAGE_SELF,
+            -1 => libc::RUSAGE_CHILDREN,
+            _ => return Err(errno::EINVAL),
+        };
+        let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: valid out-pointer.
+        check(unsafe { libc::getrusage(dwho, ru.as_mut_ptr()) } as isize)?;
+        // SAFETY: getrusage succeeded.
+        let ru = unsafe { ru.assume_init() };
+        Ok(Rusage {
+            utime: timeval(ru.ru_utime),
+            stime: timeval(ru.ru_stime),
+            maxrss_kib: ru.ru_maxrss / 1024, // Darwin reports bytes, Linux KiB
+            minflt: ru.ru_minflt,
+            majflt: ru.ru_majflt,
+            nvcsw: ru.ru_nvcsw,
+            nivcsw: ru.ru_nivcsw,
+        })
+    }
+
+    fn getrlimit(&self, resource: u32) -> Result<(u64, u64), i32> {
+        if resource > 15 {
+            return Err(errno::EINVAL);
+        }
+        let Some(r) = darwin_rlimit(resource) else { return Ok((u64::MAX, u64::MAX)) };
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: valid out-pointer.
+        check(unsafe { libc::getrlimit(r, &mut rl) } as isize)?;
+        let lim = |v: libc::rlim_t| if v == libc::RLIM_INFINITY { u64::MAX } else { v };
+        Ok((lim(rl.rlim_cur), lim(rl.rlim_max)))
+    }
+
+    fn kill(&self, pid: i32, sig: i32) -> SysResult {
+        let sig = darwin_signal(sig).ok_or(errno::EINVAL)?;
+        // SAFETY: no pointers.
+        check(unsafe { libc::kill(pid, sig) } as isize)
     }
 
     fn identity(&self) -> Identity {

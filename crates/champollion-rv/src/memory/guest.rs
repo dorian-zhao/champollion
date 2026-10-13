@@ -398,6 +398,29 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Copy `len` bytes from guest `src` to guest `dst` regardless of permissions (for
+    /// `mremap`). Both ranges must be mapped. Holds the write lock, so no guest access races.
+    pub fn copy_privileged(&self, src: u64, dst: u64, len: u64) -> Result<(), MemFault> {
+        let maps = self.maps_mut();
+        maps.covering(src, len, Prot::NONE)?;
+        maps.covering(dst, len, Prot::NONE)?;
+        // SAFETY: both ranges are mapped (committed) and the write lock excludes every
+        // other access; `copy` allows overlap.
+        unsafe {
+            std::ptr::copy(self.base.add(src as usize), self.base.add(dst as usize), len as usize)
+        };
+        Ok(())
+    }
+
+    /// Zero `len` mapped bytes at `addr` regardless of permissions (for `MADV_DONTNEED`).
+    pub fn zero_privileged(&self, addr: u64, len: u64) -> Result<(), MemFault> {
+        let maps = self.maps_mut();
+        maps.covering(addr, len, Prot::NONE)?;
+        // SAFETY: mapped, and the write lock excludes every other access.
+        unsafe { std::ptr::write_bytes(self.base.add(addr as usize), 0, len as usize) };
+        Ok(())
+    }
+
     /// Write regardless of guest permissions (for the loader and the kernel side of
     /// syscalls). The range must still be mapped.
     pub fn write_privileged(&self, addr: u64, buf: &[u8]) -> Result<(), MemFault> {
