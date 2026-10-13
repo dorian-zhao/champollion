@@ -53,6 +53,7 @@ pub struct Jit {
     stub_word: usize,
     /// Guest pc -> byte offset of its translation.
     blocks: HashMap<u64, usize, BuildHasherDefault<PcHasher>>,
+    /// `GuestMemory::code_generation` the translations are valid for.
     generation: u64,
     faults: fault::Table,
     /// Exits waiting for their target to be translated: target pc -> byte offsets of the
@@ -60,6 +61,53 @@ pub struct Jit {
     unchained: HashMap<u64, Vec<usize>, BuildHasherDefault<PcHasher>>,
     /// Set to disable chaining (every block returns to the dispatcher), for comparison.
     pub chaining: bool,
+    /// Indirect-jump cache probed inline by generated code; `(guest pc, host address)`
+    /// per slot, with guest pc 1 (never a valid pc) marking an empty slot.
+    jump_cache: Box<[[u64; 2]; translate::JUMP_CACHE_ENTRIES]>,
+    pub stats: Stats,
+}
+
+/// Counters for `RVRUN_STATS`, to see where time goes outside generated code. The cheap
+/// counters are always kept; the per-kind histogram costs a decode per interpreted
+/// instruction, so it is collected only when `detailed` is set.
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub detailed: bool,
+    /// Calls into generated code (each one a full save/restore round trip).
+    pub entries: u64,
+    pub translations: u64,
+    pub resets: u64,
+    /// Instructions run on the interpreter, by kind (the `Inst` variant name).
+    pub interpreted: HashMap<&'static str, u64>,
+}
+
+impl Stats {
+    pub fn report(&self) -> String {
+        let total: u64 = self.interpreted.values().sum();
+        let mut top: Vec<_> = self.interpreted.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        let top: Vec<String> = top.iter().take(6).map(|(k, v)| format!("{k} {v}")).collect();
+        format!(
+            "jit: {} entries, {} translations, {} resets, {total} interpreted [{}]",
+            self.entries,
+            self.translations,
+            self.resets,
+            top.join(", ")
+        )
+    }
+}
+
+/// The variant name of an instruction, for statistics.
+fn kind(inst: &crate::decoder::Inst) -> &'static str {
+    let name = format!("{inst:?}");
+    let end = name.find([' ', '{']).unwrap_or(name.len());
+    // Leak once per distinct name; there are only a few dozen.
+    thread_local! {
+        static NAMES: std::cell::RefCell<HashMap<String, &'static str>> = Default::default();
+    }
+    NAMES.with(|n| {
+        *n.borrow_mut().entry(name[..end].to_string()).or_insert_with_key(|k| k.clone().leak())
+    })
 }
 
 impl Jit {
@@ -84,6 +132,8 @@ impl Jit {
             faults,
             unchained: HashMap::default(),
             chaining: true,
+            jump_cache: Box::new([[1, 0]; translate::JUMP_CACHE_ENTRIES]),
+            stats: Stats::default(),
         };
         jit.reset();
         Ok(jit)
@@ -92,8 +142,10 @@ impl Jit {
     /// Drop every translation and regenerate the trampoline at the start of the buffer.
     fn reset(&mut self) {
         self.code.reset();
+        self.stats.resets += 1;
         self.blocks.clear();
         self.unchained.clear();
+        self.jump_cache.fill([1, 0]);
         let (words, stub) = translate::trampoline();
         let at = self.code.append(&words).expect("trampoline fits");
         // SAFETY: the trampoline is a C-ABI function with this signature.
@@ -112,11 +164,14 @@ impl Jit {
         let block = decode_block(mem, pc)?;
         for attempt in 0..2 {
             let word = (self.code.used() / 4) as i64;
-            let Some(t) = translate::translate(&block, pc, word, self.stub_word as i64) else {
+            let cache = self.jump_cache.as_ptr() as u64;
+            let Some(t) = translate::translate(&block, pc, word, self.stub_word as i64, cache)
+            else {
                 return Ok(None);
             };
             match self.code.append(&t.code) {
                 Some(at) => {
+                    self.stats.translations += 1;
                     self.blocks.insert(pc, at);
                     for (index, site) in t.sites {
                         self.faults.sites.insert(at + 4 * index, site);
@@ -159,13 +214,18 @@ impl Jit {
     /// Run until a trap (including `ecall`), like [`interpreter::run`] with no step limit.
     pub fn run(&mut self, cpu: &mut CpuState, mem: &GuestMemory) -> Trap {
         loop {
-            let generation = mem.generation();
+            let generation = mem.code_generation();
             if generation != self.generation {
                 self.reset();
                 self.generation = generation;
             }
             let at = match self.lookup(cpu.pc, mem) {
-                Ok(Some(at)) => at,
+                Ok(Some(at)) => {
+                    // Let generated indirect jumps find this block without us next time.
+                    self.jump_cache[translate::jump_cache_index(cpu.pc)] =
+                        [cpu.pc, self.code.ptr(at) as u64];
+                    at
+                }
                 Ok(None) => {
                     if let Err(trap) = interpreter::step(cpu, mem) {
                         return trap;
@@ -177,6 +237,7 @@ impl Jit {
             // SAFETY: `at` holds a translation produced for this guest memory layout; it
             // only touches `cpu`, guest memory below `host_base() + GUEST_SIZE` (addresses
             // are masked), and the host stack, and returns through the exit stub.
+            self.stats.entries += 1;
             let code = {
                 let _active = fault::Active::enter(&self.faults);
                 unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at)) }
@@ -185,6 +246,11 @@ impl Jit {
                 exit::NEXT => {}
                 exit::ECALL => return Trap::Ecall { pc: cpu.pc },
                 exit::INTERPRET => {
+                    if self.stats.detailed
+                        && let Ok(block) = decode_block(mem, cpu.pc)
+                    {
+                        *self.stats.interpreted.entry(kind(&block[0].0)).or_default() += 1;
+                    }
                     if let Err(trap) = interpreter::step(cpu, mem) {
                         return trap;
                     }

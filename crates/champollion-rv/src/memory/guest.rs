@@ -138,9 +138,11 @@ impl Maps {
 /// take the write lock. [`GuestBuf`]s are validated under the lock but used after it is
 /// released, so blocking host I/O never holds it.
 ///
-/// Caching: every mapping change bumps [`generation`](Self::generation). Per-thread caches
-/// of mapping state (the [`Tlb`](super::Tlb), decoded blocks) remember the generation they
-/// were filled at and flush when it moves, so they may skip the lock in between. With
+/// Caching: every mapping change bumps [`generation`](Self::generation), and changes that
+/// involve executable pages also bump [`code_generation`](Self::code_generation). Per-thread
+/// caches remember the counter they were filled at and flush when it moves, so they may skip
+/// the lock in between: the [`Tlb`](super::Tlb) follows `generation`, decoded blocks and
+/// translations follow `code_generation`. With
 /// threads (M5), `munmap` must additionally wait until every running thread has observed
 /// the new generation before decommitting host pages.
 pub struct GuestMemory {
@@ -148,6 +150,7 @@ pub struct GuestMemory {
     host_page: u64,
     maps: RwLock<Maps>,
     generation: AtomicU64,
+    code_generation: AtomicU64,
 }
 
 // SAFETY: `base` points to a reservation owned by this object for its whole lifetime, and
@@ -179,6 +182,7 @@ impl GuestMemory {
             host_page,
             maps: RwLock::default(),
             generation: AtomicU64::new(0),
+            code_generation: AtomicU64::new(0),
         })
     }
 
@@ -193,9 +197,25 @@ impl GuestMemory {
         self.generation.load(Acquire)
     }
 
+    /// Counter bumped by mapping changes that involve executable pages (before or after the
+    /// change). Caches of decoded or translated code follow this one, so data-only `mmap`,
+    /// `brk`, and `munmap` traffic leaves them intact.
+    #[inline]
+    pub fn code_generation(&self) -> u64 {
+        self.code_generation.load(Acquire)
+    }
+
     /// Force every thread's caches to flush, e.g. for `riscv_flush_icache`.
     pub fn invalidate_caches(&self) {
         self.generation.fetch_add(1, Release);
+        self.code_generation.fetch_add(1, Release);
+    }
+
+    fn changed(&self, code: bool) {
+        self.generation.fetch_add(1, Release);
+        if code {
+            self.code_generation.fetch_add(1, Release);
+        }
     }
 
     /// Permissions of the guest page containing `addr`, or `None` if it is unmapped.
@@ -276,10 +296,13 @@ impl GuestMemory {
         if maps.covering(r.start, len, Prot::NONE).is_err() {
             return Err(MapError::NotMapped);
         }
+        let mut code = prot.contains(Prot::EXEC);
         for (start, _) in maps.split_out(r) {
-            maps.0.get_mut(&start).unwrap().prot = prot;
+            let m = maps.0.get_mut(&start).unwrap();
+            code |= m.prot.contains(Prot::EXEC);
+            m.prot = prot;
         }
-        self.invalidate_caches();
+        self.changed(code);
         Ok(())
     }
 
@@ -300,15 +323,17 @@ impl GuestMemory {
     fn insert_locked(&self, maps: &mut Maps, r: Range<u64>, prot: Prot) {
         self.commit_host(r.clone());
         maps.0.insert(r.start, Mapping { end: r.end, prot });
-        self.invalidate_caches();
+        self.changed(prot.contains(Prot::EXEC));
     }
 
     fn unmap_locked(&self, maps: &mut Maps, r: Range<u64>) {
+        let mut code = false;
         for (start, m) in maps.split_out(r) {
+            code |= m.prot.contains(Prot::EXEC);
             maps.0.remove(&start);
             self.release(maps, start..m.end);
         }
-        self.invalidate_caches();
+        self.changed(code);
     }
 
     /// Host-page-aligned range covering guest range `r`.

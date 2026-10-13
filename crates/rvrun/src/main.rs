@@ -61,7 +61,10 @@ fn main() -> ExitCode {
     proc.log.strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
     if std::env::var_os("RVRUN_JIT").is_none_or(|v| v != "0") {
         match champollion_rv::jit::Jit::new() {
-            Ok(jit) => main_thread.jit = Some(jit),
+            Ok(mut jit) => {
+                jit.stats.detailed = std::env::var_os("RVRUN_STATS").is_some_and(|v| v != "0");
+                main_thread.jit = Some(jit);
+            }
             Err(e) => eprintln!("rvrun: JIT unavailable ({e}); interpreting"),
         }
     }
@@ -83,6 +86,9 @@ fn main() -> ExitCode {
         let secs = start.elapsed().as_secs_f64();
         let n = main_thread.cpu.instret;
         eprintln!("[rvrun] {n} instructions in {secs:.3} s = {:.1} MIPS", n as f64 / secs / 1e6);
+        if let Some(jit) = &main_thread.jit {
+            eprintln!("[rvrun] {}", jit.stats.report());
+        }
     }
     match exit {
         Exit::Signal(sig) => {

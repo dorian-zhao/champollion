@@ -102,8 +102,18 @@ pub struct Translation {
 enum Tail {
     /// Continue at a static pc with an exit code.
     Static { pc: u64, code: u64 },
-    /// Continue at the pc computed into `ADDR`.
+    /// Continue at the pc computed into `ADDR`: try the jump cache, else exit.
     Indirect,
+}
+
+/// Number of entries in the jump cache (a power of two): `(guest pc, host code address)`
+/// pairs indexed by guest pc bits 1..=12.
+pub const JUMP_CACHE_ENTRIES: usize = 4096;
+const JUMP_CACHE_BITS: u32 = JUMP_CACHE_ENTRIES.trailing_zeros();
+
+/// Jump-cache slot for a guest pc.
+pub fn jump_cache_index(pc: u64) -> usize {
+    ((pc >> 1) as usize) & (JUMP_CACHE_ENTRIES - 1)
 }
 
 struct Tx {
@@ -116,6 +126,8 @@ struct Tx {
     accesses: Vec<(usize, u64, u32, bool)>,
     /// Instructions of this block retired so far (while translating).
     retired: u32,
+    /// Host address of the jump cache.
+    jump_cache: u64,
 }
 
 fn sext(imm: i32) -> u64 {
@@ -426,6 +438,17 @@ impl Tx {
                     self.a.movz(EXIT_CODE, code as u16, 0);
                 }
                 Tail::Indirect => {
+                    // Inline jump-cache probe: on a hit, jump straight to the target's
+                    // translation; on a miss, let the dispatcher find it (and fill the slot).
+                    self.a.ubfm(DST, ADDR, 1, JUMP_CACHE_BITS); // index = pc[12:1]
+                    self.a.mov_imm(SRC0, self.jump_cache);
+                    self.a.add_lsl(DST, SRC0, DST, 4);
+                    self.a.ldr_off(SRC0, DST, 0);
+                    self.a.ldr_off(SRC1, DST, 8);
+                    self.a.cmp(SRC0, ADDR);
+                    let miss = self.a.pos();
+                    self.a.b_cond(Cond::Ne, miss + 2);
+                    self.a.br(SRC1);
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, exit::NEXT as u16, 0);
                 }
@@ -440,12 +463,14 @@ impl Tx {
 
 /// Translate `block` (as decoded at `pc`) into code that will live at word index
 /// `block_word` of the code buffer, whose exit stub is at word index `stub_word`. Returns
-/// `None` if not even the first instruction can be translated.
+/// `None` if not even the first instruction can be translated. Indirect jumps probe the
+/// jump cache at host address `jump_cache`.
 pub fn translate(
     block: &[(Inst, u8)],
     pc: u64,
     block_word: i64,
     stub_word: i64,
+    jump_cache: u64,
 ) -> Option<Translation> {
     let mut tx = Tx {
         a: Asm::new(),
@@ -453,6 +478,7 @@ pub fn translate(
         stub_branches: Vec::new(),
         accesses: Vec::new(),
         retired: 0,
+        jump_cache,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.

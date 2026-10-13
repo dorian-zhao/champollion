@@ -8,8 +8,9 @@
 //!
 //! Behavior is identical to [`interpreter::step`] (the oracle), which the riscv-tests
 //! suites check register-for-register. Cached blocks are dropped when:
-//! - [`GuestMemory::generation`] moves (any mapping change, `riscv_flush_icache`),
-//!   checked before every block;
+//! - [`GuestMemory::code_generation`] moves (a mapping change involving executable pages,
+//!   or `riscv_flush_icache`), checked before every block (the TLB follows the broader
+//!   [`GuestMemory::generation`]);
 //! - this thread executes `fence.i`, which is exactly when RISC-V requires a hart to
 //!   observe its own code modifications. Code modified without `fence.i` may keep running
 //!   stale instructions, as it may on real hardware.
@@ -96,6 +97,7 @@ impl BlockCache {
 pub struct Engine {
     tlb: Tlb,
     generation: u64,
+    code_generation: u64,
     cache: BlockCache,
 }
 
@@ -150,11 +152,6 @@ impl Engine {
         Self::default()
     }
 
-    fn flush(&mut self) {
-        self.tlb.flush();
-        self.cache.clear();
-    }
-
     /// Run until a trap or `max_steps` retired instructions; same contract as
     /// [`interpreter::run`].
     pub fn run(
@@ -168,9 +165,14 @@ impl Engine {
         while retired < max_steps {
             let generation = mem.generation();
             if generation != self.generation {
-                self.flush();
+                self.tlb.flush();
                 self.generation = generation;
-                prev = None;
+                let code_generation = mem.code_generation();
+                if code_generation != self.code_generation {
+                    self.cache.clear();
+                    self.code_generation = code_generation;
+                    prev = None;
+                }
             }
             let tm = TlbMemory { mem, tlb: &self.tlb };
             let cache = &mut self.cache;
@@ -306,9 +308,9 @@ mod tests {
         e.run(&mut cpu, &mem, 1);
         assert_eq!(cpu.x[10], 2);
 
-        // So does any mapping change, via the generation counter.
+        // So does a mapping change involving executable pages, via the code generation...
         mem.write(CODE, &addi(10, 0, 3).to_le_bytes()).unwrap();
-        mem.map(0x30000, 0x1000, Prot::RW).unwrap();
+        mem.protect(CODE, 0x1000, Prot::READ | Prot::WRITE | Prot::EXEC).unwrap();
         cpu.pc = CODE;
         e.run(&mut cpu, &mem, 1);
         assert_eq!(cpu.x[10], 3);
