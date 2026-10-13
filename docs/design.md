@@ -226,7 +226,11 @@ Threads arrive in M5, but the runtime is shaped for them from M2 so that adding 
 
 The locks and per-access permission checks above belong to the **interpreter only**, which is the correctness oracle and the cold-code tier. They must never reach JIT-generated code:
 
-- **JIT loads and stores** are `ldr`/`str` relative to the guest base register, with no lock and no software permission check. Accesses to unmapped memory are caught by the host fault handler and turned into guest `SIGSEGV`, as in QEMU.
+- **JIT loads and stores** are `ldr`/`str` relative to the guest base register, with no lock and no software permission check. Accesses to unmapped memory are caught by the host fault handler and turned into guest `SIGSEGV`, as in QEMU. Host protection works on 16 KiB pages, so generated code deviates from the interpreter where guest permissions are finer:
+  - a guest page that is unmapped (or read-only) but shares a host page with a writable one can be read and written;
+  - a base register at or above 2^38 is masked into the guest space, so its access aliases a lower address instead of faulting.
+
+  The differential fuzzer (`jit::tests::fuzz`) keeps its programs clear of both.
 - **JIT atomics** are single ARM64 LSE instructions (`ldadd`, `swp`, `cas`, ...); `lr`/`sc` become `ldaxr`/`stlxr` or a `cas` against the reserved value.
 - **JIT fences** map RISC-V `pred`/`succ` sets to the cheapest sufficient `dmb` variant (`ish`, `ishld`, `ishst`).
 
