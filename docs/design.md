@@ -174,6 +174,8 @@ A CPU-bound C benchmark (sieve, array traffic, integer hashing; 228 M guest inst
 | Same, lock and permission checks removed (experiment only) | 147 MIPS | 1.55 s | — |
 | **Engine: block cache + software TLB + chaining** | **~270 MIPS** | **0.85 s** | **~23× slower** |
 
+Real program (Lua 5.4 running a fib + table sort + concat script, 1.94 G guest instructions): native 100 ms, engine 10.4 s (183 MIPS), **~104× slower**. Interpreters like Lua are dominated by indirect jumps (their own dispatch loop), which break into short blocks that our chaining cannot link; this is the workload M4's indirect-jump prediction and inline lookup must fix.
+
 The per-access lock and B-tree lookup cost the reference interpreter 3.6×, mostly on instruction fetch. The engine (below) recovers that and more without giving up thread safety. Closing the remaining gap is the JIT's job (M4), as it is for QEMU's TCG.
 
 ### What we borrow from Rosetta 2
@@ -236,6 +238,9 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 ## Decision Log
 
 - **Oct 14, 2026 — Route B first, then route A as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. B covers the daily build → test → debug loop best (instant, no VM, Mac file system); A (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux; see [Goals and Positioning](#goals-and-positioning).
+- **Oct 14, 2026 — Static-PIE moves into M3.** Rust's musl targets link static-PIE by default, so `cargo test` needs it; images load at `PIE_BASE` (2/3 up, like Linux) and relocate themselves.
+- **Oct 14, 2026 — `cargo test` works before threads.** libtest falls back to the main thread when `clone` fails, so the M3 criterion holds without M5; parallel test execution waits for M5.
+- **Oct 14, 2026 — FP reference is Berkeley SoftFloat (RISC-V specialization), vendored.** Same code as Spike; used to fuzz the host-FPU path and as the RMM fallback. Existing crates either fail to build with current CMake or are LGPL.
 - **Oct 14, 2026 — Performance target: ≤ 2× native, stretch Rosetta 2 class (70–80% of native).** See [Target](#target). Consequence for M3: F/D runs on the host FPU, with the interpreter using the same `FPCR`/`FPSR` mapping the JIT will use, so the hardware-mapping claims are validated before M4.
 - **Oct 14, 2026 — Fast interpreter before M3.** A decoded-block cache with chaining plus a software TLB takes the CPU benchmark from 41 to ~270 MIPS (6.6×), and is the cache structure the JIT will reuse; see [What we borrow from Rosetta 2](#what-we-borrow-from-rosetta-2).
 - **Oct 14, 2026 — The runtime is thread-ready from M2.** Process/thread split, `&self` memory with atomic accesses, host atomics for AMOs and `lr`/`sc`, and lock-free host I/O on raw guest buffers; see [Concurrency Model](#concurrency-model). Locks stay interpreter-only.
