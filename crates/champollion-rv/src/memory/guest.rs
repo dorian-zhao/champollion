@@ -421,6 +421,11 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Read regardless of guest permissions (for the debugger). The range must be mapped.
+    pub fn read_privileged(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
+        self.load(addr, buf, Prot::NONE)
+    }
+
     /// Write regardless of guest permissions (for the loader and the kernel side of
     /// syscalls). The range must still be mapped.
     pub fn write_privileged(&self, addr: u64, buf: &[u8]) -> Result<(), MemFault> {
