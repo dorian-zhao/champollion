@@ -77,6 +77,10 @@ pub struct Stats {
     pub entries: u64,
     pub translations: u64,
     pub resets: u64,
+    /// Exits by code (see `translate::exit`), and NEXT exits whose target was already
+    /// translated (a missed chain or jump-cache slot rather than new code).
+    pub exits: [u64; 6],
+    pub next_known: u64,
     /// Instructions run on the interpreter, by kind (the `Inst` variant name).
     pub interpreted: HashMap<&'static str, u64>,
 }
@@ -88,10 +92,13 @@ impl Stats {
         top.sort_by(|a, b| b.1.cmp(a.1));
         let top: Vec<String> = top.iter().take(6).map(|(k, v)| format!("{k} {v}")).collect();
         format!(
-            "jit: {} entries, {} translations, {} resets, {total} interpreted [{}]",
+            "jit: {} entries, {} translations, {} resets, exits next/ecall/interp/fence.i/fault \
+             {:?} ({} next to known blocks), {total} interpreted [{}]",
             self.entries,
             self.translations,
             self.resets,
+            self.exits,
+            self.next_known,
             top.join(", ")
         )
     }
@@ -251,6 +258,10 @@ impl Jit {
                 let _active = fault::Active::enter(&self.faults);
                 unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at), fpcr) }
             };
+            self.stats.exits[code.min(5) as usize] += 1;
+            if code == exit::NEXT && self.blocks.contains_key(&cpu.pc) {
+                self.stats.next_known += 1;
+            }
             match code {
                 exit::NEXT => {}
                 exit::ECALL => return Trap::Ecall { pc: cpu.pc },
@@ -433,6 +444,32 @@ mod tests {
         assert_eq!((cpu.x[14], cpu.x[15], cpu.x[16]), (2, 1, 0));
         assert_eq!(cpu.f[8], 0xffff_ffff_7fc0_0000, "unboxed operand reads as canonical NaN");
         assert_eq!(cpu.fcsr & 0x1f, 0b11001, "NV, DZ, and NX accrued");
+    }
+
+    #[test]
+    fn pinned_and_unpinned_fp_registers_agree() {
+        // f28-f31 live in memory, the rest in host registers; mix them in every role, and
+        // use the fmv/fneg/fabs fast paths (fsgnj* with rs1 == rs2).
+        let dyn_ = 0b111;
+        let fp = |f5, fmt, rm, rd, rs1, rs2| op_fp(f5, fmt, rm, rd, rs1, rs2);
+        let (_, cpu) = same_as_interpreter(&[
+            addi(12, 0, -9),
+            fp(0b11010, 0b01, dyn_, 28, 12, 2), // fcvt.d.l f28, a2 = -9 (unpinned)
+            fp(0b00100, 0b01, 0b010, 1, 28, 28), // fabs.d f1, f28 = 9
+            fp(0b00100, 0b01, 0b001, 29, 1, 1), // fneg.d f29, f1 = -9 (unpinned)
+            fp(0b00100, 0b01, 0b000, 30, 29, 29), // fmv.d f30, f29
+            fp(0b00010, 0b01, dyn_, 31, 30, 1), // fmul.d f31, f30, f1 = -81
+            fp(0b01011, 0b01, dyn_, 20, 1, 0),  // fsqrt.d f20, f1 = 3 (pinned high)
+            fstore(0b011, 11, 31, 0),           // fsd f31, 0(a1)
+            fload(0b011, 9, 11, 0),             // fld f9 (callee-saved host v9)
+            fp(0b00000, 0b01, dyn_, 27, 9, 20), // fadd.d f27 = -78
+            fp(0b11000, 0b01, 0b001, 13, 27, 2), // fcvt.l.d a3 = -78
+            fp(0b00100, 0b01, 0b001, 28, 27, 30), // fsgnjn.d f28, f27, f30 (general)
+            fp(0b11100, 0b01, 0, 14, 28, 0),    // fmv.x.d a4, f28
+            ECALL,
+        ]);
+        assert_eq!(cpu.x[13] as i64, -78);
+        assert_eq!(f64::from_bits(cpu.x[14]), 78.0);
     }
 
     #[test]

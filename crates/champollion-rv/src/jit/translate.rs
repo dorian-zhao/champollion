@@ -84,6 +84,19 @@ const PC: u32 = offset_of!(CpuState, pc) as u32;
 const INSTRET: u32 = offset_of!(CpuState, instret) as u32;
 const RESERVED_ADDR: u32 = offset_of!(CpuState, reserved_addr) as u32;
 const FCSR: u32 = offset_of!(CpuState, fcsr) as u32;
+/// Host v-register holding each guest f register, or `None` if it lives in `CpuState`.
+/// f0–f15 -> v0–v15 and f16–f27 -> v20–v31; ft8–ft11 (f28–f31) stay in memory. v8–v15 are
+/// callee-saved in the host ABI (their low halves), so the trampoline preserves them.
+pub const FHOST_REG: [Option<Reg>; 32] = {
+    let mut map = [None; 32];
+    let mut i = 0;
+    while i < 28 {
+        map[i] = Some(if i < 16 { i as Reg } else { i as Reg + 4 });
+        i += 1;
+    }
+    map
+};
+
 /// FP scratch registers (caller-saved, so the trampoline need not preserve them).
 const FA: Reg = 16;
 const FB: Reg = 17;
@@ -143,8 +156,9 @@ enum Tail {
 }
 
 /// Number of entries in the jump cache (a power of two): `(guest pc, host code address)`
-/// pairs indexed by guest pc bits 1..=12.
-pub const JUMP_CACHE_ENTRIES: usize = 4096;
+/// pairs indexed by guest pc bits 1..=16. 4096 entries thrashed on Lua (600k misses for 3.4k
+/// blocks, from conflicting targets); 65536 (1 MiB) leaves only cold misses.
+pub const JUMP_CACHE_ENTRIES: usize = 65536;
 const JUMP_CACHE_BITS: u32 = JUMP_CACHE_ENTRIES.trailing_zeros();
 
 /// Jump-cache slot for a guest pc.
@@ -275,50 +289,81 @@ impl Tx {
             }
             // Conservatively a full barrier; mapping pred/succ to dmb variants comes later.
             Inst::Fence { .. } => self.a.dmb_ish(),
-            // F/D data movement: f registers live in CpuState and move as integers.
+            // F/D data movement. Doubles are moved as raw bits; singles are NaN-boxed when
+            // written to an f register.
             Inst::FLoad { width, rd, rs1, offset } => {
                 self.address(rs1, offset);
                 self.accesses.push((self.a.pos(), pc, self.retired, false));
-                if width == FWidth::D {
-                    self.a.ldr_reg(Mem::U64, DST, MEMBASE, ADDR);
-                } else {
-                    self.a.ldr_reg(Mem::U32, DST, MEMBASE, ADDR);
-                    self.a.orr_imm(DST, DST, NAN_BOX).unwrap();
+                match (width, FHOST_REG[rd as usize]) {
+                    (FWidth::D, Some(h)) => self.a.ldr_fp_reg(Fp::D, h, MEMBASE, ADDR),
+                    (FWidth::D, None) => {
+                        self.a.ldr_reg(Mem::U64, DST, MEMBASE, ADDR);
+                        self.a.str_off(DST, CTX, f_offset(rd));
+                    }
+                    (FWidth::S, _) => {
+                        self.a.ldr_reg(Mem::U32, DST, MEMBASE, ADDR);
+                        self.a.orr_imm(DST, DST, NAN_BOX).unwrap();
+                        self.fraw_store(rd, DST);
+                    }
                 }
-                self.a.str_off(DST, CTX, f_offset(rd));
             }
             Inst::FStore { width, rs1, rs2, offset } => {
-                self.a.ldr_off(SRC1, CTX, f_offset(rs2));
-                self.address(rs1, offset);
-                self.accesses.push((self.a.pos(), pc, self.retired, true));
-                let mem = if width == FWidth::D { Mem::U64 } else { Mem::U32 };
-                self.a.str_reg(mem, SRC1, MEMBASE, ADDR);
+                let size = fp(width);
+                match FHOST_REG[rs2 as usize] {
+                    Some(h) => {
+                        self.address(rs1, offset);
+                        self.accesses.push((self.a.pos(), pc, self.retired, true));
+                        // A single store writes the low 32 bits, boxed or not.
+                        self.a.str_fp_reg(size, h, MEMBASE, ADDR);
+                    }
+                    None => {
+                        self.a.ldr_off(SRC1, CTX, f_offset(rs2));
+                        self.address(rs1, offset);
+                        self.accesses.push((self.a.pos(), pc, self.retired, true));
+                        let mem = if width == FWidth::D { Mem::U64 } else { Mem::U32 };
+                        self.a.str_reg(mem, SRC1, MEMBASE, ADDR);
+                    }
+                }
             }
             Inst::FMvFromInt { width, rd, rs1 } => {
                 let v = self.src(rs1, SRC0);
                 if width == FWidth::D {
-                    self.a.str_off(v, CTX, f_offset(rd));
+                    self.fraw_store(rd, v);
                 } else {
                     self.a.orr_imm(DST, v, NAN_BOX).unwrap();
-                    self.a.str_off(DST, CTX, f_offset(rd));
+                    self.fraw_store(rd, DST);
                 }
             }
             Inst::FMvToInt { width, rd, rs1 } => {
                 if rd != 0 {
                     let d = self.dst(rd);
-                    if width == FWidth::D {
-                        self.a.ldr_off(d, CTX, f_offset(rs1));
-                    } else {
-                        self.a.ldr_off_w(d, CTX, f_offset(rs1));
+                    match (width, FHOST_REG[rs1 as usize]) {
+                        (FWidth::D, _) => self.fraw_load(rs1, d),
+                        (FWidth::S, Some(h)) => self.a.fmov_to_gpr(Fp::S, d, h),
+                        (FWidth::S, None) => self.a.ldr_off_w(d, CTX, f_offset(rs1)),
+                    }
+                    if width == FWidth::S {
                         self.a.sxtw(d, d);
                     }
                     self.commit(rd, d);
                 }
             }
+            // fmv.d / fneg.d / fabs.d (rs1 == rs2) are single sign-bit instructions, which,
+            // like RISC-V, never touch NaN payloads or raise exceptions.
+            Inst::FSgnj { kind, width: FWidth::D, rd, rs1, rs2 } if rs1 == rs2 => {
+                let a = self.fsrc(FWidth::D, rs1, FA);
+                let d = self.fdest(FWidth::D, rd);
+                match kind {
+                    SgnjKind::Sgnj => self.a.fmov_d(d, a),
+                    SgnjKind::Sgnjn => self.a.fneg_d(d, a),
+                    SgnjKind::Sgnjx => self.a.fabs_d(d, a),
+                }
+                self.fcommit(FWidth::D, rd, d);
+            }
             Inst::FSgnj { kind, width: FWidth::D, rd, rs1, rs2 } => {
                 // Single precision needs NaN-box checks; it stays on the interpreter for now.
-                self.a.ldr_off(SRC0, CTX, f_offset(rs1));
-                self.a.ldr_off(SRC1, CTX, f_offset(rs2));
+                self.fraw_load(rs1, SRC0);
+                self.fraw_load(rs2, SRC1);
                 match kind {
                     SgnjKind::Sgnj => {}
                     SgnjKind::Sgnjn => self.a.eor_imm(SRC1, SRC1, SIGN64).unwrap(),
@@ -327,7 +372,7 @@ impl Tx {
                 self.a.and_imm(SRC1, SRC1, SIGN64).unwrap();
                 self.a.and_imm(SRC0, SRC0, !SIGN64).unwrap();
                 self.a.orr(DST, SRC0, SRC1);
-                self.a.str_off(DST, CTX, f_offset(rd));
+                self.fraw_store(rd, DST);
             }
             Inst::Lr { width, rd, rs1, .. } => {
                 let base = self.src(rs1, SRC0);
@@ -349,26 +394,28 @@ impl Tx {
             // set from frm, so only `dyn` rounding (what compilers emit) is translated;
             // exceptions accumulate in FPSR and fold into fflags at exit.
             Inst::FArith { op, width, rd, rs1, rs2, rm: RM_DYN } => {
-                self.fsrc(width, rs1, FA);
-                self.fsrc(width, rs2, FB);
+                let a = self.fsrc(width, rs1, FA);
+                let b = self.fsrc(width, rs2, FB);
                 let op = match op {
                     FArithOp::Add => FpOp::Add,
                     FArithOp::Sub => FpOp::Sub,
                     FArithOp::Mul => FpOp::Mul,
                     FArithOp::Div => FpOp::Div,
                 };
-                self.a.fp_arith(op, fp(width), FR, FA, FB);
-                self.fdst(width, rd, FR);
+                let d = self.fdest(width, rd);
+                self.a.fp_arith(op, fp(width), d, a, b);
+                self.fcommit(width, rd, d);
             }
             Inst::FSqrt { width, rd, rs1, rm: RM_DYN } => {
-                self.fsrc(width, rs1, FA);
-                self.a.fsqrt(fp(width), FR, FA);
-                self.fdst(width, rd, FR);
+                let a = self.fsrc(width, rs1, FA);
+                let d = self.fdest(width, rd);
+                self.a.fsqrt(fp(width), d, a);
+                self.fcommit(width, rd, d);
             }
             Inst::FFma { op, width, rd, rs1, rs2, rs3, rm: RM_DYN } => {
-                self.fsrc(width, rs1, FA);
-                self.fsrc(width, rs2, FB);
-                self.fsrc(width, rs3, FC);
+                let a = self.fsrc(width, rs1, FA);
+                let b = self.fsrc(width, rs2, FB);
+                let c = self.fsrc(width, rs3, FC);
                 // ARM names the negated forms the other way around (see fpu::fma).
                 let kind = match op {
                     FmaOp::Madd => FmaKind::Fmadd,
@@ -376,14 +423,15 @@ impl Tx {
                     FmaOp::Nmsub => FmaKind::Fmsub,
                     FmaOp::Nmadd => FmaKind::Fnmadd,
                 };
-                self.a.fma(kind, fp(width), FR, FA, FB, FC);
-                self.fdst(width, rd, FR);
+                let d = self.fdest(width, rd);
+                self.a.fma(kind, fp(width), d, a, b, c);
+                self.fcommit(width, rd, d);
             }
             Inst::FCmp { op, width, rd, rs1, rs2 } => {
-                self.fsrc(width, rs1, FA);
-                self.fsrc(width, rs2, FB);
+                let a = self.fsrc(width, rs1, FA);
+                let b = self.fsrc(width, rs2, FB);
                 // fcmp is quiet like feq; fcmpe signals on any NaN like flt/fle.
-                self.a.fcmp(op != FCmpOp::Eq, fp(width), FA, FB);
+                self.a.fcmp(op != FCmpOp::Eq, fp(width), a, b);
                 if rd != 0 {
                     let d = self.dst(rd);
                     let cond = match op {
@@ -404,9 +452,10 @@ impl Tx {
                     FWidth::S
                 };
                 let from = if to == FWidth::D { FWidth::S } else { FWidth::D };
-                self.fsrc(from, rs1, FA);
-                self.a.fcvt(fp(to), FR, FA);
-                self.fdst(to, rd, FR);
+                let a = self.fsrc(from, rs1, FA);
+                let d = self.fdest(to, rd);
+                self.a.fcvt(fp(to), d, a);
+                self.fcommit(to, rd, d);
             }
             // Float to integer: the rounding is part of the ARM opcode, so every static mode
             // (RMM included) is available; dyn would need frm at translation time.
@@ -418,10 +467,10 @@ impl Tx {
                     3 => FpRound::Up,
                     _ => FpRound::Away,
                 };
-                self.fsrc(from, rs1, FA);
+                let a = self.fsrc(from, rs1, FA);
                 let signed = matches!(to, IntType::W | IntType::L);
                 let wide = matches!(to, IntType::L | IntType::Lu);
-                self.a.fcvt_to_int(round, signed, wide, fp(from), SRC0, FA);
+                self.a.fcvt_to_int(round, signed, wide, fp(from), SRC0, a);
                 // NaN converts to the largest integer on RISC-V, to 0 on ARM.
                 let max = match to {
                     IntType::W => i32::MAX as u64,
@@ -429,7 +478,7 @@ impl Tx {
                     IntType::L => i64::MAX as u64,
                     IntType::Lu => u64::MAX,
                 };
-                self.a.fcmp(false, fp(from), FA, FA);
+                self.a.fcmp(false, fp(from), a, a);
                 self.a.mov_imm(SRC1, max);
                 let d = self.dst(rd);
                 self.a.csel(d, SRC1, SRC0, Cond::Vs);
@@ -446,8 +495,9 @@ impl Tx {
                 let v = self.src(rs1, SRC0);
                 let signed = matches!(from, IntType::W | IntType::L);
                 let wide = matches!(from, IntType::L | IntType::Lu);
-                self.a.cvt_from_int(signed, wide, fp(to), FR, v);
-                self.fdst(to, rd, FR);
+                let d = self.fdest(to, rd);
+                self.a.cvt_from_int(signed, wide, fp(to), d, v);
+                self.fcommit(to, rd, d);
             }
             Inst::Amo { op, width, rd, rs1, rs2, .. } => {
                 let base = self.src(rs1, SRC0);
@@ -487,30 +537,64 @@ impl Tx {
         true
     }
 
-    /// Load `f[r]` into v-register `v` as an operand of width `w`. Singles must be properly
-    /// NaN-boxed; anything else reads as the canonical NaN, as the spec requires.
-    fn fsrc(&mut self, w: FWidth, r: u8, v: Reg) {
-        if w == FWidth::D {
-            self.a.ldr_fp(Fp::D, v, CTX, f_offset(r));
-            return;
+    /// Host v-register holding `f[r]` as an operand of width `w`, loading it into `scratch`
+    /// if needed. Singles must be properly NaN-boxed; anything else reads as the canonical
+    /// NaN, as the spec requires, so singles always go through the check.
+    fn fsrc(&mut self, w: FWidth, r: u8, scratch: Reg) -> Reg {
+        match (w, FHOST_REG[r as usize]) {
+            (FWidth::D, Some(h)) => h,
+            (FWidth::D, None) => {
+                self.a.ldr_fp(Fp::D, scratch, CTX, f_offset(r));
+                scratch
+            }
+            (FWidth::S, _) => {
+                self.fraw_load(r, SRC0);
+                self.a.lsr_imm(SRC1, SRC0, 32);
+                self.a.cmn_imm_w(SRC1, 1); // upper half == 0xffffffff?
+                self.a.mov_imm(ADDR, 0x7fc0_0000);
+                self.a.csel(SRC0, SRC0, ADDR, Cond::Eq);
+                self.a.fmov_from_gpr(Fp::S, scratch, SRC0);
+                scratch
+            }
         }
-        self.a.ldr_off(SRC0, CTX, f_offset(r));
-        self.a.lsr_imm(SRC1, SRC0, 32);
-        self.a.cmn_imm_w(SRC1, 1); // upper half == 0xffffffff?
-        self.a.mov_imm(ADDR, 0x7fc0_0000);
-        self.a.csel(SRC0, SRC0, ADDR, Cond::Eq);
-        self.a.fmov_from_gpr(Fp::S, v, SRC0);
     }
 
-    /// Store v-register `v` to `f[r]` as width `w`, NaN-boxing singles.
-    fn fdst(&mut self, w: FWidth, r: u8, v: Reg) {
-        if w == FWidth::D {
-            self.a.str_fp(Fp::D, v, CTX, f_offset(r));
-            return;
+    /// Host v-register to compute `f[r]`'s new value of width `w` into.
+    fn fdest(&self, w: FWidth, r: u8) -> Reg {
+        match (w, FHOST_REG[r as usize]) {
+            (FWidth::D, Some(h)) => h,
+            _ => FR,
         }
-        self.a.fmov_to_gpr(Fp::S, SRC0, v);
-        self.a.orr_imm(SRC0, SRC0, NAN_BOX).unwrap();
-        self.a.str_off(SRC0, CTX, f_offset(r));
+    }
+
+    /// Finish writing `f[r]` from `v` (as returned by `fdest`): store unpinned doubles, and
+    /// NaN-box singles.
+    fn fcommit(&mut self, w: FWidth, r: u8, v: Reg) {
+        match (w, FHOST_REG[r as usize]) {
+            (FWidth::D, Some(_)) => {}
+            (FWidth::D, None) => self.a.str_fp(Fp::D, v, CTX, f_offset(r)),
+            (FWidth::S, _) => {
+                self.a.fmov_to_gpr(Fp::S, SRC0, v);
+                self.a.orr_imm(SRC0, SRC0, NAN_BOX).unwrap();
+                self.fraw_store(r, SRC0);
+            }
+        }
+    }
+
+    /// Copy `f[r]`'s raw 64 bits into general register `g`.
+    fn fraw_load(&mut self, r: u8, g: Reg) {
+        match FHOST_REG[r as usize] {
+            Some(h) => self.a.fmov_to_gpr(Fp::D, g, h),
+            None => self.a.ldr_off(g, CTX, f_offset(r)),
+        }
+    }
+
+    /// Set `f[r]` to the raw 64 bits in general register `g` (which may be xzr).
+    fn fraw_store(&mut self, r: u8, g: Reg) {
+        match FHOST_REG[r as usize] {
+            Some(h) => self.a.fmov_from_gpr(Fp::D, h, g),
+            None => self.a.str_off(g, CTX, f_offset(r)),
+        }
     }
 
     /// Leave for the interpreter (which raises the misaligned-atomic trap) unless `base` is
@@ -768,7 +852,7 @@ impl Tx {
                 Tail::Indirect => {
                     // Inline jump-cache probe: on a hit, jump straight to the target's
                     // translation; on a miss, let the dispatcher find it (and fill the slot).
-                    self.a.ubfm(DST, ADDR, 1, JUMP_CACHE_BITS); // index = pc[12:1]
+                    self.a.ubfm(DST, ADDR, 1, JUMP_CACHE_BITS); // index = pc[16:1]
                     self.a.mov_imm(SRC0, self.jump_cache);
                     self.a.add_lsl(DST, SRC0, DST, 4);
                     self.a.ldr_off(SRC0, DST, 0);
@@ -938,6 +1022,9 @@ pub fn trampoline() -> (Vec<u32>, usize) {
     a.stp_pre(ADDR, XZR, 31, -16);
     a.msr_fpcr(3);
     a.msr_fpsr(XZR);
+    for pair in [(8, 9), (10, 11), (12, 13), (14, 15)] {
+        a.stp_pre_d(pair.0, pair.1, 31, -16);
+    }
     a.add_imm(29, 31, 0); // frame pointer = sp
     a.mov(CTX, 0);
     a.mov(MEMBASE, 1);
@@ -947,6 +1034,11 @@ pub fn trampoline() -> (Vec<u32>, usize) {
             a.ldr_off(*h, CTX, x_offset(guest as u8));
         }
     }
+    for (guest, host) in FHOST_REG.iter().enumerate() {
+        if let Some(h) = host {
+            a.ldr_fp(Fp::D, *h, CTX, f_offset(guest as u8));
+        }
+    }
     a.br(ADDR);
 
     // Exit stub: generated code branches here with the exit code in EXIT_CODE.
@@ -954,6 +1046,11 @@ pub fn trampoline() -> (Vec<u32>, usize) {
     for (guest, host) in HOST_REG.iter().enumerate() {
         if let Some(h) = host {
             a.str_off(*h, CTX, x_offset(guest as u8));
+        }
+    }
+    for (guest, host) in FHOST_REG.iter().enumerate() {
+        if let Some(h) = host {
+            a.str_fp(Fp::D, *h, CTX, f_offset(guest as u8));
         }
     }
     // Fold the exceptions raised while running into fflags. FPSR's IOC..IXC (bits 0..4) are
@@ -966,6 +1063,9 @@ pub fn trampoline() -> (Vec<u32>, usize) {
     a.orr(SRC1, SRC1, ADDR);
     a.str_off_w(SRC1, CTX, FCSR);
     a.mov(0, EXIT_CODE);
+    for pair in [(14, 15), (12, 13), (10, 11), (8, 9)] {
+        a.ldp_post_d(pair.0, pair.1, 31, 16);
+    }
     a.ldp_post(ADDR, XZR, 31, 16);
     a.msr_fpcr(ADDR);
     for pair in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)] {

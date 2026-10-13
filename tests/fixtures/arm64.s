@@ -128,3 +128,12 @@ msr fpsr, x3
 rbit w4, w5
 cmn w6, #1
 and w7, w8, #0x1f
+ldr d20, [x27, x17]
+str d21, [x27, x17]
+ldr s22, [x27, x17]
+str s23, [x27, x17]
+fmov d1, d2
+fneg d3, d4
+fabs d5, d6
+stp d8, d9, [sp, #-16]!
+ldp d14, d15, [sp], #16

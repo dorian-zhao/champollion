@@ -136,6 +136,15 @@ fn matches_assembler() {
     a.rbit_w(4, 5);
     a.cmn_imm_w(6, 1);
     a.and_imm_w(7, 8, 0x1f).unwrap();
+    a.ldr_fp_reg(Fp::D, 20, 27, 17);
+    a.str_fp_reg(Fp::D, 21, 27, 17);
+    a.ldr_fp_reg(Fp::S, 22, 27, 17);
+    a.str_fp_reg(Fp::S, 23, 27, 17);
+    a.fmov_d(1, 2);
+    a.fneg_d(3, 4);
+    a.fabs_d(5, 6);
+    a.stp_pre_d(8, 9, SP, -16);
+    a.ldp_post_d(14, 15, SP, 16);
 
     let source = include_str!("../../../tests/fixtures/arm64.s");
     let lines: Vec<&str> = source

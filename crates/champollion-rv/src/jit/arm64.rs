@@ -590,6 +590,35 @@ impl Asm {
         assert!(offset.is_multiple_of(scale) && offset / scale < 4096);
         self.emit(base | (offset / scale) << 10 | (rn as u32) << 5 | rt as u32);
     }
+    /// `ldr dt|st, [xn, xm]` (register offset).
+    pub fn ldr_fp_reg(&mut self, size: Fp, rt: Reg, rn: Reg, rm: Reg) {
+        self.r3(if size == Fp::D { 0xfc60_6800 } else { 0xbc60_6800 }, rt, rn, rm);
+    }
+    pub fn str_fp_reg(&mut self, size: Fp, rt: Reg, rn: Reg, rm: Reg) {
+        self.r3(if size == Fp::D { 0xfc20_6800 } else { 0xbc20_6800 }, rt, rn, rm);
+    }
+    /// `fmov dd, dn` (register copy).
+    pub fn fmov_d(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x1e60_4000 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `fneg dd, dn` / `fabs dd, dn`: sign-bit operations, NaNs included, no exceptions.
+    pub fn fneg_d(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x1e61_4000 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn fabs_d(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x1e60_c000 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `stp dt, dt2, [xn, #offset]!` / `ldp dt, dt2, [xn], #offset`.
+    pub fn stp_pre_d(&mut self, rt: Reg, rt2: Reg, rn: Reg, offset: i32) {
+        assert!(offset % 8 == 0 && (-512..=504).contains(&offset));
+        let imm7 = ((offset / 8) as u32) & 0x7f;
+        self.emit(0x6d80_0000 | imm7 << 15 | (rt2 as u32) << 10 | (rn as u32) << 5 | rt as u32);
+    }
+    pub fn ldp_post_d(&mut self, rt: Reg, rt2: Reg, rn: Reg, offset: i32) {
+        assert!(offset % 8 == 0 && (-512..=504).contains(&offset));
+        let imm7 = ((offset / 8) as u32) & 0x7f;
+        self.emit(0x6cc0_0000 | imm7 << 15 | (rt2 as u32) << 10 | (rn as u32) << 5 | rt as u32);
+    }
     /// `fmov sd, wn` / `fmov dd, xn`.
     pub fn fmov_from_gpr(&mut self, size: Fp, rd: Reg, rn: Reg) {
         let base = if size == Fp::D { 0x9e67_0000 } else { 0x1e27_0000 };
