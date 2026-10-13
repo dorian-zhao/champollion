@@ -1,7 +1,9 @@
 //! Checks the JIT's ARM64 encoder against an assembler: tests/fixtures/arm64.s, assembled
 //! into arm64.bin by build.sh, lists the same instructions this test emits, in order.
 
-use champollion_rv::jit::arm64::{Asm, AtomicOp, Cond, LR, Mem, SP, XZR};
+use champollion_rv::jit::arm64::{
+    Asm, AtomicOp, Cond, FmaKind, Fp, FpOp, FpRound, LR, Mem, SP, XZR,
+};
 
 #[test]
 fn matches_assembler() {
@@ -95,6 +97,45 @@ fn matches_assembler() {
     a.atomic(AtomicOp::Swp, true, 0, XZR, 1);
     a.casal(true, 2, 3, 4);
     a.casal(false, 5, 6, 7);
+    a.ldr_fp(Fp::D, 16, 28, 256);
+    a.str_fp(Fp::D, 17, 28, 504);
+    a.ldr_fp(Fp::S, 18, 1, 4);
+    a.str_fp(Fp::S, 19, 2, 8);
+    a.fmov_from_gpr(Fp::S, 16, 14);
+    a.fmov_from_gpr(Fp::D, 17, 15);
+    a.fmov_to_gpr(Fp::S, 14, 18);
+    a.fmov_to_gpr(Fp::D, 15, 19);
+    a.fp_arith(FpOp::Add, Fp::S, 16, 17, 18);
+    a.fp_arith(FpOp::Sub, Fp::D, 16, 17, 18);
+    a.fp_arith(FpOp::Mul, Fp::S, 19, 20, 21);
+    a.fp_arith(FpOp::Div, Fp::D, 22, 23, 24);
+    a.fsqrt(Fp::S, 16, 17);
+    a.fsqrt(Fp::D, 18, 19);
+    a.fma(FmaKind::Fmadd, Fp::S, 16, 17, 18, 19);
+    a.fma(FmaKind::Fmsub, Fp::D, 20, 21, 22, 23);
+    a.fma(FmaKind::Fnmadd, Fp::S, 24, 25, 26, 27);
+    a.fma(FmaKind::Fnmsub, Fp::D, 28, 29, 30, 31);
+    a.fcmp(false, Fp::S, 16, 17);
+    a.fcmp(true, Fp::D, 18, 19);
+    a.fcvt(Fp::D, 16, 17);
+    a.fcvt(Fp::S, 18, 19);
+    a.fcvt_to_int(FpRound::Nearest, true, false, Fp::S, 0, 16);
+    a.fcvt_to_int(FpRound::Away, false, true, Fp::D, 1, 17);
+    a.fcvt_to_int(FpRound::Up, true, true, Fp::S, 2, 18);
+    a.fcvt_to_int(FpRound::Down, false, false, Fp::D, 3, 19);
+    a.fcvt_to_int(FpRound::Zero, true, true, Fp::D, 4, 20);
+    a.fcvt_to_int(FpRound::Zero, false, false, Fp::S, 5, 21);
+    a.cvt_from_int(true, false, Fp::S, 16, 0);
+    a.cvt_from_int(false, true, Fp::D, 17, 1);
+    a.cvt_from_int(true, true, Fp::D, 18, 2);
+    a.cvt_from_int(false, false, Fp::S, 19, 3);
+    a.mrs_fpcr(0);
+    a.msr_fpcr(1);
+    a.mrs_fpsr(2);
+    a.msr_fpsr(3);
+    a.rbit_w(4, 5);
+    a.cmn_imm_w(6, 1);
+    a.and_imm_w(7, 8, 0x1f).unwrap();
 
     let source = include_str!("../../../tests/fixtures/arm64.s");
     let lines: Vec<&str> = source

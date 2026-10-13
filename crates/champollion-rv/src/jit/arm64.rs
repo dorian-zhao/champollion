@@ -60,6 +60,39 @@ impl Cond {
     }
 }
 
+/// Floating-point operand size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp {
+    S,
+    D,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmaKind {
+    Fmadd,
+    Fmsub,
+    Fnmadd,
+    Fnmsub,
+}
+
+/// Rounding encoded in float-to-integer conversions (`fcvt{n,a,p,m,z}{s,u}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpRound {
+    Nearest,
+    Away,
+    Up,
+    Down,
+    Zero,
+}
+
 /// LSE atomic operations (`ld<op>al` and `swpal`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicOp {
@@ -542,6 +575,116 @@ impl Asm {
     pub fn casal(&mut self, wide: bool, rs: Reg, rt: Reg, rn: Reg) {
         let base = if wide { 0xc8e0_fc00 } else { 0x88e0_fc00 };
         self.emit(base | (rs as u32) << 16 | (rn as u32) << 5 | rt as u32);
+    }
+
+    // ---- floating point (register numbers name v0–v31) ----
+
+    /// `ldr dt|st, [xn, #offset]` (scaled unsigned offset).
+    pub fn ldr_fp(&mut self, size: Fp, rt: Reg, rn: Reg, offset: u32) {
+        let (base, scale) = if size == Fp::D { (0xfd40_0000, 8) } else { (0xbd40_0000, 4) };
+        assert!(offset.is_multiple_of(scale) && offset / scale < 4096);
+        self.emit(base | (offset / scale) << 10 | (rn as u32) << 5 | rt as u32);
+    }
+    pub fn str_fp(&mut self, size: Fp, rt: Reg, rn: Reg, offset: u32) {
+        let (base, scale) = if size == Fp::D { (0xfd00_0000, 8) } else { (0xbd00_0000, 4) };
+        assert!(offset.is_multiple_of(scale) && offset / scale < 4096);
+        self.emit(base | (offset / scale) << 10 | (rn as u32) << 5 | rt as u32);
+    }
+    /// `fmov sd, wn` / `fmov dd, xn`.
+    pub fn fmov_from_gpr(&mut self, size: Fp, rd: Reg, rn: Reg) {
+        let base = if size == Fp::D { 0x9e67_0000 } else { 0x1e27_0000 };
+        self.emit(base | (rn as u32) << 5 | rd as u32);
+    }
+    /// `fmov wd, sn` / `fmov xd, dn`.
+    pub fn fmov_to_gpr(&mut self, size: Fp, rd: Reg, rn: Reg) {
+        let base = if size == Fp::D { 0x9e66_0000 } else { 0x1e26_0000 };
+        self.emit(base | (rn as u32) << 5 | rd as u32);
+    }
+    fn fp_type(size: Fp) -> u32 {
+        if size == Fp::D { 0x0040_0000 } else { 0 }
+    }
+    pub fn fp_arith(&mut self, op: FpOp, size: Fp, rd: Reg, rn: Reg, rm: Reg) {
+        let opc = match op {
+            FpOp::Mul => 0x0800,
+            FpOp::Div => 0x1800,
+            FpOp::Add => 0x2800,
+            FpOp::Sub => 0x3800,
+        };
+        self.r3(0x1e20_0000 | Self::fp_type(size) | opc, rd, rn, rm);
+    }
+    pub fn fsqrt(&mut self, size: Fp, rd: Reg, rn: Reg) {
+        self.emit(0x1e21_c000 | Self::fp_type(size) | (rn as u32) << 5 | rd as u32);
+    }
+    /// Fused multiply-add family: `fmadd` = ra + rn·rm, `fmsub` = ra − rn·rm,
+    /// `fnmadd` = −ra − rn·rm, `fnmsub` = −ra + rn·rm.
+    pub fn fma(&mut self, op: FmaKind, size: Fp, rd: Reg, rn: Reg, rm: Reg, ra: Reg) {
+        let base = match op {
+            FmaKind::Fmadd => 0x1f00_0000,
+            FmaKind::Fmsub => 0x1f00_8000,
+            FmaKind::Fnmadd => 0x1f20_0000,
+            FmaKind::Fnmsub => 0x1f20_8000,
+        };
+        self.r3(base | Self::fp_type(size) | (ra as u32) << 10, rd, rn, rm);
+    }
+    /// `fcmp` (quiet: invalid only for signaling NaNs) or `fcmpe` (signaling).
+    pub fn fcmp(&mut self, signaling: bool, size: Fp, rn: Reg, rm: Reg) {
+        let e = if signaling { 0x10 } else { 0 };
+        self.r3(0x1e20_2000 | Self::fp_type(size) | e, 0, rn, rm);
+    }
+    /// `fcvt` between single and double precision (`to` is the destination size).
+    pub fn fcvt(&mut self, to: Fp, rd: Reg, rn: Reg) {
+        let base = if to == Fp::D { 0x1e22_c000 } else { 0x1e62_4000 };
+        self.emit(base | (rn as u32) << 5 | rd as u32);
+    }
+    /// Float to integer with the rounding in the opcode; `wide` selects an x destination.
+    pub fn fcvt_to_int(
+        &mut self,
+        round: FpRound,
+        signed: bool,
+        wide: bool,
+        size: Fp,
+        rd: Reg,
+        rn: Reg,
+    ) {
+        let opc = match round {
+            FpRound::Nearest => 0x0000_0000,
+            FpRound::Away => 0x0004_0000,
+            FpRound::Up => 0x0008_0000,
+            FpRound::Down => 0x0010_0000,
+            FpRound::Zero => 0x0018_0000,
+        };
+        let u = if signed { 0 } else { 0x0001_0000 };
+        let sf = if wide { 0x8000_0000 } else { 0 };
+        self.emit(0x1e20_0000 | sf | Self::fp_type(size) | opc | u | (rn as u32) << 5 | rd as u32);
+    }
+    /// Integer to float (`scvtf`/`ucvtf`), rounding per FPCR; `wide` selects an x source.
+    pub fn cvt_from_int(&mut self, signed: bool, wide: bool, size: Fp, rd: Reg, rn: Reg) {
+        let base = if signed { 0x1e22_0000 } else { 0x1e23_0000 };
+        let sf = if wide { 0x8000_0000 } else { 0 };
+        self.emit(base | sf | Self::fp_type(size) | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn mrs_fpcr(&mut self, rt: Reg) {
+        self.emit(0xd53b_4400 | rt as u32);
+    }
+    pub fn msr_fpcr(&mut self, rt: Reg) {
+        self.emit(0xd51b_4400 | rt as u32);
+    }
+    pub fn mrs_fpsr(&mut self, rt: Reg) {
+        self.emit(0xd53b_4420 | rt as u32);
+    }
+    pub fn msr_fpsr(&mut self, rt: Reg) {
+        self.emit(0xd51b_4420 | rt as u32);
+    }
+    /// `rbit wd, wn`: reverse the bits of a 32-bit value.
+    pub fn rbit_w(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x5ac0_0000 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `cmn wn, #imm` (sets flags for wn + imm).
+    pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
+        self.imm12(0x3100_0000, XZR, rn, imm);
+    }
+    pub fn and_imm_w(&mut self, rd: Reg, rn: Reg, imm: u64) -> Option<()> {
+        self.logical(0x1200_0000, 32, rd, rn, imm)
     }
 
     pub fn nop(&mut self) {

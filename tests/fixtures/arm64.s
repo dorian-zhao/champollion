@@ -89,3 +89,42 @@ lduminal w25, w26, [x27]
 swpal x0, xzr, [x1]
 casal x2, x3, [x4]
 casal w5, w6, [x7]
+ldr d16, [x28, #256]
+str d17, [x28, #504]
+ldr s18, [x1, #4]
+str s19, [x2, #8]
+fmov s16, w14
+fmov d17, x15
+fmov w14, s18
+fmov x15, d19
+fadd s16, s17, s18
+fsub d16, d17, d18
+fmul s19, s20, s21
+fdiv d22, d23, d24
+fsqrt s16, s17
+fsqrt d18, d19
+fmadd s16, s17, s18, s19
+fmsub d20, d21, d22, d23
+fnmadd s24, s25, s26, s27
+fnmsub d28, d29, d30, d31
+fcmp s16, s17
+fcmpe d18, d19
+fcvt d16, s17
+fcvt s18, d19
+fcvtns w0, s16
+fcvtau x1, d17
+fcvtps x2, s18
+fcvtmu w3, d19
+fcvtzs x4, d20
+fcvtzu w5, s21
+scvtf s16, w0
+ucvtf d17, x1
+scvtf d18, x2
+ucvtf s19, w3
+mrs x0, fpcr
+msr fpcr, x1
+mrs x2, fpsr
+msr fpsr, x3
+rbit w4, w5
+cmn w6, #1
+and w7, w8, #0x1f

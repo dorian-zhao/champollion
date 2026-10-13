@@ -44,7 +44,7 @@ impl Hasher for PcHasher {
     }
 }
 
-type EnterFn = unsafe extern "C" fn(*mut CpuState, *mut u8, *const u8) -> u64;
+type EnterFn = unsafe extern "C" fn(*mut CpuState, *mut u8, *const u8, u64) -> u64;
 
 pub struct Jit {
     code: CodeBuffer,
@@ -237,10 +237,19 @@ impl Jit {
             // SAFETY: `at` holds a translation produced for this guest memory layout; it
             // only touches `cpu`, guest memory below `host_base() + GUEST_SIZE` (addresses
             // are masked), and the host stack, and returns through the exit stub.
+            // Generated FP code runs under the guest's rounding mode; RMM (and reserved frm
+            // values, which make dyn instructions illegal) can only be honored by the
+            // interpreter.
+            let Some(fpcr) = translate::guest_fpcr(cpu.fcsr >> 5 & 0b111) else {
+                if let Err(trap) = interpreter::step(cpu, mem) {
+                    return trap;
+                }
+                continue;
+            };
             self.stats.entries += 1;
             let code = {
                 let _active = fault::Active::enter(&self.faults);
-                unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at)) }
+                unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at), fpcr) }
             };
             match code {
                 exit::NEXT => {}
@@ -395,6 +404,35 @@ mod tests {
         assert_eq!(cpu.f[2], 0xffff_ffff_ffff_ffff);
         assert_eq!(cpu.x[13], u64::MAX);
         assert_eq!(cpu.f[5], u64::MAX >> 1);
+    }
+
+    #[test]
+    fn fp_arithmetic_matches_the_interpreter() {
+        let dyn_ = 0b111;
+        let fp = |f5, fmt, rm, rd, rs1, rs2| op_fp(f5, fmt, rm, rd, rs1, rs2);
+        let (_, cpu) = same_as_interpreter(&[
+            addi(12, 0, 3),
+            fp(0b11010, 0b01, dyn_, 1, 12, 0), // fcvt.d.w f1, a2 = 3.0
+            addi(12, 0, 7),
+            fp(0b11010, 0b01, dyn_, 2, 12, 0),  // f2 = 7.0
+            fp(0b00011, 0b01, dyn_, 3, 2, 1),   // fdiv.d f3 = 7/3: inexact
+            fp(0b00011, 0b01, dyn_, 4, 2, 0),   // fdiv.d f4 = 7/0: divide by zero
+            fp(0b00001, 0b01, dyn_, 5, 4, 4),   // fsub.d f5 = inf - inf: invalid, NaN
+            fp(0b11000, 0b01, 0b001, 13, 5, 0), // fcvt.w.d a3, f5 (rtz): NaN -> INT_MAX
+            fp(0b11000, 0b01, 0b001, 14, 3, 1), // fcvt.wu.d a4, f3: 2
+            fp(0b01000, 0b00, dyn_, 6, 3, 1),   // fcvt.s.d f6, f3: boxed single
+            fp(0b00010, 0b00, dyn_, 7, 6, 6),   // fmul.s f7, f6, f6
+            fp(0b00000, 0b00, dyn_, 8, 3, 6),   // fadd.s f8, f3 (not boxed!) + f6
+            fp(0b10100, 0b01, 0b001, 15, 3, 2), // flt.d a5, f3, f2: 1
+            fp(0b10100, 0b01, 0b010, 16, 5, 5), // feq.d a6, NaN, NaN: 0
+            fp(0b01000, 0b01, dyn_, 9, 7, 0),   // fcvt.d.s f9, f7
+            fp(0b01011, 0b01, dyn_, 10, 2, 0),  // fsqrt.d f10, f2
+            ECALL,
+        ]);
+        assert_eq!(cpu.x[13], i32::MAX as u64);
+        assert_eq!((cpu.x[14], cpu.x[15], cpu.x[16]), (2, 1, 0));
+        assert_eq!(cpu.f[8], 0xffff_ffff_7fc0_0000, "unboxed operand reads as canonical NaN");
+        assert_eq!(cpu.fcsr & 0x1f, 0b11001, "NV, DZ, and NX accrued");
     }
 
     #[test]
