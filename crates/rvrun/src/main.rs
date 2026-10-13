@@ -2,6 +2,7 @@
 //!
 //! Environment:
 //! - `RVRUN_STRACE=1` traces every syscall to stderr.
+//! - `RVRUN_STATS=1` prints instructions retired and execution speed on exit.
 
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
@@ -39,7 +40,14 @@ fn main() -> ExitCode {
         };
     proc.log.strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
 
-    match proc.run(&mut main_thread, &host) {
+    let start = std::time::Instant::now();
+    let exit = proc.run(&mut main_thread, &host);
+    if std::env::var_os("RVRUN_STATS").is_some_and(|v| v != "0") {
+        let secs = start.elapsed().as_secs_f64();
+        let n = main_thread.instret;
+        eprintln!("[rvrun] {n} instructions in {secs:.3} s = {:.1} MIPS", n as f64 / secs / 1e6);
+    }
+    match exit {
         Exit::Status(status) => ExitCode::from(status as u8),
         exit @ Exit::Trap(trap) => {
             // Match the shell convention for a process killed by a signal.

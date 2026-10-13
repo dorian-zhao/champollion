@@ -101,6 +101,8 @@ pub struct Thread {
     /// Set by `set_tid_address`; on thread exit the kernel zeroes it and wakes futex
     /// waiters (M5, for `pthread_join`).
     pub clear_child_tid: u64,
+    /// Instructions retired by this thread (excluding the trapping one).
+    pub instret: u64,
 }
 
 fn page_up(a: u64) -> Option<u64> {
@@ -153,7 +155,7 @@ impl Process {
         cpu.x[2] = sp;
         let process =
             Self { mem, brk: Mutex::new(Brk { start: brk, cur: brk }), log: SyscallLog::default() };
-        Ok((process, Thread { cpu, tid: id.pid, clear_child_tid: 0 }))
+        Ok((process, Thread { cpu, tid: id.pid, clear_child_tid: 0, instret: 0 }))
     }
 
     /// Run `thread` until it exits or dies.
@@ -162,7 +164,9 @@ impl Process {
     /// process too; afterwards the process ends when its last thread exits.
     pub fn run(&self, thread: &mut Thread, host: &dyn HostOs) -> Exit {
         loop {
-            match interpreter::run(&mut thread.cpu, &self.mem, u64::MAX) {
+            let (trap, retired) = interpreter::run(&mut thread.cpu, &self.mem, u64::MAX);
+            thread.instret += retired;
+            match (trap, retired) {
                 (Some(Trap::Ecall { .. }), _) => match syscall::dispatch(self, thread, host) {
                     Flow::Continue => {}
                     Flow::ExitThread(status) | Flow::ExitGroup(status) => {
