@@ -121,10 +121,15 @@ fn rv64ua_compressed() {
 
 #[test]
 fn rv64uf() {
-    run_suite("rv64uf", 1);
+    run_suite("rv64uf", 11);
 }
 
 #[test]
 fn rv64ud() {
-    run_suite("rv64ud", 1);
+    run_suite("rv64ud", 12);
+}
+
+#[test]
+fn rv64ud_compressed() {
+    run_suite("rv64ud-c", 12);
 }

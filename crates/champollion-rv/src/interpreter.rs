@@ -5,6 +5,7 @@ use crate::decoder::{
     self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, DecodeError, FWidth, Inst,
     LoadWidth, SgnjKind, StoreWidth,
 };
+use crate::fpu;
 use crate::memory::{MemFault, Memory};
 
 /// Why execution stopped. On every trap, `cpu.pc` still points at the trapping instruction
@@ -14,6 +15,8 @@ use crate::memory::{MemFault, Memory};
 ///   resumes at `pc + 4` (`ecall` has no compressed form).
 /// - `MisalignedAtomic`: `lr`/`sc`/AMO on an address not aligned to its width; Linux
 ///   delivers SIGBUS.
+/// - `ReservedRoundingMode`: an FP instruction with `rm = dyn` while `frm` holds a reserved
+///   value (5–7); an illegal instruction on real hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trap {
     FetchFault(MemFault),
@@ -23,6 +26,7 @@ pub enum Trap {
     Ecall { pc: u64 },
     Ebreak { pc: u64 },
     MisalignedAtomic { pc: u64, addr: u64 },
+    ReservedRoundingMode { pc: u64 },
 }
 
 // With the C extension, IALIGN is 16 and every control-transfer target is even by
@@ -173,6 +177,51 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             let v = cpu.x(rs1);
             cpu.f[rd as usize] = if width == FWidth::S { nan_box(v as u32 as u64) } else { v };
         }
+        Inst::FArith { op, width, rd, rs1, rs2, rm } => {
+            let rm = rounding(cpu, rm)?;
+            let (r, fl) = fpu::binop(op, width, fget(cpu, width, rs1), fget(cpu, width, rs2), rm);
+            fset(cpu, width, rd, r, fl);
+        }
+        Inst::FSqrt { width, rd, rs1, rm } => {
+            let rm = rounding(cpu, rm)?;
+            let (r, fl) = fpu::sqrt(width, fget(cpu, width, rs1), rm);
+            fset(cpu, width, rd, r, fl);
+        }
+        Inst::FFma { op, width, rd, rs1, rs2, rs3, rm } => {
+            let rm = rounding(cpu, rm)?;
+            let (a, b, c) = (fget(cpu, width, rs1), fget(cpu, width, rs2), fget(cpu, width, rs3));
+            let (r, fl) = fpu::fma(op, width, a, b, c, rm);
+            fset(cpu, width, rd, r, fl);
+        }
+        Inst::FMinMax { max, width, rd, rs1, rs2 } => {
+            let (r, fl) = fpu::min_max(max, width, fget(cpu, width, rs1), fget(cpu, width, rs2));
+            fset(cpu, width, rd, r, fl);
+        }
+        Inst::FCmp { op, width, rd, rs1, rs2 } => {
+            let (r, fl) = fpu::compare(op, width, fget(cpu, width, rs1), fget(cpu, width, rs2));
+            cpu.fcsr |= fl as u32;
+            cpu.set_x(rd, r as u64);
+        }
+        Inst::FClass { width, rd, rs1 } => {
+            cpu.set_x(rd, fpu::classify(width, fget(cpu, width, rs1)))
+        }
+        Inst::FCvtToInt { from, to, rd, rs1, rm } => {
+            let rm = rounding(cpu, rm)?;
+            let (r, fl) = fpu::to_int(from, to, fget(cpu, from, rs1), rm);
+            cpu.fcsr |= fl as u32;
+            cpu.set_x(rd, r);
+        }
+        Inst::FCvtFromInt { from, to, rd, rs1, rm } => {
+            let rm = rounding(cpu, rm)?;
+            let (r, fl) = fpu::from_int(to, from, cpu.x(rs1), rm);
+            fset(cpu, to, rd, r, fl);
+        }
+        Inst::FCvtFloat { to, rd, rs1, rm } => {
+            let rm = rounding(cpu, rm)?;
+            let from = if to == FWidth::S { FWidth::D } else { FWidth::S };
+            let (r, fl) = fpu::convert(to, fget(cpu, from, rs1), rm);
+            fset(cpu, to, rd, r, fl);
+        }
         Inst::FSgnj { kind, width, rd, rs1, rs2 } => {
             cpu.f[rd as usize] = match width {
                 FWidth::S => {
@@ -266,6 +315,32 @@ fn amo_op(op: AmoOp, width: AmoWidth, old: u64, src: u64) -> u64 {
         AmoOp::Minu => ua.min(ub),
         AmoOp::Maxu => ua.max(ub),
     }
+}
+
+/// Resolve an instruction's `rm` field, reading `frm` for `dyn`.
+#[inline]
+fn rounding(cpu: &CpuState, rm: u8) -> Result<fpu::Rm, Trap> {
+    let bits = if rm == decoder::RM_DYN { (cpu.fcsr >> 5 & 0b111) as u8 } else { rm };
+    fpu::Rm::from_bits(bits).ok_or(Trap::ReservedRoundingMode { pc: cpu.pc })
+}
+
+/// Read an FP operand as raw bits: doubles as-is, singles unboxed into the low 32 bits.
+#[inline]
+fn fget(cpu: &CpuState, w: FWidth, r: u8) -> u64 {
+    match w {
+        FWidth::S => unbox(cpu.f[r as usize]) as u64,
+        FWidth::D => cpu.f[r as usize],
+    }
+}
+
+/// Write an FP result (NaN-boxing singles) and accrue its exception flags.
+#[inline]
+fn fset(cpu: &mut CpuState, w: FWidth, r: u8, v: u64, flags: fpu::Fflags) {
+    cpu.f[r as usize] = match w {
+        FWidth::S => nan_box(v),
+        FWidth::D => v,
+    };
+    cpu.fcsr |= flags as u32;
 }
 
 /// NaN-box a single-precision value (in the low 32 bits) for an `f` register.

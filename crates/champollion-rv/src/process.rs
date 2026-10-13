@@ -34,7 +34,7 @@ pub const STACK_SIZE: u64 = 8 << 20;
 pub const MMAP_TOP: u64 = STACK_TOP - (1 << 30);
 
 /// `AT_HWCAP`: one bit per single-letter extension we implement (bit n = letter 'a' + n).
-const HWCAP: u64 = hwcap(b"imac");
+const HWCAP: u64 = hwcap(b"imafdc");
 
 const fn hwcap(letters: &[u8]) -> u64 {
     let mut bits = 0;
@@ -74,7 +74,7 @@ impl Exit {
         match self {
             Exit::Status(_) => None,
             Exit::Trap(t) => Some(match t {
-                Trap::IllegalInstruction { .. } => SIGILL,
+                Trap::IllegalInstruction { .. } | Trap::ReservedRoundingMode { .. } => SIGILL,
                 Trap::Ebreak { .. } => SIGTRAP,
                 Trap::MisalignedAtomic { .. } => SIGBUS,
                 Trap::FetchFault(_) | Trap::LoadFault { .. } | Trap::StoreFault { .. } => SIGSEGV,

@@ -2,7 +2,7 @@
 //!
 //! Covers RV64I, M, A, C (see [`compressed`]), Zicsr (for the CSRs user programs can
 //! reach), Zifencei, and the data-movement subset of F and D (loads, stores, `fmv`,
-//! `fsgnj`); floating-point arithmetic is M3.
+//! `fsgnj`), and all of F and D (arithmetic runs in [`crate::fpu`]).
 //!
 //! Immediates are stored already sign-extended (`lui`/`auipc` already shifted left by 12),
 //! and branch/jump offsets are byte offsets relative to the instruction's own pc. Every
@@ -18,9 +18,9 @@
 ///   writes to read-only ones are rejected here, so execution never sees an illegal access.
 /// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
 ///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
-/// - `FLoad` / `FStore` / `FSgnj`: register numbers name `f` registers, except `rs1` of the
-///   loads/stores (the base address). `FMvToInt` reads `f[rs1]` into `x[rd]`;
-///   `FMvFromInt` reads `x[rs1]` into `f[rd]`.
+/// - F/D instructions: register numbers name `f` registers, except the base address of
+///   loads/stores, the `x` destination of `FMvToInt`/`FCmp`/`FClass`/`FCvtToInt`, and the
+///   `x` source of `FMvFromInt`/`FCvtFromInt`. `rm` is the raw rounding-mode field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inst {
     Lui { rd: u8, imm: i32 },
@@ -47,6 +47,54 @@ pub enum Inst {
     FMvToInt { width: FWidth, rd: u8, rs1: u8 },
     FMvFromInt { width: FWidth, rd: u8, rs1: u8 },
     FSgnj { kind: SgnjKind, width: FWidth, rd: u8, rs1: u8, rs2: u8 },
+    FArith { op: FArithOp, width: FWidth, rd: u8, rs1: u8, rs2: u8, rm: u8 },
+    FSqrt { width: FWidth, rd: u8, rs1: u8, rm: u8 },
+    FFma { op: FmaOp, width: FWidth, rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u8 },
+    FMinMax { max: bool, width: FWidth, rd: u8, rs1: u8, rs2: u8 },
+    FCmp { op: FCmpOp, width: FWidth, rd: u8, rs1: u8, rs2: u8 },
+    FClass { width: FWidth, rd: u8, rs1: u8 },
+    FCvtToInt { from: FWidth, to: IntType, rd: u8, rs1: u8, rm: u8 },
+    FCvtFromInt { from: IntType, to: FWidth, rd: u8, rs1: u8, rm: u8 },
+    FCvtFloat { to: FWidth, rd: u8, rs1: u8, rm: u8 },
+}
+
+/// `rm` value meaning "use `frm`". Instructions store `rm` raw (0–4 or 7); reserved values
+/// are rejected at decode, and `dyn` is resolved at execution.
+pub const RM_DYN: u8 = 0b111;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// Fused multiply-add: `Madd` = a·b + c, `Msub` = a·b − c, `Nmsub` = −(a·b) + c,
+/// `Nmadd` = −(a·b) − c.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmaOp {
+    Madd,
+    Msub,
+    Nmsub,
+    Nmadd,
+}
+
+/// `feq` is a quiet comparison; `flt` and `fle` are signaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FCmpOp {
+    Eq,
+    Lt,
+    Le,
+}
+
+/// Integer side of `fcvt`: 32-bit (`w`/`wu`) or 64-bit (`l`/`lu`), signed or unsigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntType {
+    W,
+    Wu,
+    L,
+    Lu,
 }
 
 /// Floating-point operand width: single (F) or double (D).
@@ -204,6 +252,10 @@ const LOAD: u32 = 0b000_0011;
 const LOAD_FP: u32 = 0b000_0111;
 const STORE_FP: u32 = 0b010_0111;
 const OP_FP: u32 = 0b101_0011;
+const MADD: u32 = 0b100_0011;
+const MSUB: u32 = 0b100_0111;
+const NMSUB: u32 = 0b100_1011;
+const NMADD: u32 = 0b100_1111;
 const MISC_MEM: u32 = 0b000_1111;
 const OP_IMM: u32 = 0b001_0011;
 const AUIPC: u32 = 0b001_0111;
@@ -418,6 +470,24 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 Inst::FStore { width, rs1, rs2, offset: imm_s(w) }
             }
         }
+        MADD | MSUB | NMSUB | NMADD => {
+            // R4 format: rs3 in bits 31:27, fmt in bits 26:25, rm in funct3.
+            let width = match f7 & 0b11 {
+                0b00 => FWidth::S,
+                0b01 => FWidth::D,
+                _ => return illegal,
+            };
+            if f3 == 0b101 || f3 == 0b110 {
+                return illegal;
+            }
+            let op = match w & 0x7f {
+                MADD => FmaOp::Madd,
+                MSUB => FmaOp::Msub,
+                NMSUB => FmaOp::Nmsub,
+                _ => FmaOp::Nmadd,
+            };
+            Inst::FFma { op, width, rd, rs1, rs2, rs3: (w >> 27) as u8, rm: f3 as u8 }
+        }
         OP_FP => {
             // funct7 = funct5 << 2 | fmt, with fmt 0 = S, 1 = D.
             let width = match f7 & 0b11 {
@@ -425,13 +495,50 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 0b01 => FWidth::D,
                 _ => return illegal,
             };
+            // Rounding-mode field: 101 and 110 are reserved.
+            let rm = f3 as u8;
+            let rm_ok = !(rm == 0b101 || rm == 0b110);
+            let int = |n: u8| match n {
+                0 => Some(IntType::W),
+                1 => Some(IntType::Wu),
+                2 => Some(IntType::L),
+                3 => Some(IntType::Lu),
+                _ => None,
+            };
+            let arith = |op| Inst::FArith { op, width, rd, rs1, rs2, rm };
             match (f7 >> 2, f3, rs2) {
+                (0b00000, _, _) if rm_ok => arith(FArithOp::Add),
+                (0b00001, _, _) if rm_ok => arith(FArithOp::Sub),
+                (0b00010, _, _) if rm_ok => arith(FArithOp::Mul),
+                (0b00011, _, _) if rm_ok => arith(FArithOp::Div),
+                (0b01011, _, 0) if rm_ok => Inst::FSqrt { width, rd, rs1, rm },
                 (0b00100, 0b000, _) => Inst::FSgnj { kind: SgnjKind::Sgnj, width, rd, rs1, rs2 },
                 (0b00100, 0b001, _) => Inst::FSgnj { kind: SgnjKind::Sgnjn, width, rd, rs1, rs2 },
                 (0b00100, 0b010, _) => Inst::FSgnj { kind: SgnjKind::Sgnjx, width, rd, rs1, rs2 },
+                (0b00101, 0b000, _) => Inst::FMinMax { max: false, width, rd, rs1, rs2 },
+                (0b00101, 0b001, _) => Inst::FMinMax { max: true, width, rd, rs1, rs2 },
+                // fcvt.s.d (fmt S, source D = 1) and fcvt.d.s (fmt D, source S = 0).
+                (0b01000, _, 1) if rm_ok && width == FWidth::S => {
+                    Inst::FCvtFloat { to: FWidth::S, rd, rs1, rm }
+                }
+                (0b01000, _, 0) if rm_ok && width == FWidth::D => {
+                    Inst::FCvtFloat { to: FWidth::D, rd, rs1, rm }
+                }
+                (0b10100, 0b010, _) => Inst::FCmp { op: FCmpOp::Eq, width, rd, rs1, rs2 },
+                (0b10100, 0b001, _) => Inst::FCmp { op: FCmpOp::Lt, width, rd, rs1, rs2 },
+                (0b10100, 0b000, _) => Inst::FCmp { op: FCmpOp::Le, width, rd, rs1, rs2 },
+                (0b11000, _, n) if rm_ok => match int(n) {
+                    Some(to) => Inst::FCvtToInt { from: width, to, rd, rs1, rm },
+                    None => return illegal,
+                },
+                (0b11010, _, n) if rm_ok => match int(n) {
+                    Some(from) => Inst::FCvtFromInt { from, to: width, rd, rs1, rm },
+                    None => return illegal,
+                },
                 (0b11100, 0b000, 0) => Inst::FMvToInt { width, rd, rs1 },
+                (0b11100, 0b001, 0) => Inst::FClass { width, rd, rs1 },
                 (0b11110, 0b000, 0) => Inst::FMvFromInt { width, rd, rs1 },
-                _ => return illegal, // arithmetic, conversions, compares: M3
+                _ => return illegal,
             }
         }
         AMO => {
@@ -644,7 +751,12 @@ mod tests {
             0x0020_0073,                          // uret-shaped SYSTEM encoding
             0x0000_1073,           // csrrw on ustatus: not a user-mode CSR we implement
             fload(0b001, 1, 2, 0), // flh: Zfh
-            op_fp(0b00000, 0b01, 0b111, 1, 2, 3), // fadd.d: arithmetic is M3
+            op_fp(0b00000, 0b01, 0b101, 1, 2, 3), // fadd.d with reserved rm 101
+            op_fp(0b01011, 0b00, 0b000, 1, 2, 3), // fsqrt.s with rs2 != 0
+            op_fp(0b01000, 0b00, 0b000, 1, 2, 0), // fcvt.s.s
+            op_fp(0b11000, 0b01, 0b000, 1, 2, 4), // fcvt to an unknown integer type
+            op_fp(0b10100, 0b00, 0b011, 1, 2, 3), // compare funct3 011
+            0x0600_0043 | 0b110 << 12, // fmadd.q (fmt 11) / reserved rm
             op_fp(0b11100, 0b01, 0b000, 1, 2, 3), // fmv.x.d with rs2 != 0
             op_fp(0b00100, 0b10, 0b000, 1, 2, 3), // fsgnj.h: Zfh
             0xc000_1073,           // csrrw cycle: read-only CSR

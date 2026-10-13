@@ -4,7 +4,8 @@
 
 use champollion_rv::decoder::inst_len;
 use champollion_rv::decoder::{
-    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FWidth, LoadWidth, SgnjKind, StoreWidth,
+    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FArithOp, FCmpOp, FWidth, FmaOp, IntType,
+    LoadWidth, RM_DYN, SgnjKind, StoreWidth,
 };
 use champollion_rv::{Inst, decode};
 
@@ -290,6 +291,13 @@ fn rv64fd() {
     const FA5: u8 = 15;
     const FA7: u8 = 17;
     const FS11: u8 = 27;
+    const FT2: u8 = 2;
+    const FS1: u8 = 9;
+    const FS2: u8 = 18;
+    const FS3: u8 = 19;
+    const FA3: u8 = 13;
+    const FA4: u8 = 14;
+
     const T2: u8 = 7;
     let expected = [
         ("flw fa0, -4(sp)", FLoad { width: S, rd: FA0, rs1: SP, offset: -4 }),
@@ -306,6 +314,67 @@ fn rv64fd() {
         ("fsgnj.d ft3, ft4, ft5", FSgnj { kind: Sgnj, width: D, rd: FT3, rs1: FT4, rs2: FT5 }),
         ("fsgnjn.d ft3, ft4, ft5", FSgnj { kind: Sgnjn, width: D, rd: FT3, rs1: FT4, rs2: FT5 }),
         ("fsgnjx.d ft3, ft4, ft5", FSgnj { kind: Sgnjx, width: D, rd: FT3, rs1: FT4, rs2: FT5 }),
+        (
+            "fadd.s fa0, fa1, fa2, rne",
+            FArith { op: FArithOp::Add, width: S, rd: FA0, rs1: FA1, rs2: FA2, rm: 0 },
+        ),
+        (
+            "fsub.d ft0, ft1, ft2, rtz",
+            FArith { op: FArithOp::Sub, width: D, rd: FT0, rs1: FT1, rs2: FT2, rm: 1 },
+        ),
+        (
+            "fmul.s fs0, fs1, fs2, rdn",
+            FArith { op: FArithOp::Mul, width: S, rd: FS0, rs1: FS1, rs2: FS2, rm: 2 },
+        ),
+        (
+            "fdiv.d fa3, fa4, fa5, rup",
+            FArith { op: FArithOp::Div, width: D, rd: FA3, rs1: FA4, rs2: FA5, rm: 3 },
+        ),
+        (
+            "fadd.d fa0, fa1, fa2, rmm",
+            FArith { op: FArithOp::Add, width: D, rd: FA0, rs1: FA1, rs2: FA2, rm: 4 },
+        ),
+        (
+            "fmul.d fa0, fa1, fa2, dyn",
+            FArith { op: FArithOp::Mul, width: D, rd: FA0, rs1: FA1, rs2: FA2, rm: RM_DYN },
+        ),
+        ("fsqrt.s ft3, ft4", FSqrt { width: S, rd: FT3, rs1: FT4, rm: RM_DYN }),
+        ("fsqrt.d ft3, ft4, rtz", FSqrt { width: D, rd: FT3, rs1: FT4, rm: 1 }),
+        (
+            "fmadd.s fa0, fa1, fa2, fa3",
+            FFma { op: FmaOp::Madd, width: S, rd: FA0, rs1: FA1, rs2: FA2, rs3: FA3, rm: RM_DYN },
+        ),
+        (
+            "fmsub.d fa0, fa1, fa2, fa3, rne",
+            FFma { op: FmaOp::Msub, width: D, rd: FA0, rs1: FA1, rs2: FA2, rs3: FA3, rm: 0 },
+        ),
+        (
+            "fnmsub.s ft0, ft1, ft2, ft3, rtz",
+            FFma { op: FmaOp::Nmsub, width: S, rd: FT0, rs1: FT1, rs2: FT2, rs3: FT3, rm: 1 },
+        ),
+        (
+            "fnmadd.d fs0, fs1, fs2, fs3",
+            FFma { op: FmaOp::Nmadd, width: D, rd: FS0, rs1: FS1, rs2: FS2, rs3: FS3, rm: RM_DYN },
+        ),
+        ("fmin.s fa0, fa1, fa2", FMinMax { max: false, width: S, rd: FA0, rs1: FA1, rs2: FA2 }),
+        ("fmax.d fa0, fa1, fa2", FMinMax { max: true, width: D, rd: FA0, rs1: FA1, rs2: FA2 }),
+        ("feq.s a0, fa1, fa2", FCmp { op: FCmpOp::Eq, width: S, rd: A0, rs1: FA1, rs2: FA2 }),
+        ("flt.d a1, ft0, ft1", FCmp { op: FCmpOp::Lt, width: D, rd: A1, rs1: FT0, rs2: FT1 }),
+        ("fle.s a2, fs0, fs1", FCmp { op: FCmpOp::Le, width: S, rd: A2, rs1: FS0, rs2: FS1 }),
+        ("fclass.d a3, fa0", FClass { width: D, rd: A3, rs1: FA0 }),
+        ("fcvt.w.s a0, fa0, rtz", FCvtToInt { from: S, to: IntType::W, rd: A0, rs1: FA0, rm: 1 }),
+        ("fcvt.wu.d a1, fa1, rne", FCvtToInt { from: D, to: IntType::Wu, rd: A1, rs1: FA1, rm: 0 }),
+        ("fcvt.l.s a2, fa2", FCvtToInt { from: S, to: IntType::L, rd: A2, rs1: FA2, rm: RM_DYN }),
+        ("fcvt.lu.d a3, fa3, rmm", FCvtToInt { from: D, to: IntType::Lu, rd: A3, rs1: FA3, rm: 4 }),
+        ("fcvt.s.w fa0, a0", FCvtFromInt { from: IntType::W, to: S, rd: FA0, rs1: A0, rm: RM_DYN }),
+        ("fcvt.d.wu fa1, a1", FCvtFromInt { from: IntType::Wu, to: D, rd: FA1, rs1: A1, rm: 0 }),
+        ("fcvt.s.l fa2, a2, rdn", FCvtFromInt { from: IntType::L, to: S, rd: FA2, rs1: A2, rm: 2 }),
+        (
+            "fcvt.d.lu fa3, a3",
+            FCvtFromInt { from: IntType::Lu, to: D, rd: FA3, rs1: A3, rm: RM_DYN },
+        ),
+        ("fcvt.s.d fa0, fa1", FCvtFloat { to: S, rd: FA0, rs1: FA1, rm: RM_DYN }),
+        ("fcvt.d.s fa2, fa3", FCvtFloat { to: D, rd: FA2, rs1: FA3, rm: 0 }),
     ];
     check(
         include_str!("../../../tests/fixtures/rv64fd.s"),

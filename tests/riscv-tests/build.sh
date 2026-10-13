@@ -42,24 +42,12 @@ build_suite rv64um generic_rv64+m
 build_suite rv64ua generic_rv64+m+a
 build_suite rv64uc generic_rv64+c
 
-# F/D: only the load/store tests for now; the rest need FP arithmetic and fcsr (M3).
-build_suite_only() {
-    suite=$1 cpu=$2 out_name=$3
-    shift 3
-    out="$root/tests/fixtures/$out_name"
-    rm -rf "$out" && mkdir -p "$out"
-    for name in "$@"; do
-        zig cc -target riscv64-linux-musl -mcpu="$cpu" -mno-relax \
-            -nostdlib -static -s -Wl,--build-id=none \
-            -I"$here" -I"$isa/macros/scalar" \
-            "$isa/$suite/$name.S" -o "$out/$name"
-    done
-}
-build_suite_only rv64uf generic_rv64+f rv64uf ldst
-build_suite_only rv64ud generic_rv64+f+d rv64ud ldst
+build_suite rv64uf generic_rv64+f
+build_suite rv64ud generic_rv64+f+d
 
 # The same sources again with C enabled: the assembler compresses every eligible
 # instruction, which exercises the C decoder on hundreds of real instruction sequences.
 build_suite rv64ui generic_rv64+c rv64ui-c
 build_suite rv64um generic_rv64+m+c rv64um-c
 build_suite rv64ua generic_rv64+m+a+c rv64ua-c
+build_suite rv64ud generic_rv64+f+d+c rv64ud-c

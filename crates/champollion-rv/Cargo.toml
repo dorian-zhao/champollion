@@ -9,4 +9,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+champollion-softfloat = { version = "0.1.0", path = "../softfloat" }
 libc = "0.2.190"

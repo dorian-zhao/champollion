@@ -72,3 +72,16 @@ fn load_errors() {
     let out = rvrun(&[], b"");
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn floating_point_matches_native() {
+    // fp.expected is the output of the same C source built natively for arm64.
+    let out = rvrun(&[fixture("fp").as_os_str()], b"");
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let expected = include_str!("../../../tests/fixtures/fp.expected");
+    let got = String::from_utf8_lossy(&out.stdout);
+    for (i, (g, e)) in got.lines().zip(expected.lines()).enumerate() {
+        assert_eq!(g, e, "line {}", i + 1);
+    }
+    assert_eq!(got.lines().count(), expected.lines().count());
+}
