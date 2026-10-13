@@ -85,14 +85,69 @@ Rust at the core; ARM64 assembly and Swift at the edges.
 - **W^X:** JIT memory must be `mmap(MAP_JIT)`, toggled between writable and executable with `pthread_jit_write_protect_np()`; the executable needs the `com.apple.security.cs.allow-jit` entitlement and must be codesigned.
 - **I-cache:** call `sys_icache_invalidate()` after writing machine code, or stale instructions will execute.
 - **No binfmt\_misc:** ELF files can't be launched by double-clicking; only through `rvrun`.
-- **Address space:** map the guest's 47-bit address space onto the host with a fixed offset or as close to identity mapping as possible, avoiding regions macOS already occupies.
+- **Address space:** map the guest's 47-bit address space onto the host at a fixed offset. Identity mapping is not an option: static musl ELFs typically load near `0x10000`, which falls inside the 4 GiB `__PAGEZERO` that macOS reserves at the bottom of every 64-bit process.
+- **Reserved registers:** Apple's arm64 ABI reserves `x18` as the platform register; it must never hold guest state.
 
 **Translation**
 
 - **LR/SC:** translate to LSE `CAS` or `LDAXR`/`STLXR`, minding the ABA semantic differences.
-- **Floating point:** NaN-boxing, dynamic rounding modes, and accrued `fflags` are hidden performance costs; get it correct first, then optimize with "don't compute fflags if nobody reads them."
+- **Floating point:** NaN-boxing, dynamic rounding modes, and accrued `fflags` are hidden performance costs; get it correct first. Most of the cost can be pushed onto hardware; see [Performance Strategy](#performance-strategy).
 - **Indirect jumps:** `jalr` looks up the translated address in a hash table, plus a return address stack to predict `ret`.
 - **Self-modifying code:** detect writes to translated pages and invalidate the corresponding blocks.
+
+## Performance Strategy
+
+Performance is protected in three layers: define what "fast" means and measure it continuously, get the architectural decisions that set the ceiling right before M4, and only then tune the JIT.
+
+### Measurement
+
+- **Primary metric: percent of native speed.** Build each benchmark from the same C source twice with `zig cc`, once for riscv64-linux-musl and once for aarch64-macos, and report the translated run as a percentage of the native one. Rosetta 2 runs at roughly 70–80% of native and serves as the reference ceiling.
+- **Secondary baseline: QEMU linux-user** (run on Linux), the incumbent this project wants to beat.
+- **Workloads:** CoreMark, Embench, a few lua benchmark scripts, and sqlite's `speedtest1`.
+- **Regression tracking:** time with `hyperfine`, store results in the repository, and from M4 onward run the suite on every JIT-related commit.
+- **JIT counters:** blocks translated, direct-chain ratio, indirect-jump lookup miss rate, and dispatcher re-entries. Performance problems usually show up here before they show up in wall-clock time.
+- **Profiling:** Instruments (Time Profiler, CPU Counters) or `samply`. The JIT should emit a symbol map so profiles can show guest function names.
+
+### Architecture That Sets the Ceiling
+
+These must be decided before M4; changing them later means rewriting the JIT.
+
+| Area | Approach | Why it matters |
+| --- | --- | --- |
+| Register mapping | Pin the ~20 most used guest registers in host registers; spill the rest to `CpuState` | The single largest factor. Not 1:1, because `x18` is reserved on macOS and `x29`, `x30`, and `sp` are spoken for; pick by usage frequency |
+| Memory addressing | Keep the guest memory base in a host register and use register-offset addressing (`ldr x, [base, xN]`) with no software bounds checks | Out-of-range accesses are caught by host page protection instead of per-access checks |
+| Block chaining | Once a direct branch target is translated, patch the branch to jump straight to it | Hot loops never return to the dispatcher |
+| Indirect jumps | Inline hash-table lookup in generated code for `jalr`; a shadow return stack to predict `ret` | Calls and switch jump tables are typically a translator's biggest bottleneck |
+| Lazy state | Write back `pc` only at block exits; compute `instret` and `cycle` only when the guest reads them | Avoids per-instruction overhead |
+| Self-modifying code | Write-protect translated pages and invalidate on fault | Zero cost in the common case |
+| AOT cache | Persist translations to `~/Library/Caches` | Removes translation warmup from startup |
+
+### Floating Point Mostly Maps onto Hardware
+
+ARM64 hardware lines up with RISC-V floating-point semantics closely enough that correctness is nearly free:
+
+- **Canonical NaN:** with `FPCR.DN` (Default NaN) set, ARM produces `0x7FC00000`, exactly the RISC-V canonical NaN, so no software fix-up is needed.
+- **`fflags`:** the cumulative exception bits in ARM's `FPSR` map one-to-one onto RISC-V `fflags` (IOC→NV, DZC→DZ, OFC→OF, UFC→UF, IXC→NX). Hardware accumulates them; read `FPSR` only when the guest reads `fflags`.
+- **Rounding modes:** static rounding modes encoded in the instruction map to ARM instruction variants (e.g. `fcvtzs` / `fcvtms`); dynamic `frm` is written to `FPCR` only when it changes.
+- **Exception:** NaN-boxing checks (a single-precision value requires the upper 32 bits to be all ones) have no hardware equivalent. Track the type held in each register at translation time to elide most of them.
+
+### Peephole Optimizations (Later)
+
+Recognize common instruction sequences and emit tighter ARM64 code:
+
+- `lui` + `addi` → a single `mov`
+- `auipc` + `jalr` → a direct `bl`
+- `slli 32` + `srli 32` → `ubfx`
+- fold `sext.w` into the preceding `*w` instruction
+- compare-and-branch → `cbz` / `tbz`
+
+Do these only once the JIT is correct and the benchmarks run, and pick them by profile.
+
+### Constraints on M1–M3
+
+- **Do not optimize the interpreter.** It is the correctness oracle; clarity beats speed.
+- **Get the data structures right now:** `CpuState` stays `#[repr(C)]` for fixed-offset JIT access, and `Inst` stays small and `Copy`. The `Memory` trait is for the interpreter only; JIT code reaches guest memory through the base register, so the trait never becomes a bottleneck.
+- **Fix the guest address-space layout in M2** (offset and reserved range), since it determines the M4 addressing scheme.
 
 ## Milestones
 
@@ -124,3 +179,4 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 - **Oct 13, 2026 — RV64 only.** RV32 is not supported; see [Instruction Set Scope](#instruction-set-scope).
 - **Oct 13, 2026 — C extension moves into M2.** Real binaries are full of compressed instructions, so `hello` cannot run without them.
+- **Oct 13, 2026 — Guest address-space layout is decided in M2.** Guest memory lives at a fixed host offset (identity mapping collides with `__PAGEZERO`), and the layout dictates the JIT's memory addressing; see [Performance Strategy](#performance-strategy).
