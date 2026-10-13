@@ -70,3 +70,8 @@ fn run_suite(suite: &str, min_tests: usize) {
 fn rv64ui() {
     run_suite("rv64ui", 53);
 }
+
+#[test]
+fn rv64um() {
+    run_suite("rv64um", 13);
+}

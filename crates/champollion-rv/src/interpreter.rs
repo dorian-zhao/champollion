@@ -168,6 +168,10 @@ fn load_value(mem: &impl Memory, addr: u64, width: LoadWidth) -> Result<u64, Mem
 }
 
 /// 64-bit ALU. Shift amounts use the low 6 bits of `b`.
+///
+/// Division never traps (M extension): x / 0 = all ones, x % 0 = x, and the signed overflow
+/// case MIN / -1 = MIN with remainder 0, which is exactly what `wrapping_div`/`wrapping_rem`
+/// give.
 fn alu(op: AluOp, a: u64, b: u64) -> u64 {
     let sh = (b & 63) as u32;
     match op {
@@ -181,6 +185,16 @@ fn alu(op: AluOp, a: u64, b: u64) -> u64 {
         AluOp::Sra => ((a as i64) >> sh) as u64,
         AluOp::Or => a | b,
         AluOp::And => a & b,
+        AluOp::Mul => a.wrapping_mul(b),
+        AluOp::Mulh => ((a as i64 as i128 * b as i64 as i128) >> 64) as u64,
+        AluOp::Mulhsu => ((a as i64 as i128 * b as i128) >> 64) as u64,
+        AluOp::Mulhu => ((a as u128 * b as u128) >> 64) as u64,
+        AluOp::Div if b == 0 => u64::MAX,
+        AluOp::Div => (a as i64).wrapping_div(b as i64) as u64,
+        AluOp::Divu => a.checked_div(b).unwrap_or(u64::MAX),
+        AluOp::Rem if b == 0 => a,
+        AluOp::Rem => (a as i64).wrapping_rem(b as i64) as u64,
+        AluOp::Remu => a.checked_rem(b).unwrap_or(a),
     }
 }
 
@@ -195,6 +209,13 @@ fn alu32(op: AluOp32, a: u64, b: u64) -> u64 {
         AluOp32::Sll => a << sh,
         AluOp32::Srl => a >> sh,
         AluOp32::Sra => ((a as i32) >> sh) as u32,
+        AluOp32::Mul => a.wrapping_mul(b),
+        AluOp32::Div if b == 0 => u32::MAX,
+        AluOp32::Div => (a as i32).wrapping_div(b as i32) as u32,
+        AluOp32::Divu => a.checked_div(b).unwrap_or(u32::MAX),
+        AluOp32::Rem if b == 0 => a,
+        AluOp32::Rem => (a as i32).wrapping_rem(b as i32) as u32,
+        AluOp32::Remu => a.checked_rem(b).unwrap_or(a),
     };
     r as i32 as u64
 }
@@ -357,6 +378,45 @@ mod tests {
                 4,
                 0xffff_ffff_f800_0000,
             ), // sraw
+        ];
+        for (i, &(w, a, b, want)) in cases.iter().enumerate() {
+            assert_eq!(one(w, a, b), want, "case {i}: {:?}", decoder::decode(w));
+        }
+    }
+
+    #[test]
+    fn mul_div_edge_cases() {
+        let m = |f3| op(f3, 0b000_0001, 10, 11, 12);
+        let w = |f3| op_32(f3, 0b000_0001, 10, 11, 12);
+        let (mul, mulh, mulhsu, mulhu) = (m(0b000), m(0b001), m(0b010), m(0b011));
+        let (div, divu, rem, remu) = (m(0b100), m(0b101), m(0b110), m(0b111));
+        let (mulw, divw, divuw, remw, remuw) = (w(0b000), w(0b100), w(0b101), w(0b110), w(0b111));
+        // (encoding, a1, a2, expected a0)
+        let cases = [
+            (mul, NEG1, NEG1, 1),
+            (mul, 1 << 32, 1 << 32, 0), // low 64 bits only
+            (mulh, NEG1, NEG1, 0),      // (-1 * -1) >> 64
+            (mulh, MIN, MIN, 1 << 62),
+            (mulhu, NEG1, NEG1, NEG1 - 1),
+            (mulhsu, NEG1, NEG1, NEG1), // -1 * (2^64 - 1) >> 64 = -1
+            (mulhsu, 2, NEG1, 1),
+            (div, 7, NEG1 - 1, NEG1 - 2),   // 7 / -2 = -3, truncating
+            (rem, 7, NEG1 - 1, 1),          // remainder takes the dividend's sign
+            (rem, (-7i64) as u64, 2, NEG1), // -7 % 2 = -1
+            (div, 5, 0, NEG1),              // divide by zero
+            (divu, 5, 0, NEG1),
+            (rem, 5, 0, 5),
+            (remu, 5, 0, 5),
+            (div, MIN, NEG1, MIN), // signed overflow
+            (rem, MIN, NEG1, 0),
+            (divu, NEG1, 2, NEG1 >> 1),
+            (mulw, 0x1_0000_0002, 0x4000_0000, 0xffff_ffff_8000_0000), // low 32 bits, sign-extended
+            (divw, 0x1_0000_0007, 2, 3),                               // upper bits ignored
+            (divw, 0x8000_0000, NEG1, 0xffff_ffff_8000_0000),          // 32-bit overflow
+            (remw, 0x8000_0000, NEG1, 0),
+            (divuw, 0xffff_fffe, 1, 0xffff_ffff_ffff_fffe), // result is sign-extended
+            (divuw, 5, 0, NEG1),
+            (remuw, 0x1_8000_0001, 0, 0xffff_ffff_8000_0001),
         ];
         for (i, &(w, a, b, want)) in cases.iter().enumerate() {
             assert_eq!(one(w, a, b), want, "case {i}: {:?}", decoder::decode(w));

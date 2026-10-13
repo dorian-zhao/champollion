@@ -1,11 +1,9 @@
 //! Checks the decoder against encodings produced by a real assembler (LLVM, via `zig cc`).
-//! `tests/fixtures/rv64i.s` lists the instructions; `rv64i.bin` is the assembled `.text`.
+//! Each `tests/fixtures/*.s` lists instructions one per line; the matching `.bin` is the
+//! assembled `.text`.
 
 use champollion_rv::decoder::{AluOp, AluOp32, BranchCond, LoadWidth, StoreWidth};
 use champollion_rv::{Inst, decode};
-
-const SOURCE: &str = include_str!("../../../tests/fixtures/rv64i.s");
-const BINARY: &[u8] = include_bytes!("../../../tests/fixtures/rv64i.bin");
 
 // Register numbers by ABI name, for readability below.
 const ZERO: u8 = 0;
@@ -31,7 +29,7 @@ const T4: u8 = 29;
 const T5: u8 = 30;
 const T6: u8 = 31;
 
-fn expected() -> Vec<(&'static str, Inst)> {
+fn rv64i_expected() -> Vec<(&'static str, Inst)> {
     use AluOp as A;
     use AluOp32 as W;
     use BranchCond as C;
@@ -531,34 +529,174 @@ fn expected() -> Vec<(&'static str, Inst)> {
     ]
 }
 
-#[test]
-fn decodes_assembler_output() {
-    let lines: Vec<&str> = SOURCE
+/// Decode every word of an assembled fixture and compare against `expected`, which lists
+/// the source lines of the `.s` file in order alongside the `Inst` each should decode to.
+fn check(source: &str, binary: &[u8], expected: &[(&str, Inst)]) {
+    let lines: Vec<&str> = source
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('.'))
         .collect();
-    let words: Vec<u32> = BINARY
+    let words: Vec<u32> = binary
         .as_chunks::<4>()
         .0
         .iter()
         .map(|c| u32::from_le_bytes(*c))
         .collect();
-    let expected = expected();
 
     assert_eq!(
         lines.len(),
         words.len(),
-        "rv64i.bin is stale; run tests/fixtures/build.sh"
+        "fixture .bin is stale; run tests/fixtures/build.sh"
     );
     assert_eq!(
         lines.len(),
         expected.len(),
-        "rv64i.s and this table are out of sync"
+        "fixture .s and the table are out of sync"
     );
 
-    for ((line, word), (asm, inst)) in lines.iter().zip(&words).zip(&expected) {
-        assert_eq!(line, asm, "rv64i.s and this table are out of order");
+    for ((line, word), (asm, inst)) in lines.iter().zip(&words).zip(expected) {
+        assert_eq!(line, asm, "fixture .s and the table are out of order");
         assert_eq!(decode(*word), Ok(*inst), "{asm} ({word:#010x})");
     }
+}
+
+#[test]
+fn rv64i() {
+    check(
+        include_str!("../../../tests/fixtures/rv64i.s"),
+        include_bytes!("../../../tests/fixtures/rv64i.bin"),
+        &rv64i_expected(),
+    );
+}
+
+#[test]
+fn rv64m() {
+    use AluOp as A;
+    use AluOp32 as W;
+    use Inst::*;
+    let expected = [
+        (
+            "mul a0, a1, a2",
+            Op {
+                op: A::Mul,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "mulh a0, a1, a2",
+            Op {
+                op: A::Mulh,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "mulhsu a0, a1, a2",
+            Op {
+                op: A::Mulhsu,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "mulhu a0, a1, a2",
+            Op {
+                op: A::Mulhu,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "div s2, s3, s4",
+            Op {
+                op: A::Div,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "divu s2, s3, s4",
+            Op {
+                op: A::Divu,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "rem t4, t5, t6",
+            Op {
+                op: A::Rem,
+                rd: T4,
+                rs1: T5,
+                rs2: T6,
+            },
+        ),
+        (
+            "remu t4, t5, t6",
+            Op {
+                op: A::Remu,
+                rd: T4,
+                rs1: T5,
+                rs2: T6,
+            },
+        ),
+        (
+            "mulw a0, a1, a2",
+            Op32 {
+                op: W::Mul,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "divw a0, a1, a2",
+            Op32 {
+                op: W::Div,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "divuw a0, a1, a2",
+            Op32 {
+                op: W::Divu,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "remw a0, a1, a2",
+            Op32 {
+                op: W::Rem,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "remuw a0, a1, a2",
+            Op32 {
+                op: W::Remu,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/rv64m.s"),
+        include_bytes!("../../../tests/fixtures/rv64m.bin"),
+        &expected,
+    );
 }

@@ -1,6 +1,6 @@
 //! RISC-V instruction decoder.
 //!
-//! Covers all of RV64I. Immediates are stored already sign-extended (`lui`/`auipc` already
+//! Covers RV64I and M. Immediates are stored already sign-extended (`lui`/`auipc` already
 //! shifted left by 12), and branch/jump offsets are byte offsets relative to the
 //! instruction's own pc. Every immediate fits in an `i32`, which keeps [`Inst`] at 8 bytes.
 
@@ -119,6 +119,15 @@ pub enum AluOp {
     Sra,
     Or,
     And,
+    // M extension; register-register only.
+    Mul,
+    Mulh,
+    Mulhsu,
+    Mulhu,
+    Div,
+    Divu,
+    Rem,
+    Remu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +137,12 @@ pub enum AluOp32 {
     Sll,
     Srl,
     Sra,
+    // M extension; register-register only.
+    Mul,
+    Div,
+    Divu,
+    Rem,
+    Remu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +327,14 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b101, 0b010_0000) => AluOp::Sra,
                 (0b110, 0b000_0000) => AluOp::Or,
                 (0b111, 0b000_0000) => AluOp::And,
+                (0b000, 0b000_0001) => AluOp::Mul,
+                (0b001, 0b000_0001) => AluOp::Mulh,
+                (0b010, 0b000_0001) => AluOp::Mulhsu,
+                (0b011, 0b000_0001) => AluOp::Mulhu,
+                (0b100, 0b000_0001) => AluOp::Div,
+                (0b101, 0b000_0001) => AluOp::Divu,
+                (0b110, 0b000_0001) => AluOp::Rem,
+                (0b111, 0b000_0001) => AluOp::Remu,
                 _ => return illegal,
             };
             Inst::Op { op, rd, rs1, rs2 }
@@ -335,6 +358,11 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b001, 0b000_0000) => AluOp32::Sll,
                 (0b101, 0b000_0000) => AluOp32::Srl,
                 (0b101, 0b010_0000) => AluOp32::Sra,
+                (0b000, 0b000_0001) => AluOp32::Mul,
+                (0b100, 0b000_0001) => AluOp32::Div,
+                (0b101, 0b000_0001) => AluOp32::Divu,
+                (0b110, 0b000_0001) => AluOp32::Rem,
+                (0b111, 0b000_0001) => AluOp32::Remu,
                 _ => return illegal,
             };
             Inst::Op32 { op, rd, rs1, rs2 }
@@ -513,7 +541,8 @@ mod tests {
             op_imm(0b001, 1, 2, 0x400 | 3),     // slli with funct6 != 0
             op_imm(0b101, 1, 2, 0x200 | 3),     // srli/srai with bad funct6
             op(0b001, 0b010_0000, 1, 2, 3),     // "subl"
-            op(0b000, 0b000_0001, 1, 2, 3),     // mul: M extension, not yet
+            op(0b000, 0b000_0011, 1, 2, 3),     // unassigned funct7
+            op_32(0b001, 0b000_0001, 1, 2, 3),  // no mulhw
             op_imm_32(0b001, 1, 2, 32),         // slliw with shamt[5] set
             op_imm_32(0b101, 1, 2, 0x400 | 32), // sraiw with shamt[5] set
             op_32(0b010, 0, 1, 2, 3),           // no sltw

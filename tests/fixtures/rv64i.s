@@ -1,5 +1,5 @@
 # Every RV64I instruction form, one per line, in the order the decoder
-# test (crates/champollion-rv/tests/decode_rv64i.rs) expects them.
+# test (crates/champollion-rv/tests/decode.rs) expects them.
 # Assembled to rv64i.bin by build.sh; the raw words are the reference
 # encodings the decoder is checked against.
 .option norvc
