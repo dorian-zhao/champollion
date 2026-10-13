@@ -1,0 +1,564 @@
+//! Checks the decoder against encodings produced by a real assembler (LLVM, via `zig cc`).
+//! `tests/fixtures/rv64i.s` lists the instructions; `rv64i.bin` is the assembled `.text`.
+
+use champollion_rv::decoder::{AluOp, AluOp32, BranchCond, LoadWidth, StoreWidth};
+use champollion_rv::{Inst, decode};
+
+const SOURCE: &str = include_str!("../../../tests/fixtures/rv64i.s");
+const BINARY: &[u8] = include_bytes!("../../../tests/fixtures/rv64i.bin");
+
+// Register numbers by ABI name, for readability below.
+const ZERO: u8 = 0;
+const RA: u8 = 1;
+const SP: u8 = 2;
+const GP: u8 = 3;
+const TP: u8 = 4;
+const T0: u8 = 5;
+const T1: u8 = 6;
+const S0: u8 = 8;
+const S1: u8 = 9;
+const A0: u8 = 10;
+const A1: u8 = 11;
+const A2: u8 = 12;
+const A3: u8 = 13;
+const A4: u8 = 14;
+const A5: u8 = 15;
+const A6: u8 = 16;
+const S2: u8 = 18;
+const S3: u8 = 19;
+const S4: u8 = 20;
+const T4: u8 = 29;
+const T5: u8 = 30;
+const T6: u8 = 31;
+
+fn expected() -> Vec<(&'static str, Inst)> {
+    use AluOp as A;
+    use AluOp32 as W;
+    use BranchCond as C;
+    use Inst::*;
+    use LoadWidth as L;
+    use StoreWidth as S;
+    vec![
+        (
+            "lui a0, 0x12345",
+            Lui {
+                rd: A0,
+                imm: 0x1234_5000,
+            },
+        ),
+        (
+            "lui t1, 0xfffff",
+            Lui {
+                rd: T1,
+                imm: -0x1000,
+            },
+        ),
+        (
+            "auipc t0, 1",
+            Auipc {
+                rd: T0,
+                imm: 0x1000,
+            },
+        ),
+        (
+            "auipc sp, 0x80000",
+            Auipc {
+                rd: SP,
+                imm: i32::MIN,
+            },
+        ),
+        (
+            "jal ra, 2048",
+            Jal {
+                rd: RA,
+                offset: 2048,
+            },
+        ),
+        (
+            "jal zero, -1048576",
+            Jal {
+                rd: ZERO,
+                offset: -1_048_576,
+            },
+        ),
+        (
+            "jalr ra, 16(a0)",
+            Jalr {
+                rd: RA,
+                rs1: A0,
+                offset: 16,
+            },
+        ),
+        (
+            "jalr zero, -1(ra)",
+            Jalr {
+                rd: ZERO,
+                rs1: RA,
+                offset: -1,
+            },
+        ),
+        (
+            "beq a0, a1, -4096",
+            Branch {
+                cond: C::Eq,
+                rs1: A0,
+                rs2: A1,
+                offset: -4096,
+            },
+        ),
+        (
+            "bne a0, a1, 4094",
+            Branch {
+                cond: C::Ne,
+                rs1: A0,
+                rs2: A1,
+                offset: 4094,
+            },
+        ),
+        (
+            "blt t0, t1, 8",
+            Branch {
+                cond: C::Lt,
+                rs1: T0,
+                rs2: T1,
+                offset: 8,
+            },
+        ),
+        (
+            "bge t0, t1, -8",
+            Branch {
+                cond: C::Ge,
+                rs1: T0,
+                rs2: T1,
+                offset: -8,
+            },
+        ),
+        (
+            "bltu s0, s1, 16",
+            Branch {
+                cond: C::Ltu,
+                rs1: S0,
+                rs2: S1,
+                offset: 16,
+            },
+        ),
+        (
+            "bgeu s0, s1, -16",
+            Branch {
+                cond: C::Geu,
+                rs1: S0,
+                rs2: S1,
+                offset: -16,
+            },
+        ),
+        (
+            "lb a0, -2048(sp)",
+            Load {
+                width: L::B,
+                rd: A0,
+                rs1: SP,
+                offset: -2048,
+            },
+        ),
+        (
+            "lh a1, -1(sp)",
+            Load {
+                width: L::H,
+                rd: A1,
+                rs1: SP,
+                offset: -1,
+            },
+        ),
+        (
+            "lw a2, 0(sp)",
+            Load {
+                width: L::W,
+                rd: A2,
+                rs1: SP,
+                offset: 0,
+            },
+        ),
+        (
+            "ld a3, 8(sp)",
+            Load {
+                width: L::D,
+                rd: A3,
+                rs1: SP,
+                offset: 8,
+            },
+        ),
+        (
+            "lbu a4, 1(gp)",
+            Load {
+                width: L::Bu,
+                rd: A4,
+                rs1: GP,
+                offset: 1,
+            },
+        ),
+        (
+            "lhu a5, 2(tp)",
+            Load {
+                width: L::Hu,
+                rd: A5,
+                rs1: TP,
+                offset: 2,
+            },
+        ),
+        (
+            "lwu a6, 2047(s0)",
+            Load {
+                width: L::Wu,
+                rd: A6,
+                rs1: S0,
+                offset: 2047,
+            },
+        ),
+        (
+            "sb a0, -2048(sp)",
+            Store {
+                width: S::B,
+                rs1: SP,
+                rs2: A0,
+                offset: -2048,
+            },
+        ),
+        (
+            "sh a1, -1(sp)",
+            Store {
+                width: S::H,
+                rs1: SP,
+                rs2: A1,
+                offset: -1,
+            },
+        ),
+        (
+            "sw a2, 0(sp)",
+            Store {
+                width: S::W,
+                rs1: SP,
+                rs2: A2,
+                offset: 0,
+            },
+        ),
+        (
+            "sd a3, 2047(sp)",
+            Store {
+                width: S::D,
+                rs1: SP,
+                rs2: A3,
+                offset: 2047,
+            },
+        ),
+        (
+            "addi a0, a1, -2048",
+            OpImm {
+                op: A::Add,
+                rd: A0,
+                rs1: A1,
+                imm: -2048,
+            },
+        ),
+        (
+            "slti a0, a1, 2047",
+            OpImm {
+                op: A::Slt,
+                rd: A0,
+                rs1: A1,
+                imm: 2047,
+            },
+        ),
+        (
+            "sltiu a0, a1, -1",
+            OpImm {
+                op: A::Sltu,
+                rd: A0,
+                rs1: A1,
+                imm: -1,
+            },
+        ),
+        (
+            "xori a0, a1, -1",
+            OpImm {
+                op: A::Xor,
+                rd: A0,
+                rs1: A1,
+                imm: -1,
+            },
+        ),
+        (
+            "ori a0, a1, 0x7ff",
+            OpImm {
+                op: A::Or,
+                rd: A0,
+                rs1: A1,
+                imm: 0x7ff,
+            },
+        ),
+        (
+            "andi a0, a1, 0xff",
+            OpImm {
+                op: A::And,
+                rd: A0,
+                rs1: A1,
+                imm: 0xff,
+            },
+        ),
+        (
+            "slli a0, a1, 63",
+            OpImm {
+                op: A::Sll,
+                rd: A0,
+                rs1: A1,
+                imm: 63,
+            },
+        ),
+        (
+            "srli a0, a1, 1",
+            OpImm {
+                op: A::Srl,
+                rd: A0,
+                rs1: A1,
+                imm: 1,
+            },
+        ),
+        (
+            "srai a0, a1, 63",
+            OpImm {
+                op: A::Sra,
+                rd: A0,
+                rs1: A1,
+                imm: 63,
+            },
+        ),
+        (
+            "add s2, s3, s4",
+            Op {
+                op: A::Add,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "sub s2, s3, s4",
+            Op {
+                op: A::Sub,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "sll s2, s3, s4",
+            Op {
+                op: A::Sll,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "slt s2, s3, s4",
+            Op {
+                op: A::Slt,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "sltu s2, s3, s4",
+            Op {
+                op: A::Sltu,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "xor s2, s3, s4",
+            Op {
+                op: A::Xor,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "srl s2, s3, s4",
+            Op {
+                op: A::Srl,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "sra s2, s3, s4",
+            Op {
+                op: A::Sra,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "or s2, s3, s4",
+            Op {
+                op: A::Or,
+                rd: S2,
+                rs1: S3,
+                rs2: S4,
+            },
+        ),
+        (
+            "and t4, t5, t6",
+            Op {
+                op: A::And,
+                rd: T4,
+                rs1: T5,
+                rs2: T6,
+            },
+        ),
+        (
+            "addiw a0, a1, -1",
+            OpImm32 {
+                op: W::Add,
+                rd: A0,
+                rs1: A1,
+                imm: -1,
+            },
+        ),
+        (
+            "slliw a0, a1, 31",
+            OpImm32 {
+                op: W::Sll,
+                rd: A0,
+                rs1: A1,
+                imm: 31,
+            },
+        ),
+        (
+            "srliw a0, a1, 0",
+            OpImm32 {
+                op: W::Srl,
+                rd: A0,
+                rs1: A1,
+                imm: 0,
+            },
+        ),
+        (
+            "sraiw a0, a1, 31",
+            OpImm32 {
+                op: W::Sra,
+                rd: A0,
+                rs1: A1,
+                imm: 31,
+            },
+        ),
+        (
+            "addw a0, a1, a2",
+            Op32 {
+                op: W::Add,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "subw a0, a1, a2",
+            Op32 {
+                op: W::Sub,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "sllw a0, a1, a2",
+            Op32 {
+                op: W::Sll,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "srlw a0, a1, a2",
+            Op32 {
+                op: W::Srl,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "sraw a0, a1, a2",
+            Op32 {
+                op: W::Sra,
+                rd: A0,
+                rs1: A1,
+                rs2: A2,
+            },
+        ),
+        (
+            "fence",
+            Fence {
+                fm: 0,
+                pred: 0b1111,
+                succ: 0b1111,
+            },
+        ),
+        (
+            "fence rw, w",
+            Fence {
+                fm: 0,
+                pred: 0b0011,
+                succ: 0b0001,
+            },
+        ),
+        (
+            "fence.tso",
+            Fence {
+                fm: 0b1000,
+                pred: 0b0011,
+                succ: 0b0011,
+            },
+        ),
+        ("ecall", Ecall),
+        ("ebreak", Ebreak),
+    ]
+}
+
+#[test]
+fn decodes_assembler_output() {
+    let lines: Vec<&str> = SOURCE
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('.'))
+        .collect();
+    let words: Vec<u32> = BINARY
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    let expected = expected();
+
+    assert_eq!(
+        lines.len(),
+        words.len(),
+        "rv64i.bin is stale; run tests/fixtures/build.sh"
+    );
+    assert_eq!(
+        lines.len(),
+        expected.len(),
+        "rv64i.s and this table are out of sync"
+    );
+
+    for ((line, word), (asm, inst)) in lines.iter().zip(&words).zip(&expected) {
+        assert_eq!(line, asm, "rv64i.s and this table are out of order");
+        assert_eq!(decode(*word), Ok(*inst), "{asm} ({word:#010x})");
+    }
+}
