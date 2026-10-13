@@ -1,0 +1,9 @@
+[package]
+name = "champollion-rv"
+description = "User-mode RISC-V Linux binary translator for macOS arm64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

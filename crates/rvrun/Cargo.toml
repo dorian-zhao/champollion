@@ -1,0 +1,12 @@
+[package]
+name = "rvrun"
+description = "Run RISC-V Linux executables on macOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+champollion-rv = { path = "../champollion-rv" }
+
+[lints]
+workspace = true
