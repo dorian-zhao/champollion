@@ -1,4 +1,5 @@
-//! Runs the riscv-tests suites (built by tests/riscv-tests/build.sh) on the interpreter.
+//! Runs the riscv-tests suites (built by tests/riscv-tests/build.sh) on the reference
+//! interpreter and on the caching engine, and checks that both agree.
 //!
 //! Each test is a static executable that ends with the Linux `exit` syscall: status 0 on
 //! pass, otherwise the number of the first failing test case.
@@ -6,8 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use champollion_rv::CpuState;
+use champollion_rv::engine::Engine;
 use champollion_rv::interpreter::{Trap, run};
 use champollion_rv::loader;
+use champollion_rv::memory::GuestMemory;
 
 const SYS_EXIT: u64 = 93;
 const MAX_STEPS: u64 = 1_000_000;
@@ -22,20 +25,41 @@ fn fixtures(suite: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// Run one test binary; `Ok(())` on pass, otherwise a description of what went wrong.
+/// Run one test binary twice: on the reference interpreter (flat memory) and on the
+/// caching engine (real guest address space). Both must pass and end in identical CPU
+/// states, which differentially tests the engine's block cache and TLB.
 fn run_test(path: &Path) -> Result<(), String> {
     let file = std::fs::read(path).map_err(|e| e.to_string())?;
     let elf = loader::parse(&file).map_err(|e| format!("load: {e:?}"))?;
-    let mem = loader::load_flat(&elf, 0).ok_or("load: no segments")?;
-    let mut cpu = CpuState::new(elf.entry);
 
-    match run(&mut cpu, &mem, MAX_STEPS) {
+    let flat = loader::load_flat(&elf, 0).ok_or("load: no segments")?;
+    let mut oracle = CpuState::new(elf.entry);
+    let oracle_result = run(&mut oracle, &flat, MAX_STEPS);
+    check_exit("interpreter", &oracle, oracle_result)?;
+
+    let mem = GuestMemory::new().map_err(|e| e.to_string())?;
+    loader::map_elf(&mem, &elf).map_err(|e| format!("map: {e:?}"))?;
+    let mut cpu = CpuState::new(elf.entry);
+    let engine_result = Engine::new().run(&mut cpu, &mem, MAX_STEPS);
+    check_exit("engine", &cpu, engine_result)?;
+
+    if cpu != oracle || engine_result.1 != oracle_result.1 {
+        return Err(format!(
+            "engine diverged from the interpreter ({} vs {} steps)\nengine:\n{cpu:?}\ninterpreter:\n{oracle:?}",
+            engine_result.1, oracle_result.1
+        ));
+    }
+    Ok(())
+}
+
+fn check_exit(who: &str, cpu: &CpuState, result: (Option<Trap>, u64)) -> Result<(), String> {
+    match result {
         (Some(Trap::Ecall { .. }), _) if cpu.x[17] == SYS_EXIT => match cpu.x[10] {
             0 => Ok(()),
-            n => Err(format!("failed test case #{n}")),
+            n => Err(format!("{who}: failed test case #{n}")),
         },
-        (Some(trap), n) => Err(format!("trap after {n} steps: {trap:?}\n{cpu:?}")),
-        (None, _) => Err(format!("no exit after {MAX_STEPS} steps\n{cpu:?}")),
+        (Some(trap), n) => Err(format!("{who}: trap after {n} steps: {trap:?}\n{cpu:?}")),
+        (None, _) => Err(format!("{who}: no exit after {MAX_STEPS} steps\n{cpu:?}")),
     }
 }
 

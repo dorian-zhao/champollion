@@ -247,6 +247,7 @@ fn sext(imm: i32) -> u64 {
     imm as i64 as u64
 }
 
+#[inline]
 fn branch_taken(cond: BranchCond, a: u64, b: u64) -> bool {
     match cond {
         BranchCond::Eq => a == b,
@@ -260,6 +261,7 @@ fn branch_taken(cond: BranchCond, a: u64, b: u64) -> bool {
 
 /// Misaligned addresses are allowed: Linux guarantees user-mode misaligned access works
 /// (in hardware or via kernel emulation), and arm64 handles it natively.
+#[inline]
 fn load_value(mem: &impl Memory, addr: u64, width: LoadWidth) -> Result<u64, MemFault> {
     let mut b = [0u8; 8];
     let n = match width {
@@ -283,6 +285,7 @@ fn load_value(mem: &impl Memory, addr: u64, width: LoadWidth) -> Result<u64, Mem
 /// Division never traps (M extension): x / 0 = all ones, x % 0 = x, and the signed overflow
 /// case MIN / -1 = MIN with remainder 0, which is exactly what `wrapping_div`/`wrapping_rem`
 /// give.
+#[inline]
 fn alu(op: AluOp, a: u64, b: u64) -> u64 {
     let sh = (b & 63) as u32;
     match op {
@@ -311,6 +314,7 @@ fn alu(op: AluOp, a: u64, b: u64) -> u64 {
 
 /// 32-bit ALU for the `*w` instructions: uses the low 32 bits of the operands and the low
 /// 5 bits of the shift amount, then sign-extends the 32-bit result.
+#[inline]
 fn alu32(op: AluOp32, a: u64, b: u64) -> u64 {
     let (a, b) = (a as u32, b as u32);
     let sh = b & 31;

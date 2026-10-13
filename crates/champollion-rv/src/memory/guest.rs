@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -137,10 +137,17 @@ impl Maps {
 /// so racing guest threads never cause undefined behavior on the host side. Mapping changes
 /// take the write lock. [`GuestBuf`]s are validated under the lock but used after it is
 /// released, so blocking host I/O never holds it.
+///
+/// Caching: every mapping change bumps [`generation`](Self::generation). Per-thread caches
+/// of mapping state (the [`Tlb`](super::Tlb), decoded blocks) remember the generation they
+/// were filled at and flush when it moves, so they may skip the lock in between. With
+/// threads (M5), `munmap` must additionally wait until every running thread has observed
+/// the new generation before decommitting host pages.
 pub struct GuestMemory {
     base: *mut u8,
     host_page: u64,
     maps: RwLock<Maps>,
+    generation: AtomicU64,
 }
 
 // SAFETY: `base` points to a reservation owned by this object for its whole lifetime, and
@@ -167,12 +174,38 @@ impl GuestMemory {
         // SAFETY: sysconf has no preconditions.
         let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         assert!(host_page.is_power_of_two() && host_page >= GUEST_PAGE_SIZE);
-        Ok(Self { base: base.cast(), host_page, maps: RwLock::default() })
+        Ok(Self {
+            base: base.cast(),
+            host_page,
+            maps: RwLock::default(),
+            generation: AtomicU64::new(0),
+        })
     }
 
     /// Host address of guest address 0. Guest address `g` is at `host_base() + g`.
     pub fn host_base(&self) -> *mut u8 {
         self.base
+    }
+
+    /// Counter bumped by every mapping change; see the type-level docs.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Acquire)
+    }
+
+    /// Force every thread's caches to flush, e.g. for `riscv_flush_icache`.
+    pub fn invalidate_caches(&self) {
+        self.generation.fetch_add(1, Release);
+    }
+
+    /// Permissions of the guest page containing `addr`, or `None` if it is unmapped.
+    pub fn page_prot(&self, addr: u64) -> Option<Prot> {
+        let page = addr & !(GUEST_PAGE_SIZE - 1);
+        let maps = self.maps();
+        match maps.0.range(..=page).next_back() {
+            Some((_, m)) if m.end > page => Some(m.prot),
+            _ => None,
+        }
     }
 
     fn maps(&self) -> RwLockReadGuard<'_, Maps> {
@@ -246,6 +279,7 @@ impl GuestMemory {
         for (start, _) in maps.split_out(r) {
             maps.0.get_mut(&start).unwrap().prot = prot;
         }
+        self.invalidate_caches();
         Ok(())
     }
 
@@ -266,6 +300,7 @@ impl GuestMemory {
     fn insert_locked(&self, maps: &mut Maps, r: Range<u64>, prot: Prot) {
         self.commit_host(r.clone());
         maps.0.insert(r.start, Mapping { end: r.end, prot });
+        self.invalidate_caches();
     }
 
     fn unmap_locked(&self, maps: &mut Maps, r: Range<u64>) {
@@ -273,6 +308,7 @@ impl GuestMemory {
             maps.0.remove(&start);
             self.release(maps, start..m.end);
         }
+        self.invalidate_caches();
     }
 
     /// Host-page-aligned range covering guest range `r`.
@@ -388,7 +424,8 @@ impl GuestMemory {
 ///
 /// # Safety
 /// `src..src + buf.len()` must be valid for reads for the duration of the call.
-unsafe fn atomic_copy_out(src: *mut u8, buf: &mut [u8]) {
+#[inline]
+pub(super) unsafe fn atomic_copy_out(src: *mut u8, buf: &mut [u8]) {
     // SAFETY (all arms): `src` is valid per the caller and aligned where a wider atomic is
     // used.
     unsafe {
@@ -415,7 +452,8 @@ unsafe fn atomic_copy_out(src: *mut u8, buf: &mut [u8]) {
 ///
 /// # Safety
 /// `dst..dst + buf.len()` must be valid for writes for the duration of the call.
-unsafe fn atomic_copy_in(dst: *mut u8, buf: &[u8]) {
+#[inline]
+pub(super) unsafe fn atomic_copy_in(dst: *mut u8, buf: &[u8]) {
     // SAFETY (all arms): as in `atomic_copy_out`.
     unsafe {
         match buf.len() {

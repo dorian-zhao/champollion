@@ -21,7 +21,8 @@
 //! ```
 
 use crate::cpu::CpuState;
-use crate::interpreter::{self, Trap};
+use crate::engine::Engine;
+use crate::interpreter::Trap;
 use crate::loader::{self, LoadError, StackInit, auxv};
 use std::sync::Mutex;
 
@@ -103,6 +104,8 @@ pub struct Thread {
     pub clear_child_tid: u64,
     /// Instructions retired by this thread (excluding the trapping one).
     pub instret: u64,
+    /// This thread's decoded-block cache and TLB.
+    pub engine: Engine,
 }
 
 fn page_up(a: u64) -> Option<u64> {
@@ -155,7 +158,10 @@ impl Process {
         cpu.x[2] = sp;
         let process =
             Self { mem, brk: Mutex::new(Brk { start: brk, cur: brk }), log: SyscallLog::default() };
-        Ok((process, Thread { cpu, tid: id.pid, clear_child_tid: 0, instret: 0 }))
+        Ok((
+            process,
+            Thread { cpu, tid: id.pid, clear_child_tid: 0, instret: 0, engine: Engine::new() },
+        ))
     }
 
     /// Run `thread` until it exits or dies.
@@ -164,7 +170,7 @@ impl Process {
     /// process too; afterwards the process ends when its last thread exits.
     pub fn run(&self, thread: &mut Thread, host: &dyn HostOs) -> Exit {
         loop {
-            let (trap, retired) = interpreter::run(&mut thread.cpu, &self.mem, u64::MAX);
+            let (trap, retired) = thread.engine.run(&mut thread.cpu, &self.mem, u64::MAX);
             thread.instret += retired;
             match (trap, retired) {
                 (Some(Trap::Ecall { .. }), _) => match syscall::dispatch(self, thread, host) {

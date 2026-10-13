@@ -9,3 +9,6 @@ license = "MIT OR Apache-2.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+debug = "line-tables-only"

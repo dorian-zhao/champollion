@@ -4,6 +4,8 @@
 //! - [`decoder`]: raw instruction bits -> [`decoder::Inst`]
 //! - [`interpreter`]: executes `Inst`s against [`cpu::CpuState`] and [`memory::Memory`];
 //!   always kept as the correctness oracle for the JIT
+//! - [`engine`]: the fast interpreter (decoded-block cache + software TLB), checked against
+//!   the oracle
 //! - [`memory`]: the guest address space ([`memory::GuestMemory`])
 //! - [`loader`]: static ELF loading, initial stack / auxv
 //! - [`syscall`]: Linux syscall ABI -> [`syscall::HostOs`]
@@ -12,6 +14,7 @@
 
 pub mod cpu;
 pub mod decoder;
+pub mod engine;
 pub mod host;
 pub mod interpreter;
 pub mod jit;

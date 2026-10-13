@@ -62,6 +62,7 @@ pub mod nr {
     pub const MUNMAP: u64 = 215;
     pub const MMAP: u64 = 222;
     pub const MPROTECT: u64 = 226;
+    pub const RISCV_FLUSH_ICACHE: u64 = 259;
     pub const GETRANDOM: u64 = 278;
 }
 
@@ -341,6 +342,13 @@ fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) ->
             }
             Ok(0)
         }
+        nr::RISCV_FLUSH_ICACHE => {
+            // Make code written by any thread visible to all threads' instruction fetch:
+            // bump the generation so every engine drops its decoded blocks. The range and
+            // flags are only hints.
+            p.mem.invalidate_caches();
+            Ok(0)
+        }
         nr::BRK => Ok(p.brk(a[0])),
         nr::MMAP => p.mmap(host, a[0], a[1], a[2] as u32, a[3] as u32, a[4] as i32, a[5]),
         nr::MUNMAP => p.munmap(a[0], a[1]),
@@ -433,6 +441,7 @@ pub fn name(nr: u64) -> Option<&'static str> {
         nr::MUNMAP => "munmap",
         nr::MMAP => "mmap",
         nr::MPROTECT => "mprotect",
+        nr::RISCV_FLUSH_ICACHE => "riscv_flush_icache",
         nr::GETRANDOM => "getrandom",
         // Not implemented yet, but common enough to name in warnings.
         17 => "getcwd",
