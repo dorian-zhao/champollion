@@ -1,5 +1,5 @@
 //! Runs the riscv-tests suites (built by tests/riscv-tests/build.sh) on the reference
-//! interpreter and on the caching engine, and checks that both agree.
+//! interpreter, the caching engine, and the JIT, and checks that all three agree.
 //!
 //! Each test is a static executable that ends with the Linux `exit` syscall: status 0 on
 //! pass, otherwise the number of the first failing test case.
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use champollion_rv::CpuState;
 use champollion_rv::engine::Engine;
 use champollion_rv::interpreter::{Trap, run};
+use champollion_rv::jit::Jit;
 use champollion_rv::loader;
 use champollion_rv::memory::GuestMemory;
 
@@ -47,6 +48,18 @@ fn run_test(path: &Path) -> Result<(), String> {
         return Err(format!(
             "engine diverged from the interpreter ({} vs {} steps)\nengine:\n{cpu:?}\ninterpreter:\n{oracle:?}",
             engine_result.1, oracle_result.1
+        ));
+    }
+
+    // And on the JIT. It runs until a trap; the tests' only trap is the final exit.
+    let mem = GuestMemory::new().map_err(|e| e.to_string())?;
+    loader::map_elf(&mem, &elf).map_err(|e| format!("map: {e:?}"))?;
+    let mut cpu = CpuState::new(elf.entry);
+    let trap = Jit::new().map_err(|e| e.to_string())?.run(&mut cpu, &mem);
+    check_exit("jit", &cpu, (Some(trap), cpu.instret))?;
+    if cpu != oracle {
+        return Err(format!(
+            "jit diverged from the interpreter\njit:\n{cpu:?}\ninterpreter:\n{oracle:?}"
         ));
     }
     Ok(())

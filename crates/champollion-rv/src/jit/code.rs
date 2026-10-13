@@ -80,7 +80,7 @@ impl CodeBuffer {
     /// Overwrite already generated code at `at` (e.g. to chain a branch).
     pub fn write(&mut self, at: CodeOffset, words: &[u32]) {
         let len = words.len() * 4;
-        assert!(at % 4 == 0 && at + len <= self.size);
+        assert!(at.is_multiple_of(4) && at + len <= self.size);
         // SAFETY: the range is inside our mapping. On macOS, making it writable affects only
         // this thread, which is not executing it while we write.
         unsafe {

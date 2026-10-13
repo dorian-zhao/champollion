@@ -24,6 +24,7 @@
 use crate::cpu::CpuState;
 use crate::engine::Engine;
 use crate::interpreter::Trap;
+use crate::jit::Jit;
 use crate::loader::{self, LoadError, StackInit, auxv};
 use std::sync::Mutex;
 
@@ -113,6 +114,8 @@ pub struct Thread {
     pub clear_child_tid: u64,
     /// This thread's decoded-block cache and TLB.
     pub engine: Engine,
+    /// This thread's JIT, if enabled (the default); otherwise `engine` runs everything.
+    pub jit: Option<Jit>,
 }
 
 fn page_up(a: u64) -> Option<u64> {
@@ -174,7 +177,10 @@ impl Process {
         };
         let brk = Mutex::new(Brk { start: brk, cur: brk });
         let process = Self { mem, brk, log: SyscallLog::default(), exe };
-        Ok((process, Thread { cpu, tid: id.pid, clear_child_tid: 0, engine: Engine::new() }))
+        Ok((
+            process,
+            Thread { cpu, tid: id.pid, clear_child_tid: 0, engine: Engine::new(), jit: None },
+        ))
     }
 
     /// Run `thread` until it exits or dies.
@@ -183,16 +189,22 @@ impl Process {
     /// process too; afterwards the process ends when its last thread exits.
     pub fn run(&self, thread: &mut Thread, host: &dyn HostOs) -> Exit {
         loop {
-            match thread.engine.run(&mut thread.cpu, &self.mem, u64::MAX) {
-                (Some(Trap::Ecall { .. }), _) => match syscall::dispatch(self, thread, host) {
+            let trap = match &mut thread.jit {
+                Some(jit) => jit.run(&mut thread.cpu, &self.mem),
+                None => match thread.engine.run(&mut thread.cpu, &self.mem, u64::MAX) {
+                    (Some(trap), _) => trap,
+                    (None, _) => unreachable!("run() with u64::MAX steps returned"),
+                },
+            };
+            match trap {
+                Trap::Ecall { .. } => match syscall::dispatch(self, thread, host) {
                     Flow::Continue => {}
                     Flow::ExitThread(status) | Flow::ExitGroup(status) => {
                         return Exit::Status(status);
                     }
                     Flow::Killed(sig) => return Exit::Signal(sig),
                 },
-                (Some(trap), _) => return Exit::Trap(trap),
-                (None, _) => unreachable!("run() with u64::MAX steps returned"),
+                trap => return Exit::Trap(trap),
             }
         }
     }

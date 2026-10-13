@@ -29,6 +29,8 @@ sdiv w27, w28, w29
 udiv w0, w1, w2
 csel x3, x4, x5, lt
 cset x6, eq
+csinv x0, x1, xzr, ne
+csinv w2, w3, wzr, ne
 cset x7, lo
 add x8, x9, #4095
 add w10, w11, #1
@@ -36,6 +38,7 @@ add sp, sp, #16
 sub x12, x13, #2048
 sub w14, w15, #7
 cmp x16, #0
+cmp w17, #5
 and x17, x19, #0x3fffffffff
 orr x20, xzr, #0xff00
 eor x21, x22, #0x5555555555555555

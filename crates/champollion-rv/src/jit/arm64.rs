@@ -231,6 +231,13 @@ impl Asm {
     pub fn csel(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Cond) {
         self.r3(0x9a80_0000 | (cond as u32) << 12, rd, rn, rm);
     }
+    /// `csinv rd, rn, rm, cond`: rd = cond ? rn : !rm.
+    pub fn csinv(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Cond) {
+        self.r3(0xda80_0000 | (cond as u32) << 12, rd, rn, rm);
+    }
+    pub fn csinv_w(&mut self, rd: Reg, rn: Reg, rm: Reg, cond: Cond) {
+        self.r3(0x5a80_0000 | (cond as u32) << 12, rd, rn, rm);
+    }
     /// `cset rd, cond`: rd = cond ? 1 : 0.
     pub fn cset(&mut self, rd: Reg, cond: Cond) {
         self.r3(0x9a80_0400 | (cond.invert() as u32) << 12, rd, XZR, XZR);
@@ -257,6 +264,9 @@ impl Asm {
     }
     pub fn cmp_imm(&mut self, rn: Reg, imm: u32) {
         self.imm12(0xf100_0000, XZR, rn, imm);
+    }
+    pub fn cmp_imm_w(&mut self, rn: Reg, imm: u32) {
+        self.imm12(0x7100_0000, XZR, rn, imm);
     }
 
     /// Logical immediate ops; `None` if `imm` is not a bitmask immediate.
@@ -429,6 +439,15 @@ impl Asm {
     /// Offset in instructions from `from` to `to`.
     fn rel(from: usize, to: usize) -> i64 {
         to as i64 - from as i64
+    }
+
+    /// `b` by `delta` instructions from here (targets outside this stream).
+    pub fn b_rel(&mut self, delta: i64) {
+        self.emit(0x1400_0000 | (delta as u32 & 0x03ff_ffff));
+    }
+    /// `b.cond` by `delta` instructions from here.
+    pub fn b_cond_rel(&mut self, cond: Cond, delta: i64) {
+        self.emit(0x5400_0000 | (delta as u32 & 0x7ffff) << 5 | cond as u32);
     }
 
     /// `b` to instruction index `target` (may be patched later with [`Asm::patch`]).

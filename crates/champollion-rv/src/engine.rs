@@ -26,7 +26,7 @@ use crate::memory::{GUEST_PAGE_SIZE, GuestMemory, Memory, Tlb, TlbMemory};
 const MAX_BLOCK: usize = 64;
 
 /// A decoded basic block: instructions with their lengths in bytes (2 or 4).
-type Block = Box<[(Inst, u8)]>;
+pub(crate) type Block = Box<[(Inst, u8)]>;
 
 /// Hasher for guest pcs: they are already well distributed in their low bits (after
 /// dropping bit 0), so one multiply is plenty.
@@ -116,7 +116,7 @@ fn ends_block(inst: Inst) -> bool {
 /// Decode the block starting at `pc`. Fails only if its very first instruction cannot be
 /// fetched or decoded, with the same trap `interpreter::step` would raise; later failures
 /// just end the block early, so the trap is raised when execution actually gets there.
-fn decode_block(mem: &impl Memory, pc: u64) -> Result<Block, Trap> {
+pub(crate) fn decode_block(mem: &impl Memory, pc: u64) -> Result<Block, Trap> {
     let mut insts = Vec::new();
     let mut at = pc;
     loop {

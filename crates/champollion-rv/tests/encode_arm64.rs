@@ -35,6 +35,8 @@ fn matches_assembler() {
     a.udiv_w(0, 1, 2);
     a.csel(3, 4, 5, Cond::Lt);
     a.cset(6, Cond::Eq);
+    a.csinv(0, 1, XZR, Cond::Ne);
+    a.csinv_w(2, 3, XZR, Cond::Ne);
     a.cset(7, Cond::Lo);
     a.add_imm(8, 9, 4095);
     a.add_imm_w(10, 11, 1);
@@ -42,6 +44,7 @@ fn matches_assembler() {
     a.sub_imm(12, 13, 2048);
     a.sub_imm_w(14, 15, 7);
     a.cmp_imm(16, 0);
+    a.cmp_imm_w(17, 5);
     a.and_imm(17, 19, 0x3f_ffff_ffff).unwrap();
     a.orr_imm(20, XZR, 0xff00).unwrap();
     a.eor_imm(21, 22, 0x5555_5555_5555_5555).unwrap();
