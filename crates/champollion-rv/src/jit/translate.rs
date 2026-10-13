@@ -69,6 +69,9 @@ pub mod exit {
     pub const INTERPRET: u64 = 2;
     /// `fence.i` retired; drop all translations, then continue at `pc`.
     pub const FENCE_I: u64 = 3;
+    /// A load or store at `pc` faulted (set by the fault handler, not by generated code).
+    pub const FAULT_LOAD: u64 = 4;
+    pub const FAULT_STORE: u64 = 5;
 }
 
 pub fn x_offset(r: u8) -> u32 {
@@ -92,6 +95,8 @@ pub struct ExitSite {
 pub struct Translation {
     pub code: Vec<u32>,
     pub exits: Vec<ExitSite>,
+    /// Loads and stores that may fault: instruction index and what to report.
+    pub sites: Vec<(usize, super::fault::Site)>,
 }
 
 enum Tail {
@@ -107,6 +112,10 @@ struct Tx {
     tails: Vec<(usize, Tail)>,
     /// Indices of the tails' branches to the shared exit stub, fixed up by `translate`.
     stub_branches: Vec<usize>,
+    /// Memory accesses: (instruction index, guest pc, instructions retired before, store).
+    accesses: Vec<(usize, u64, u32, bool)>,
+    /// Instructions of this block retired so far (while translating).
+    retired: u32,
 }
 
 fn sext(imm: i32) -> u64 {
@@ -196,6 +205,7 @@ impl Tx {
                 };
                 // A load to x0 still accesses memory (and may fault).
                 let d = self.dst(rd);
+                self.accesses.push((self.a.pos(), pc, self.retired, false));
                 self.a.ldr_reg(mem, d, MEMBASE, ADDR);
                 self.commit(rd, d);
             }
@@ -208,6 +218,7 @@ impl Tx {
                     StoreWidth::W => Mem::U32,
                     StoreWidth::D => Mem::U64,
                 };
+                self.accesses.push((self.a.pos(), pc, self.retired, true));
                 self.a.str_reg(mem, v, MEMBASE, ADDR);
             }
             // Conservatively a full barrier; mapping pred/succ to dmb variants comes later.
@@ -436,7 +447,13 @@ pub fn translate(
     block_word: i64,
     stub_word: i64,
 ) -> Option<Translation> {
-    let mut tx = Tx { a: Asm::new(), tails: Vec::new(), stub_branches: Vec::new() };
+    let mut tx = Tx {
+        a: Asm::new(),
+        tails: Vec::new(),
+        stub_branches: Vec::new(),
+        accesses: Vec::new(),
+        retired: 0,
+    };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
     let instret_at = tx.a.pos();
@@ -522,6 +539,7 @@ pub fn translate(
                 retired += 1;
             }
         }
+        tx.retired = retired;
         at = next;
     }
     if !ended {
@@ -540,7 +558,14 @@ pub fn translate(
         tx.a.code[b] = super::arm64::encode_branch_to(tx.a.code[b], delta);
     }
     let exits = exits.into_iter().map(|(branch, target)| ExitSite { branch, target }).collect();
-    Some(Translation { code: tx.a.code, exits })
+    let sites = tx
+        .accesses
+        .iter()
+        .map(|&(index, guest_pc, before, store)| {
+            (index, super::fault::Site { guest_pc, instret_undo: retired - before, store })
+        })
+        .collect();
+    Some(Translation { code: tx.a.code, exits, sites })
 }
 
 /// Code that enters translated code: `enter(cpu, membase, code) -> exit code`, a C-ABI

@@ -3,6 +3,7 @@
 //! - [`arm64`]: instruction encoder, checked against an assembler.
 //! - [`code`]: executable memory (MAP_JIT and W^X on macOS).
 //! - [`translate`]: guest block -> arm64, plus the enter/exit trampoline.
+//! - [`fault`]: host faults in generated loads/stores -> precise guest faults.
 //!
 //! [`Jit::run`] is the dispatcher: it looks up (or translates) the block at the guest pc,
 //! enters it, and acts on the exit code. Instructions the translator does not handle yet
@@ -11,6 +12,7 @@
 
 pub mod arm64;
 pub mod code;
+pub mod fault;
 pub mod translate;
 
 use std::collections::HashMap;
@@ -19,7 +21,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::cpu::CpuState;
 use crate::engine::decode_block;
 use crate::interpreter::{self, Trap};
-use crate::memory::GuestMemory;
+use crate::memory::{GuestMemory, MemFault};
 use code::CodeBuffer;
 use translate::exit;
 
@@ -52,6 +54,7 @@ pub struct Jit {
     /// Guest pc -> byte offset of its translation.
     blocks: HashMap<u64, usize, BuildHasherDefault<PcHasher>>,
     generation: u64,
+    faults: fault::Table,
 }
 
 impl Jit {
@@ -59,7 +62,16 @@ impl Jit {
         let code = CodeBuffer::new(CODE_SIZE)?;
         // SAFETY: placeholder, replaced by `reset` before any use.
         let enter: EnterFn = unsafe { std::mem::transmute::<*const u8, EnterFn>(code.base()) };
-        let mut jit = Jit { code, enter, stub_word: 0, blocks: HashMap::default(), generation: 0 };
+        fault::install();
+        let faults = fault::Table {
+            code_base: code.base() as usize,
+            code_len: CODE_SIZE,
+            stub: 0,
+            sites: HashMap::new(),
+            fault_addr: std::cell::Cell::new(0),
+        };
+        let mut jit =
+            Jit { code, enter, stub_word: 0, blocks: HashMap::default(), generation: 0, faults };
         jit.reset();
         Ok(jit)
     }
@@ -73,6 +85,8 @@ impl Jit {
         // SAFETY: the trampoline is a C-ABI function with this signature.
         self.enter = unsafe { std::mem::transmute::<*const u8, EnterFn>(self.code.ptr(at)) };
         self.stub_word = at / 4 + stub;
+        self.faults.sites.clear();
+        self.faults.stub = self.code.ptr(self.stub_word * 4) as usize;
     }
 
     /// Byte offset of the translation for `pc`, translating it on first use. `Ok(None)`
@@ -90,6 +104,9 @@ impl Jit {
             match self.code.append(&t.code) {
                 Some(at) => {
                     self.blocks.insert(pc, at);
+                    for (index, site) in t.sites {
+                        self.faults.sites.insert(at + 4 * index, site);
+                    }
                     return Ok(Some(at));
                 }
                 None if attempt == 0 => self.reset(), // buffer full: start over
@@ -120,7 +137,10 @@ impl Jit {
             // SAFETY: `at` holds a translation produced for this guest memory layout; it
             // only touches `cpu`, guest memory below `host_base() + GUEST_SIZE` (addresses
             // are masked), and the host stack, and returns through the exit stub.
-            let code = unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at)) };
+            let code = {
+                let _active = fault::Active::enter(&self.faults);
+                unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at)) }
+            };
             match code {
                 exit::NEXT => {}
                 exit::ECALL => return Trap::Ecall { pc: cpu.pc },
@@ -130,8 +150,95 @@ impl Jit {
                     }
                 }
                 exit::FENCE_I => self.reset(),
+                exit::FAULT_LOAD | exit::FAULT_STORE => {
+                    let fault = MemFault { addr: self.faults.fault_addr.get() };
+                    let pc = cpu.pc;
+                    return if code == exit::FAULT_LOAD {
+                        Trap::LoadFault { pc, fault }
+                    } else {
+                        Trap::StoreFault { pc, fault }
+                    };
+                }
                 other => panic!("bad exit code {other}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::enc::*;
+    use crate::memory::Prot;
+
+    const CODE: u64 = 0x10000;
+    const DATA: u64 = 0x20000;
+
+    fn setup(prog: &[u32]) -> GuestMemory {
+        let mem = GuestMemory::new().unwrap();
+        mem.map(CODE, 0x1000, Prot::READ | Prot::EXEC).unwrap();
+        mem.map(DATA, 0x1000, Prot::RW).unwrap();
+        let bytes: Vec<u8> = prog.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write_privileged(CODE, &bytes).unwrap();
+        mem
+    }
+
+    /// Run `prog` on the interpreter and on the JIT until a trap; both must agree exactly.
+    fn same_as_interpreter(prog: &[u32]) -> (Trap, CpuState) {
+        let mem = setup(prog);
+        let mut oracle = CpuState::new(CODE);
+        oracle.x[11] = DATA;
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem) {
+                break t;
+            }
+        };
+        let mem = setup(prog);
+        let mut cpu = CpuState::new(CODE);
+        cpu.x[11] = DATA;
+        let got = Jit::new().unwrap().run(&mut cpu, &mem);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        (got, cpu)
+    }
+
+    #[test]
+    fn faults_are_precise() {
+        // Pinned (a0, s0) and unpinned (t0) registers written before the fault must be
+        // visible; the instruction after the fault must not run; instret counts 3.
+        let (trap, cpu) = same_as_interpreter(&[
+            addi(10, 0, 5),       // a0 = 5
+            addi(5, 0, 7),        // t0 = 7 (unpinned)
+            addi(8, 0, 9),        // s0 = 9
+            load(3, 12, 0, 0x40), // ld a2, 0x40(zero): unmapped page 0
+            addi(10, 0, 99),      // must not run
+            ECALL,
+        ]);
+        assert!(matches!(trap, Trap::LoadFault { pc, .. } if pc == CODE + 12));
+        assert_eq!((cpu.x[10], cpu.x[5], cpu.x[8], cpu.instret), (5, 7, 9, 3));
+
+        // A store fault, in a later block reached through a jump.
+        same_as_interpreter(&[
+            store(3, 11, 10, 0), // sd a0, 0(a1): fine
+            jal(0, 8),           // -> +8
+            0,                   // (skipped)
+            addi(5, 0, 1),
+            store(2, 0, 5, 0x123), // sw t0, 0x123(zero): faults
+            ECALL,
+        ]);
+    }
+
+    #[test]
+    fn untranslated_instructions_fall_back_to_the_interpreter() {
+        // amoadd (not translated yet) between translated instructions.
+        let (trap, cpu) = same_as_interpreter(&[
+            addi(12, 0, 3),
+            amo(0, 0b011, 13, 11, 12), // amoadd.d a3, a2, (a1)
+            amo(0, 0b011, 13, 11, 12),
+            load(3, 14, 11, 0), // ld a4, 0(a1)
+            ECALL,
+        ]);
+        assert!(matches!(trap, Trap::Ecall { .. }));
+        assert_eq!((cpu.x[13], cpu.x[14]), (3, 6));
     }
 }

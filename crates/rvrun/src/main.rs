@@ -9,7 +9,7 @@
 //! Environment:
 //! - `RVRUN_STRACE=1` traces every syscall to stderr.
 //! - `RVRUN_STATS=1` prints instructions retired and execution speed on exit.
-//! - `RVRUN_JIT=1` runs on the JIT (experimental until guest faults are handled).
+//! - `RVRUN_JIT=0` runs on the caching interpreter instead of the JIT.
 
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
@@ -59,7 +59,7 @@ fn main() -> ExitCode {
             }
         };
     proc.log.strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
-    if std::env::var_os("RVRUN_JIT").is_some_and(|v| v != "0") {
+    if std::env::var_os("RVRUN_JIT").is_none_or(|v| v != "0") {
         match champollion_rv::jit::Jit::new() {
             Ok(jit) => main_thread.jit = Some(jit),
             Err(e) => eprintln!("rvrun: JIT unavailable ({e}); interpreting"),
