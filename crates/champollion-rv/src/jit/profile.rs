@@ -71,7 +71,9 @@ impl Profiler {
     pub fn start(code_base: usize, code_size: usize) -> Profiler {
         let samples = Arc::new(Samples {
             code_base,
-            per_insn: (0..code_size / 4).map(|_| AtomicU32::new(0)).collect(),
+            // Zeroed allocation: pages are only touched where samples land.
+            // SAFETY: all-zero bytes are a valid AtomicU32.
+            per_insn: unsafe { Box::new_zeroed_slice(code_size / 4).assume_init() },
             outside: AtomicU64::new(0),
             outside_pcs: (0..OUTSIDE_PCS).map(|_| AtomicUsize::new(0)).collect(),
             stop: AtomicBool::new(false),
