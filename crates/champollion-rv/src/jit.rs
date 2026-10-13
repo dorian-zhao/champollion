@@ -22,7 +22,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::cpu::CpuState;
 use crate::engine::decode_block;
 use crate::interpreter::{self, Trap};
-use crate::memory::{GuestMemory, MemFault};
+use crate::memory::{GuestMemory, MemFault, Tlb, TlbMemory};
 use code::CodeBuffer;
 use translate::exit;
 
@@ -56,6 +56,9 @@ pub struct Jit {
     blocks: HashMap<u64, usize, BuildHasherDefault<PcHasher>>,
     /// `GuestMemory::code_generation` the translations are valid for.
     generation: u64,
+    /// Instruction fetch for translation, valid for `GuestMemory::generation` `tlb_generation`.
+    tlb: Tlb,
+    tlb_generation: u64,
     faults: fault::Table,
     /// Exits waiting for their target to be translated: target pc -> byte offsets of the
     /// exits' `b` instructions, patched to jump straight to the target when it appears.
@@ -139,6 +142,8 @@ impl Jit {
             stub_word: 0,
             blocks: HashMap::default(),
             generation: 0,
+            tlb: Tlb::default(),
+            tlb_generation: u64::MAX,
             faults,
             unchained: HashMap::default(),
             chaining: true,
@@ -175,7 +180,14 @@ impl Jit {
         if let Some(&at) = self.blocks.get(&pc) {
             return Ok(Some(at));
         }
-        let block = decode_block(mem, pc, false)?;
+        // Fetch through a TLB: a lookup per instruction in the mapping table showed up as
+        // 11% of a short program's run time.
+        let generation = mem.generation();
+        if generation != self.tlb_generation {
+            self.tlb.flush();
+            self.tlb_generation = generation;
+        }
+        let block = decode_block(&TlbMemory { mem, tlb: &self.tlb }, pc, false)?;
         for attempt in 0..2 {
             let word = (self.code.used() / 4) as i64;
             let cache = self.jump_cache.as_ptr() as u64;
