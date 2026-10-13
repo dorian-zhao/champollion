@@ -892,6 +892,8 @@ impl Tx {
             AluOp32::Srl => self.a.lsrv_w(d, a, b),
             AluOp32::Sra => self.a.asrv_w(d, a, b),
             AluOp32::Mul => self.a.mul_w(d, a, b),
+            // `cmp` below cannot test x0: register 31 in an immediate compare is wsp.
+            AluOp32::Div | AluOp32::Divu if rs2 == 0 => self.a.mov_imm(d, u64::MAX),
             AluOp32::Div | AluOp32::Divu => {
                 if op == AluOp32::Div {
                     self.a.sdiv_w(ADDR, a, b);

@@ -392,6 +392,20 @@ mod tests {
     }
 
     #[test]
+    fn division_by_x0_matches_the_interpreter() {
+        // Found by the fuzzer: `divuw rd, rs, zero` returned 0 instead of all ones.
+        let (_, cpu) = same_as_interpreter(&[
+            addi(10, 0, 7),
+            op_32(4, 1, 12, 10, 0), // divw a2, a0, zero
+            op_32(5, 1, 13, 10, 0), // divuw a3, a0, zero
+            op_32(6, 1, 14, 10, 0), // remw a4, a0, zero
+            op(4, 1, 15, 10, 0),    // div a5, a0, zero
+            ECALL,
+        ]);
+        assert_eq!((cpu.x[12], cpu.x[13], cpu.x[14], cpu.x[15]), (u64::MAX, u64::MAX, 7, u64::MAX));
+    }
+
+    #[test]
     fn side_exits_match_the_interpreter() {
         // One block with two mid-block branches; the loop takes each both ways, so side
         // exits (with their instret correction) and fall-through paths both run.
