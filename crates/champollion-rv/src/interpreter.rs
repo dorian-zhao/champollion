@@ -31,9 +31,9 @@ pub enum Trap {
 /// Fetch, decode and execute one instruction.
 pub fn step(cpu: &mut CpuState, mem: &mut impl Memory) -> Result<(), Trap> {
     let pc = cpu.pc;
-    let lo = mem.read_u16(pc).map_err(Trap::FetchFault)?;
+    let lo = mem.fetch_u16(pc).map_err(Trap::FetchFault)?;
     let len = decoder::inst_len(lo);
-    let word = if len == 4 { mem.read_u32(pc).map_err(Trap::FetchFault)? } else { lo as u32 };
+    let word = if len == 4 { mem.fetch_u32(pc).map_err(Trap::FetchFault)? } else { lo as u32 };
     let inst = decoder::decode(word).map_err(|err| Trap::IllegalInstruction { pc, err })?;
     execute(cpu, mem, inst, len)
 }
