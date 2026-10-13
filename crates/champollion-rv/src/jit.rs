@@ -55,6 +55,11 @@ pub struct Jit {
     blocks: HashMap<u64, usize, BuildHasherDefault<PcHasher>>,
     generation: u64,
     faults: fault::Table,
+    /// Exits waiting for their target to be translated: target pc -> byte offsets of the
+    /// exits' `b` instructions, patched to jump straight to the target when it appears.
+    unchained: HashMap<u64, Vec<usize>, BuildHasherDefault<PcHasher>>,
+    /// Set to disable chaining (every block returns to the dispatcher), for comparison.
+    pub chaining: bool,
 }
 
 impl Jit {
@@ -70,8 +75,16 @@ impl Jit {
             sites: HashMap::new(),
             fault_addr: std::cell::Cell::new(0),
         };
-        let mut jit =
-            Jit { code, enter, stub_word: 0, blocks: HashMap::default(), generation: 0, faults };
+        let mut jit = Jit {
+            code,
+            enter,
+            stub_word: 0,
+            blocks: HashMap::default(),
+            generation: 0,
+            faults,
+            unchained: HashMap::default(),
+            chaining: true,
+        };
         jit.reset();
         Ok(jit)
     }
@@ -80,6 +93,7 @@ impl Jit {
     fn reset(&mut self) {
         self.code.reset();
         self.blocks.clear();
+        self.unchained.clear();
         let (words, stub) = translate::trampoline();
         let at = self.code.append(&words).expect("trampoline fits");
         // SAFETY: the trampoline is a C-ABI function with this signature.
@@ -107,6 +121,9 @@ impl Jit {
                     for (index, site) in t.sites {
                         self.faults.sites.insert(at + 4 * index, site);
                     }
+                    if self.chaining {
+                        self.chain(pc, at, &t.exits);
+                    }
                     return Ok(Some(at));
                 }
                 None if attempt == 0 => self.reset(), // buffer full: start over
@@ -114,6 +131,29 @@ impl Jit {
             }
         }
         unreachable!()
+    }
+
+    /// Link the new block at `at` (guest `pc`) into the graph: exits already waiting for
+    /// `pc` now jump straight to it, and its own static exits jump straight to their
+    /// targets if those are translated (or wait for them).
+    fn chain(&mut self, pc: u64, at: usize, exits: &[translate::ExitSite]) {
+        for branch in self.unchained.remove(&pc).unwrap_or_default() {
+            self.patch_branch(branch, at);
+        }
+        for exit in exits {
+            let Some(target) = exit.target else { continue };
+            let branch = at + 4 * exit.branch;
+            match self.blocks.get(&target) {
+                Some(&dest) => self.patch_branch(branch, dest),
+                None => self.unchained.entry(target).or_default().push(branch),
+            }
+        }
+    }
+
+    /// Repoint the `b` at byte offset `branch` to byte offset `dest`.
+    fn patch_branch(&mut self, branch: usize, dest: usize) {
+        let delta = (dest as i64 - branch as i64) / 4;
+        self.code.write(branch, &[arm64::encode_branch_to(0x1400_0000, delta)]);
     }
 
     /// Run until a trap (including `ecall`), like [`interpreter::run`] with no step limit.
