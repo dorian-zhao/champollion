@@ -7,7 +7,7 @@
 use std::ffi::CStr;
 
 use crate::memory::GuestBuf;
-use crate::syscall::{AT_FDCWD, Flock, HostOs, Identity, Rusage, Stat, SysResult, errno};
+use crate::syscall::{AT_FDCWD, Flock, HostOs, Identity, PollFd, Rusage, Stat, SysResult, errno};
 
 pub struct DarwinHost;
 
@@ -85,6 +85,31 @@ fn apply_fd_flags(fd: i32, linux_flags: i32) -> SysResult {
         }
     }
     Ok(0)
+}
+
+/// Linux `POLL*` bits -> Darwin and back. Bits 0x1–0x80 agree; Linux POLLWRNORM (0x100)
+/// and POLLWRBAND (0x200) are Darwin 0x4 and 0x100.
+fn darwin_poll_events(linux: i16) -> i16 {
+    let mut d = linux & 0xff;
+    if linux & 0x100 != 0 {
+        d |= libc::POLLWRNORM;
+    }
+    if linux & 0x200 != 0 {
+        d |= libc::POLLWRBAND;
+    }
+    d
+}
+
+fn linux_poll_events(darwin: i16, requested: i16) -> i16 {
+    let mut l = darwin & 0xff & !libc::POLLWRBAND;
+    // Darwin's POLLWRNORM is POLLOUT; report it only if the guest asked for it.
+    if darwin & libc::POLLOUT != 0 && requested & 0x100 != 0 {
+        l |= 0x100;
+    }
+    if darwin & libc::POLLWRBAND != 0 {
+        l |= 0x200;
+    }
+    l
 }
 
 fn timeval(tv: libc::timeval) -> (i64, i64) {
@@ -555,6 +580,26 @@ impl HostOs for DarwinHost {
         check(unsafe { libc::getrlimit(r, &mut rl) } as isize)?;
         let lim = |v: libc::rlim_t| if v == libc::RLIM_INFINITY { u64::MAX } else { v };
         Ok((lim(rl.rlim_cur), lim(rl.rlim_max)))
+    }
+
+    fn poll(&self, fds: &mut [PollFd], timeout: Option<(i64, i64)>) -> SysResult {
+        let mut host: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|f| libc::pollfd { fd: f.fd, events: darwin_poll_events(f.events), revents: 0 })
+            .collect();
+        // Round up to whole milliseconds so short timeouts do not become busy polls.
+        let ms = timeout.map_or(-1, |(s, ns)| {
+            (s.saturating_mul(1000).saturating_add((ns + 999_999) / 1_000_000)).min(i32::MAX as i64)
+                as i32
+        });
+        // SAFETY: `host` is a valid array of `host.len()` pollfds.
+        let n = check(
+            unsafe { libc::poll(host.as_mut_ptr(), host.len() as libc::nfds_t, ms) } as isize
+        )?;
+        for (f, h) in fds.iter_mut().zip(&host) {
+            f.revents = linux_poll_events(h.revents, f.events);
+        }
+        Ok(n)
     }
 
     fn kill(&self, pid: i32, sig: i32) -> SysResult {

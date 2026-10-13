@@ -95,6 +95,7 @@ syscalls! {
     KILL = 129 "kill",
     TKILL = 130 "tkill",
     TGKILL = 131 "tgkill",
+    SIGALTSTACK = 132 "sigaltstack",
     RT_SIGACTION = 134 "rt_sigaction",
     RT_SIGPROCMASK = 135 "rt_sigprocmask",
     UNAME = 160 "uname",
@@ -161,6 +162,14 @@ pub struct Stat {
     pub atime: (i64, i64),
     pub mtime: (i64, i64),
     pub ctime: (i64, i64),
+}
+
+/// `struct pollfd`, identical on Linux and Darwin; event bits are Linux values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
 }
 
 /// A POSIX record lock with Linux `l_type` values (`F_RDLCK` 0, `F_WRLCK` 1, `F_UNLCK` 2).
@@ -330,6 +339,11 @@ pub trait HostOs: Sync {
     }
     /// `(soft, hard)` limit for a Linux `RLIMIT_*` resource; `u64::MAX` is unlimited.
     fn getrlimit(&self, resource: u32) -> Result<(u64, u64), i32> {
+        Err(errno::ENOSYS)
+    }
+    /// Wait for events on `fds` (`(fd, events, revents)` with Linux `POLL*` bits) for at
+    /// most `timeout` (`None` = forever). Returns the number of ready descriptors.
+    fn poll(&self, fds: &mut [PollFd], timeout: Option<(i64, i64)>) -> SysResult {
         Err(errno::ENOSYS)
     }
     /// Send a Linux signal number to another host process.
@@ -613,6 +627,18 @@ fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) ->
             }
             Ok(0)
         }
+        nr::SIGALTSTACK => {
+            // No signal is ever delivered before M5, so accept the new stack and report the
+            // old one as disabled (stack_t: ss_sp, ss_flags = SS_DISABLE, ss_size).
+            if a[1] != 0 {
+                const SS_DISABLE: u64 = 2;
+                let mut old = 0u64.to_le_bytes().to_vec();
+                old.extend(SS_DISABLE.to_le_bytes());
+                old.extend(0u64.to_le_bytes());
+                put(p, a[1], &old)?;
+            }
+            Ok(0)
+        }
         nr::RT_SIGPROCMASK => {
             if a[2] != 0 {
                 put(p, a[2], &[0; 8])?;
@@ -692,6 +718,31 @@ fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) ->
             };
             host.nanosleep(duration)?;
             Ok(0)
+        }
+        nr::PPOLL => {
+            // The signal mask argument is ignored until signals arrive (M5).
+            const MAX_FDS: u64 = 1 << 16;
+            if a[1] > MAX_FDS {
+                return Err(errno::EINVAL);
+            }
+            let mut raw = vec![0u8; a[1] as usize * 8];
+            p.mem.read(a[0], &mut raw).map_err(efault)?;
+            let mut fds: Vec<PollFd> = raw
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| PollFd {
+                    fd: i32::from_le_bytes(c[..4].try_into().unwrap()),
+                    events: i16::from_le_bytes([c[4], c[5]]),
+                    revents: 0,
+                })
+                .collect();
+            let timeout = if a[2] == 0 { None } else { Some(read_timespec(p, a[2])?) };
+            let n = host.poll(&mut fds, timeout)?;
+            for (i, f) in fds.iter().enumerate() {
+                put(p, a[0] + i as u64 * 8 + 6, &f.revents.to_le_bytes())?;
+            }
+            Ok(n)
         }
         nr::SCHED_YIELD => {
             std::thread::yield_now();
