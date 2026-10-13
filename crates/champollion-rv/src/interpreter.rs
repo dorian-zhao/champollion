@@ -1,34 +1,27 @@
 //! Reference interpreter. Slow on purpose: it is the oracle the JIT is diffed against.
 
 use crate::cpu::CpuState;
-use crate::decoder::{self, AluOp, AluOp32, BranchCond, DecodeError, Inst, LoadWidth, StoreWidth};
+use crate::decoder::{
+    self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, DecodeError, Inst, LoadWidth, StoreWidth,
+};
 use crate::memory::{MemFault, Memory};
 
 /// Why execution stopped. On every trap, `cpu.pc` still points at the trapping instruction
 /// and no architectural state has been modified, like `sepc` on real hardware.
+///
+/// - `Ecall`: system call request. The handler reads `a7`/`a0..a5`, writes `a0`, and
+///   resumes at `pc + 4` (`ecall` has no compressed form).
+/// - `MisalignedAtomic`: `lr`/`sc`/AMO on an address not aligned to its width; Linux
+///   delivers SIGBUS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trap {
     FetchFault(MemFault),
-    LoadFault {
-        pc: u64,
-        fault: MemFault,
-    },
-    StoreFault {
-        pc: u64,
-        fault: MemFault,
-    },
-    IllegalInstruction {
-        pc: u64,
-        err: DecodeError,
-    },
-    /// System call request. The handler reads `a7`/`a0..a5`, writes `a0`, and resumes at
-    /// `pc + 4` (`ecall` has no compressed form).
-    Ecall {
-        pc: u64,
-    },
-    Ebreak {
-        pc: u64,
-    },
+    LoadFault { pc: u64, fault: MemFault },
+    StoreFault { pc: u64, fault: MemFault },
+    IllegalInstruction { pc: u64, err: DecodeError },
+    Ecall { pc: u64 },
+    Ebreak { pc: u64 },
+    MisalignedAtomic { pc: u64, addr: u64 },
 }
 
 // With the C extension, IALIGN is 16 and every control-transfer target is even by
@@ -106,9 +99,89 @@ pub fn execute(
         Inst::Fence { .. } => {}
         Inst::Ecall => return Err(Trap::Ecall { pc }),
         Inst::Ebreak => return Err(Trap::Ebreak { pc }),
+        // Single hart: every access is already atomic and ordered, so aq/rl need no
+        // action, and a reservation can only be broken by another `sc`.
+        Inst::Lr { width, rd, rs1, .. } => {
+            let addr = atomic_addr(cpu, rs1, width)?;
+            let v = load_value(mem, addr, amo_load_width(width))
+                .map_err(|fault| Trap::LoadFault { pc, fault })?;
+            cpu.set_x(rd, v);
+            cpu.reservation = Some(addr);
+        }
+        Inst::Sc { width, rd, rs1, rs2, .. } => {
+            let addr = atomic_addr(cpu, rs1, width)?;
+            if cpu.reservation == Some(addr) {
+                let bytes = cpu.x(rs2).to_le_bytes();
+                mem.write(addr, &bytes[..amo_bytes(width)])
+                    .map_err(|fault| Trap::StoreFault { pc, fault })?;
+                cpu.set_x(rd, 0);
+            } else {
+                cpu.set_x(rd, 1);
+            }
+            cpu.reservation = None;
+        }
+        Inst::Amo { op, width, rd, rs1, rs2, .. } => {
+            let addr = atomic_addr(cpu, rs1, width)?;
+            // AMOs need write permission even though they also read, so a failed read is
+            // reported as a store fault too. rd is written last so faults leave it intact.
+            let old = load_value(mem, addr, amo_load_width(width))
+                .map_err(|fault| Trap::StoreFault { pc, fault })?;
+            let new = amo_op(op, width, old, cpu.x(rs2));
+            mem.write(addr, &new.to_le_bytes()[..amo_bytes(width)])
+                .map_err(|fault| Trap::StoreFault { pc, fault })?;
+            cpu.set_x(rd, old);
+        }
     }
     cpu.pc = next;
     Ok(())
+}
+
+/// Effective address of an atomic, which must be naturally aligned.
+fn atomic_addr(cpu: &CpuState, rs1: u8, width: AmoWidth) -> Result<u64, Trap> {
+    let addr = cpu.x(rs1);
+    if !addr.is_multiple_of(amo_bytes(width) as u64) {
+        return Err(Trap::MisalignedAtomic { pc: cpu.pc, addr });
+    }
+    Ok(addr)
+}
+
+fn amo_bytes(width: AmoWidth) -> usize {
+    match width {
+        AmoWidth::W => 4,
+        AmoWidth::D => 8,
+    }
+}
+
+/// Word atomics sign-extend the loaded value into `rd`.
+fn amo_load_width(width: AmoWidth) -> LoadWidth {
+    match width {
+        AmoWidth::W => LoadWidth::W,
+        AmoWidth::D => LoadWidth::D,
+    }
+}
+
+/// New memory value for an AMO. For word ops only the low 32 bits are stored, so min/max
+/// must compare the 32-bit values (signed or unsigned), not the sign-extended ones.
+fn amo_op(op: AmoOp, width: AmoWidth, old: u64, src: u64) -> u64 {
+    let (a, b) = match width {
+        AmoWidth::W => (old as i32 as i64, src as i32 as i64),
+        AmoWidth::D => (old as i64, src as i64),
+    };
+    let (ua, ub) = match width {
+        AmoWidth::W => (old as u32 as u64, src as u32 as u64),
+        AmoWidth::D => (old, src),
+    };
+    match op {
+        AmoOp::Swap => src,
+        AmoOp::Add => old.wrapping_add(src),
+        AmoOp::Xor => old ^ src,
+        AmoOp::And => old & src,
+        AmoOp::Or => old | src,
+        AmoOp::Min => a.min(b) as u64,
+        AmoOp::Max => a.max(b) as u64,
+        AmoOp::Minu => ua.min(ub),
+        AmoOp::Maxu => ua.max(ub),
+    }
 }
 
 #[inline]
@@ -375,6 +448,102 @@ mod tests {
         ];
         for (i, &(w, a, b, want)) in cases.iter().enumerate() {
             assert_eq!(one(w, a, b), want, "case {i}: {:?}", decoder::decode(w));
+        }
+    }
+
+    #[test]
+    fn lr_sc_reservation() {
+        let (lr_d, sc_d) = (amo(0b00010, 0b011, 10, 11, 0), amo(0b00011, 0b011, 13, 11, 12));
+        let regs = [(11, DATA), (12, 0x55)];
+
+        // lr; sc succeeds (rd = 0) and stores.
+        let (cpu, mem) = exec(&[lr_d, sc_d], &regs);
+        assert_eq!(cpu.x[13], 0);
+        assert_eq!(mem.bytes[0x800], 0x55);
+        assert_eq!(cpu.reservation, None);
+
+        // sc without lr fails (rd != 0) and does not store.
+        let (cpu, mem) = exec(&[sc_d], &regs);
+        assert_ne!(cpu.x[13], 0);
+        assert_eq!(mem.bytes[0x800], 0);
+
+        // A second sc fails: the first one consumed the reservation.
+        let (cpu, mem) = exec(&[lr_d, sc_d, addi(12, 0, 0x66), sc_d], &regs);
+        assert_ne!(cpu.x[13], 0);
+        assert_eq!(mem.bytes[0x800], 0x55);
+
+        // sc to a different address than the reservation fails.
+        let (cpu, _) = exec(&[lr_d, addi(11, 11, 8), sc_d], &regs);
+        assert_ne!(cpu.x[13], 0);
+
+        // lr.w sign-extends.
+        let (mut cpu, mut mem) = setup(&[amo(0b00010, 0b010, 10, 11, 0)]);
+        mem.write(DATA, &0x8000_0000u32.to_le_bytes()).unwrap();
+        cpu.set_x(11, DATA);
+        step(&mut cpu, &mut mem).unwrap();
+        assert_eq!(cpu.x[10], 0xffff_ffff_8000_0000);
+        assert_eq!(cpu.reservation, Some(DATA));
+    }
+
+    #[test]
+    fn amo_ops() {
+        // (funct5, funct3, memory before, rs2, memory after); rd always gets the old value.
+        let w = 0b010;
+        let d = 0b011;
+        let cases = [
+            (0b00001, d, 5, 9, 9),                                 // swap
+            (0b00000, d, NEG1, 2, 1),                              // add wraps
+            (0b00000, w, 0x7fff_ffff, 1, 0x8000_0000),             // add.w: only low 32 bits stored
+            (0b00100, d, 0b1100, 0b1010, 0b0110),                  // xor
+            (0b01100, d, 0b1100, 0b1010, 0b1000),                  // and
+            (0b01000, d, 0b1100, 0b1010, 0b1110),                  // or
+            (0b10000, d, NEG1, 1, NEG1),                           // min signed
+            (0b10100, d, NEG1, 1, 1),                              // max signed
+            (0b11000, d, NEG1, 1, 1),                              // minu
+            (0b11100, d, NEG1, 1, NEG1),                           // maxu
+            (0b10000, w, 0x8000_0000, 1, 0x8000_0000),             // min.w: 0x80000000 is negative
+            (0b11100, w, 0x8000_0000, 0x1_0000_0001, 0x8000_0000), // maxu.w ignores upper rs2 bits
+        ];
+        for (i, &(f5, f3, before, src, after)) in cases.iter().enumerate() {
+            let (mut cpu, mut mem) = setup(&[amo(f5, f3, 10, 11, 12)]);
+            mem.write(DATA, &before.to_le_bytes()).unwrap();
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, src);
+            step(&mut cpu, &mut mem).unwrap();
+            let mut got = [0; 8];
+            mem.read(DATA, &mut got).unwrap();
+            let mask = if f3 == w { 0xffff_ffff } else { NEG1 };
+            let old = if f3 == w { before as u32 as i32 as u64 } else { before };
+            assert_eq!(u64::from_le_bytes(got) & mask, after & mask, "case {i}: memory");
+            assert_eq!(cpu.x[10], old, "case {i}: rd");
+        }
+
+        // rd == rs2: the operand is read before rd is overwritten.
+        let (mut cpu, mut mem) = setup(&[amo(0b00000, d, 12, 11, 12)]);
+        mem.write(DATA, &10u64.to_le_bytes()).unwrap();
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, 5);
+        step(&mut cpu, &mut mem).unwrap();
+        assert_eq!(cpu.x[12], 10);
+        assert_eq!(mem.bytes[0x800], 15);
+    }
+
+    #[test]
+    fn misaligned_atomics_trap() {
+        // lr.w (rs2 must be 0), sc.w, amoadd.w
+        for word in [
+            amo(0b00010, 0b010, 10, 11, 0),
+            amo(0b00011, 0b010, 10, 11, 12),
+            amo(0, 0b010, 10, 11, 12),
+        ] {
+            let (mut cpu, mut mem) = setup(&[word]);
+            cpu.set_x(11, DATA + 2);
+            let before = cpu.clone();
+            assert_eq!(
+                step(&mut cpu, &mut mem),
+                Err(Trap::MisalignedAtomic { pc: BASE, addr: DATA + 2 })
+            );
+            assert_eq!(cpu, before);
         }
     }
 

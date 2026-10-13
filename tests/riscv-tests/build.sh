@@ -29,3 +29,4 @@ build_suite() {
 
 build_suite rv64ui generic_rv64
 build_suite rv64um generic_rv64+m
+build_suite rv64ua generic_rv64+m+a

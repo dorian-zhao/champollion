@@ -15,11 +15,13 @@ pub struct CpuState {
     pub pc: u64,
     /// `fcsr`: `frm` in bits 7:5, `fflags` in bits 4:0.
     pub fcsr: u32,
+    /// Address reserved by the last `lr`, cleared by any `sc`.
+    pub reservation: Option<u64>,
 }
 
 impl CpuState {
     pub fn new(pc: u64) -> Self {
-        Self { x: [0; 32], f: [0; 32], pc, fcsr: 0 }
+        Self { x: [0; 32], f: [0; 32], pc, fcsr: 0, reservation: None }
     }
 
     #[inline]

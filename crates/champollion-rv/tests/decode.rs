@@ -2,7 +2,7 @@
 //! Each `tests/fixtures/*.s` lists instructions one per line; the matching `.bin` is the
 //! assembled `.text`.
 
-use champollion_rv::decoder::{AluOp, AluOp32, BranchCond, LoadWidth, StoreWidth};
+use champollion_rv::decoder::{AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, LoadWidth, StoreWidth};
 use champollion_rv::{Inst, decode};
 
 // Register numbers by ABI name, for readability below.
@@ -150,6 +150,44 @@ fn rv64m() {
     check(
         include_str!("../../../tests/fixtures/rv64m.s"),
         include_bytes!("../../../tests/fixtures/rv64m.bin"),
+        &expected,
+    );
+}
+
+#[test]
+fn rv64a() {
+    use AmoOp as O;
+    use AmoWidth::{D, W};
+    use Inst::*;
+    let amo = |op, width, aq, rl| Amo { op, width, rd: A0, rs1: A2, rs2: A1, aq, rl };
+    let amo_d = |op, aq, rl| Amo { op, width: D, rd: T0, rs1: SP, rs2: T1, aq, rl };
+    let expected = [
+        ("lr.w a0, (a1)", Lr { width: W, rd: A0, rs1: A1, aq: false, rl: false }),
+        ("lr.d.aqrl a0, (a1)", Lr { width: D, rd: A0, rs1: A1, aq: true, rl: true }),
+        ("sc.w a2, a3, (a1)", Sc { width: W, rd: A2, rs1: A1, rs2: A3, aq: false, rl: false }),
+        ("sc.d.rl a2, a3, (a1)", Sc { width: D, rd: A2, rs1: A1, rs2: A3, aq: false, rl: true }),
+        ("amoswap.w a0, a1, (a2)", amo(O::Swap, W, false, false)),
+        ("amoadd.w.aq a0, a1, (a2)", amo(O::Add, W, true, false)),
+        ("amoxor.w a0, a1, (a2)", amo(O::Xor, W, false, false)),
+        ("amoand.w a0, a1, (a2)", amo(O::And, W, false, false)),
+        ("amoor.w a0, a1, (a2)", amo(O::Or, W, false, false)),
+        ("amomin.w a0, a1, (a2)", amo(O::Min, W, false, false)),
+        ("amomax.w a0, a1, (a2)", amo(O::Max, W, false, false)),
+        ("amominu.w a0, a1, (a2)", amo(O::Minu, W, false, false)),
+        ("amomaxu.w.rl a0, a1, (a2)", amo(O::Maxu, W, false, true)),
+        ("amoswap.d t0, t1, (sp)", amo_d(O::Swap, false, false)),
+        ("amoadd.d t0, t1, (sp)", amo_d(O::Add, false, false)),
+        ("amoxor.d t0, t1, (sp)", amo_d(O::Xor, false, false)),
+        ("amoand.d t0, t1, (sp)", amo_d(O::And, false, false)),
+        ("amoor.d t0, t1, (sp)", amo_d(O::Or, false, false)),
+        ("amomin.d t0, t1, (sp)", amo_d(O::Min, false, false)),
+        ("amomax.d t0, t1, (sp)", amo_d(O::Max, false, false)),
+        ("amominu.d t0, t1, (sp)", amo_d(O::Minu, false, false)),
+        ("amomaxu.d.aqrl t0, t1, (sp)", amo_d(O::Maxu, true, true)),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/rv64a.s"),
+        include_bytes!("../../../tests/fixtures/rv64a.bin"),
         &expected,
     );
 }

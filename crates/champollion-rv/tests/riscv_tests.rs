@@ -69,3 +69,8 @@ fn rv64ui() {
 fn rv64um() {
     run_suite("rv64um", 13);
 }
+
+#[test]
+fn rv64ua() {
+    run_suite("rv64ua", 19);
+}

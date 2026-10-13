@@ -1,6 +1,6 @@
 //! RISC-V instruction decoder.
 //!
-//! Covers RV64I and M. Immediates are stored already sign-extended (`lui`/`auipc` already
+//! Covers RV64I, M, and A. Immediates are stored already sign-extended (`lui`/`auipc` already
 //! shifted left by 12), and branch/jump offsets are byte offsets relative to the
 //! instruction's own pc. Every immediate fits in an `i32`, which keeps [`Inst`] at 8 bytes.
 
@@ -9,6 +9,8 @@
 /// - `OpImm`: for shifts, `imm` is the shift amount.
 /// - `OpImm32` / `Op32` (`*w` ops): operate on the low 32 bits, sign-extend the result.
 /// - `Fence`: `pred`/`succ` are IORW bit sets; `fm` is 0b1000 for `fence.tso`.
+/// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
+///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inst {
     Lui { rd: u8, imm: i32 },
@@ -25,6 +27,9 @@ pub enum Inst {
     Fence { fm: u8, pred: u8, succ: u8 },
     Ecall,
     Ebreak,
+    Lr { width: AmoWidth, rd: u8, rs1: u8, aq: bool, rl: bool },
+    Sc { width: AmoWidth, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
+    Amo { op: AmoOp, width: AmoWidth, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +100,25 @@ pub enum AluOp32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmoWidth {
+    W,
+    D,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmoOp {
+    Swap,
+    Add,
+    Xor,
+    And,
+    Or,
+    Min,
+    Max,
+    Minu,
+    Maxu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     /// A 16-bit compressed instruction (C extension); not supported yet.
     Compressed(u16),
@@ -107,6 +131,7 @@ const OP_IMM: u32 = 0b001_0011;
 const AUIPC: u32 = 0b001_0111;
 const OP_IMM_32: u32 = 0b001_1011;
 const STORE: u32 = 0b010_0011;
+const AMO: u32 = 0b010_1111;
 const OP: u32 = 0b011_0011;
 const LUI: u32 = 0b011_0111;
 const OP_32: u32 = 0b011_1011;
@@ -301,6 +326,29 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
             pred: ((w >> 24) & 0xf) as u8,
             succ: ((w >> 20) & 0xf) as u8,
         },
+        AMO => {
+            let width = match f3 {
+                0b010 => AmoWidth::W,
+                0b011 => AmoWidth::D,
+                _ => return illegal, // Zabha byte/halfword AMOs are not supported
+            };
+            let (aq, rl) = (w >> 26 & 1 != 0, w >> 25 & 1 != 0);
+            let op = match w >> 27 {
+                0b00010 if rs2 == 0 => return Ok(Inst::Lr { width, rd, rs1, aq, rl }),
+                0b00011 => return Ok(Inst::Sc { width, rd, rs1, rs2, aq, rl }),
+                0b00001 => AmoOp::Swap,
+                0b00000 => AmoOp::Add,
+                0b00100 => AmoOp::Xor,
+                0b01100 => AmoOp::And,
+                0b01000 => AmoOp::Or,
+                0b10000 => AmoOp::Min,
+                0b10100 => AmoOp::Max,
+                0b11000 => AmoOp::Minu,
+                0b11100 => AmoOp::Maxu,
+                _ => return illegal,
+            };
+            Inst::Amo { op, width, rd, rs1, rs2, aq, rl }
+        }
         SYSTEM if w == ECALL => Inst::Ecall,
         SYSTEM if w == EBREAK => Inst::Ebreak,
         _ => return illegal,
@@ -396,6 +444,11 @@ pub(crate) mod enc {
         r(OP_32, f3, f7, rd, rs1, rs2)
     }
 
+    /// AMO with funct5 `f5` (2=lr 3=sc 1=swap 0=add ...) and funct3 `f3` (2=w 3=d).
+    pub fn amo(f5: u32, f3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+        r(AMO, f3, f5 << 2, rd, rs1, rs2)
+    }
+
     pub const FENCE: u32 = 0x0ff0_000f;
     pub const ECALL: u32 = super::ECALL;
     pub const EBREAK: u32 = super::EBREAK;
@@ -455,6 +508,10 @@ mod tests {
             0x0000_100f,                        // fence.i: Zifencei, not yet
             0x0020_0073,                        // uret-shaped SYSTEM encoding
             0x0000_1073,                        // csrrw: Zicsr, not yet
+            amo(0b00010, 0b010, 1, 2, 3),       // lr.w with rs2 != 0
+            amo(0b00000, 0b000, 1, 2, 3),       // amoadd.b: Zabha
+            amo(0b00101, 0b011, 1, 2, 3),       // amocas.d: Zacas
+            amo(0b00110, 0b010, 1, 2, 3),       // unassigned funct5
         ];
         for w in illegal {
             assert_eq!(decode(w), Err(DecodeError::Illegal(w)), "{w:#010x}");
