@@ -1,7 +1,7 @@
 //! RISC-V instruction decoder.
 //!
 //! Covers RV64I, M, A, C (see [`compressed`]), and the data-movement subset of F and D
-//! (loads, stores, `fmv`, `fsgnj`); floating-point arithmetic is M3.
+//! (loads, stores, `fmv`, `fsgnj`), and Zifencei; floating-point arithmetic is M3.
 //!
 //! Immediates are stored already sign-extended (`lui`/`auipc` already shifted left by 12),
 //! and branch/jump offsets are byte offsets relative to the instruction's own pc. Every
@@ -12,6 +12,7 @@
 /// - `OpImm`: for shifts, `imm` is the shift amount.
 /// - `OpImm32` / `Op32` (`*w` ops): operate on the low 32 bits, sign-extend the result.
 /// - `Fence`: `pred`/`succ` are IORW bit sets; `fm` is 0b1000 for `fence.tso`.
+/// - `FenceI` (Zifencei): make this hart's earlier stores visible to its instruction fetches.
 /// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
 ///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
 /// - `FLoad` / `FStore` / `FSgnj`: register numbers name `f` registers, except `rs1` of the
@@ -31,6 +32,7 @@ pub enum Inst {
     OpImm32 { op: AluOp32, rd: u8, rs1: u8, imm: i32 },
     Op32 { op: AluOp32, rd: u8, rs1: u8, rs2: u8 },
     Fence { fm: u8, pred: u8, succ: u8 },
+    FenceI,
     Ecall,
     Ebreak,
     Lr { width: AmoWidth, rd: u8, rs1: u8, aq: bool, rl: bool },
@@ -413,6 +415,8 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
             };
             Inst::Amo { op, width, rd, rs1, rs2, aq, rl }
         }
+        // fence.i: imm, rs1, and rd are reserved and ignored, like fence's.
+        MISC_MEM if f3 == 0b001 => Inst::FenceI,
         SYSTEM if w == ECALL => Inst::Ecall,
         SYSTEM if w == EBREAK => Inst::Ebreak,
         _ => return illegal,
@@ -581,7 +585,6 @@ mod tests {
             op_imm_32(0b001, 1, 2, 32),         // slliw with shamt[5] set
             op_imm_32(0b101, 1, 2, 0x400 | 32), // sraiw with shamt[5] set
             op_32(0b010, 0, 1, 2, 3),           // no sltw
-            0x0000_100f,                        // fence.i: Zifencei, not yet
             0x0020_0073,                        // uret-shaped SYSTEM encoding
             0x0000_1073,
             fload(0b001, 1, 2, 0),                // flh: Zfh

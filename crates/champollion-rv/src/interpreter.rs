@@ -95,6 +95,9 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         // every fence (including fence.tso) at least the ordering it asks for. The JIT will
         // emit the matching, cheaper `dmb` variant instead.
         Inst::Fence { .. } => std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst),
+        // This interpreter fetches from memory on every step, so it has no stale code to
+        // discard; the caching engine flushes its decoded blocks here.
+        Inst::FenceI => {}
         Inst::Ecall => return Err(Trap::Ecall { pc }),
         Inst::Ebreak => return Err(Trap::Ebreak { pc }),
         // Atomics map onto host atomics (sequentially consistent, which covers every aq/rl

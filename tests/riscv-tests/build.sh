@@ -10,8 +10,17 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 isa="$root/third_party/riscv-tests/isa"
 
-# Tests that need extensions we don't support yet.
-skip="rv64ui/fence_i" # Zifencei + self-modifying code (M3)
+# Tests that need extensions we don't support yet (space-separated suite/name).
+skip=""
+
+# Extra link flags per test. Upstream's bare-metal env makes all memory RWX, and two tests
+# rely on it: fence_i executes code it writes into .data, and rvc stores to data embedded
+# in .text. rwx.ld links them into a single RWX segment.
+link_flags() {
+    case $1 in
+    fence_i | rvc) echo "-Wl,-T,$here/rwx.ld" ;;
+    esac
+}
 
 # build_suite <suite> <cpu> [output-name]
 build_suite() {
@@ -23,7 +32,7 @@ build_suite() {
         case " $skip " in *" $suite/$name "*) continue ;; esac
         zig cc -target riscv64-linux-musl -mcpu="$cpu" -mno-relax \
             -nostdlib -static -s -Wl,--build-id=none \
-            -I"$here" -I"$isa/macros/scalar" \
+            -I"$here" -I"$isa/macros/scalar" $(link_flags "$name") \
             "$src" -o "$out/$name"
     done
 }
