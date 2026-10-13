@@ -48,3 +48,7 @@ c.jalr t0
 c.add a0, t6
 c.swsp ra, 252(sp)
 c.sdsp s0, 504(sp)
+c.fld fa0, 248(a1)
+c.fsd fs1, 0(a5)
+c.fldsp ft0, 504(sp)
+c.fsdsp fs11, 8(sp)

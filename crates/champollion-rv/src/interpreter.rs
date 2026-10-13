@@ -2,7 +2,8 @@
 
 use crate::cpu::CpuState;
 use crate::decoder::{
-    self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, DecodeError, Inst, LoadWidth, StoreWidth,
+    self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, DecodeError, FWidth, Inst, LoadWidth,
+    SgnjKind, StoreWidth,
 };
 use crate::memory::{MemFault, Memory};
 
@@ -131,6 +132,40 @@ pub fn execute(
                 .map_err(|fault| Trap::StoreFault { pc, fault })?;
             cpu.set_x(rd, old);
         }
+        Inst::FLoad { width, rd, rs1, offset } => {
+            let addr = cpu.x(rs1).wrapping_add(sext(offset));
+            let v = match width {
+                FWidth::S => load_value(mem, addr, LoadWidth::Wu).map(nan_box),
+                FWidth::D => load_value(mem, addr, LoadWidth::D),
+            }
+            .map_err(|fault| Trap::LoadFault { pc, fault })?;
+            cpu.f[rd as usize] = v;
+        }
+        Inst::FStore { width, rs1, rs2, offset } => {
+            // fsw stores the low 32 bits as-is, without checking the NaN-boxing.
+            let addr = cpu.x(rs1).wrapping_add(sext(offset));
+            let bytes = cpu.f[rs2 as usize].to_le_bytes();
+            let n = if width == FWidth::S { 4 } else { 8 };
+            mem.write(addr, &bytes[..n]).map_err(|fault| Trap::StoreFault { pc, fault })?;
+        }
+        Inst::FMvToInt { width, rd, rs1 } => {
+            let v = cpu.f[rs1 as usize];
+            cpu.set_x(rd, if width == FWidth::S { v as i32 as u64 } else { v });
+        }
+        Inst::FMvFromInt { width, rd, rs1 } => {
+            let v = cpu.x(rs1);
+            cpu.f[rd as usize] = if width == FWidth::S { nan_box(v as u32 as u64) } else { v };
+        }
+        Inst::FSgnj { kind, width, rd, rs1, rs2 } => {
+            cpu.f[rd as usize] = match width {
+                FWidth::S => {
+                    let a = unbox(cpu.f[rs1 as usize]) as u64;
+                    let b = unbox(cpu.f[rs2 as usize]) as u64;
+                    nan_box(sign_inject(kind, a, b, 31))
+                }
+                FWidth::D => sign_inject(kind, cpu.f[rs1 as usize], cpu.f[rs2 as usize], 63),
+            };
+        }
     }
     cpu.pc = next;
     Ok(())
@@ -182,6 +217,28 @@ fn amo_op(op: AmoOp, width: AmoWidth, old: u64, src: u64) -> u64 {
         AmoOp::Minu => ua.min(ub),
         AmoOp::Maxu => ua.max(ub),
     }
+}
+
+/// NaN-box a single-precision value (in the low 32 bits) for an `f` register.
+fn nan_box(v: u64) -> u64 {
+    0xffff_ffff_0000_0000 | (v & 0xffff_ffff)
+}
+
+/// Single-precision operand of an `f` register: values that are not properly NaN-boxed
+/// read as the canonical NaN.
+fn unbox(v: u64) -> u32 {
+    if v >> 32 == 0xffff_ffff { v as u32 } else { 0x7fc0_0000 }
+}
+
+/// Sign injection on raw bits; `sign` is the sign bit position (31 or 63).
+fn sign_inject(kind: SgnjKind, a: u64, b: u64, sign: u32) -> u64 {
+    let mask = 1u64 << sign;
+    let s = match kind {
+        SgnjKind::Sgnj => b & mask,
+        SgnjKind::Sgnjn => !b & mask,
+        SgnjKind::Sgnjx => (a ^ b) & mask,
+    };
+    (a & !mask) | s
 }
 
 #[inline]
@@ -572,6 +629,59 @@ mod tests {
         run(&mut cpu, &mut mem, 4); // c.addi, c.jr, addi, c.j
         assert_eq!((cpu.x[10], cpu.x[11]), (6, 1));
         assert_eq!(cpu.pc, BASE + 0x0c);
+    }
+
+    #[test]
+    fn fp_loads_stores_and_moves() {
+        let (mut cpu, mut mem) = setup(&[
+            fload(0b011, 1, 11, 0),            // fld f1, 0(a1)
+            fload(0b010, 2, 11, 8),            // flw f2, 8(a1): NaN-boxed
+            fstore(0b011, 11, 1, 16),          // fsd f1, 16(a1)
+            fstore(0b010, 11, 2, 24),          // fsw f2, 24(a1)
+            op_fp(0b11100, 0b01, 0, 10, 1, 0), // fmv.x.d a0, f1
+            op_fp(0b11100, 0b00, 0, 12, 2, 0), // fmv.x.w a2, f2: sign-extended
+            op_fp(0b11110, 0b00, 0, 3, 13, 0), // fmv.w.x f3, a3: NaN-boxed
+            op_fp(0b11110, 0b01, 0, 4, 13, 0), // fmv.d.x f4, a3
+        ]);
+        mem.write(DATA, &1.5f64.to_bits().to_le_bytes()).unwrap();
+        mem.write(DATA + 8, &(-2.0f32).to_bits().to_le_bytes()).unwrap();
+        cpu.set_x(11, DATA);
+        cpu.set_x(13, 0x1234_5678_3f80_0000);
+        run(&mut cpu, &mut mem, 8);
+
+        assert_eq!(cpu.f[1], 1.5f64.to_bits());
+        assert_eq!(cpu.f[2], 0xffff_ffff_c000_0000);
+        let mut b = [0u8; 12];
+        mem.read(DATA + 16, &mut b).unwrap();
+        assert_eq!(b[..8], 1.5f64.to_bits().to_le_bytes());
+        assert_eq!(b[8..], (-2.0f32).to_bits().to_le_bytes());
+        assert_eq!(cpu.x[10], 1.5f64.to_bits());
+        assert_eq!(cpu.x[12], 0xffff_ffff_c000_0000);
+        assert_eq!(cpu.f[3], 0xffff_ffff_3f80_0000);
+        assert_eq!(cpu.f[4], 0x1234_5678_3f80_0000);
+    }
+
+    #[test]
+    fn fp_sign_injection() {
+        let one = 1.0f64.to_bits();
+        let neg = (-3.0f64).to_bits();
+        let sgnj = |kind, fmt| op_fp(0b00100, fmt, kind, 3, 1, 2);
+        // (encoding, f1, f2, expected f3)
+        let cases = [
+            (sgnj(0b000, 1), one, neg, (-1.0f64).to_bits()), // fsgnj.d
+            (sgnj(0b001, 1), one, neg, one),                 // fsgnjn.d
+            (sgnj(0b010, 1), neg, neg, 3.0f64.to_bits()),    // fsgnjx.d (fabs)
+            (sgnj(0b001, 1), neg, neg, 3.0f64.to_bits()),    // fneg.d of -3
+            (sgnj(0b000, 0), nan_box(0x3f80_0000), nan_box(0x8000_0000), nan_box(0xbf80_0000)),
+            (sgnj(0b000, 0), 0x3f80_0000, nan_box(0), nan_box(0x7fc0_0000)), // unboxed -> NaN
+        ];
+        for (i, &(w, a, b, want)) in cases.iter().enumerate() {
+            let (mut cpu, mut mem) = setup(&[w]);
+            cpu.f[1] = a;
+            cpu.f[2] = b;
+            step(&mut cpu, &mut mem).unwrap();
+            assert_eq!(cpu.f[3], want, "case {i}");
+        }
     }
 
     #[test]

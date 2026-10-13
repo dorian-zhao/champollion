@@ -13,6 +13,8 @@
 
 #define RVTEST_RV64U
 #define RVTEST_RV32U
+#define RVTEST_RV64UF
+#define RVTEST_RV64UD
 
 #define TESTNUM gp
 

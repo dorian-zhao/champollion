@@ -3,7 +3,9 @@
 //! assembled `.text`.
 
 use champollion_rv::decoder::inst_len;
-use champollion_rv::decoder::{AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, LoadWidth, StoreWidth};
+use champollion_rv::decoder::{
+    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FWidth, LoadWidth, SgnjKind, StoreWidth,
+};
 use champollion_rv::{Inst, decode};
 
 // Register numbers by ABI name, for readability below.
@@ -257,10 +259,57 @@ fn rv64c() {
         ("c.add a0, t6", Op { op: A::Add, rd: A0, rs1: A0, rs2: T6 }),
         ("c.swsp ra, 252(sp)", Store { width: S::W, rs1: SP, rs2: RA, offset: 252 }),
         ("c.sdsp s0, 504(sp)", Store { width: S::D, rs1: SP, rs2: S0, offset: 504 }),
+        // f registers: fa0 = f10, fs1 = f9, ft0 = f0, fs11 = f27
+        ("c.fld fa0, 248(a1)", FLoad { width: FWidth::D, rd: 10, rs1: A1, offset: 248 }),
+        ("c.fsd fs1, 0(a5)", FStore { width: FWidth::D, rs1: A5, rs2: 9, offset: 0 }),
+        ("c.fldsp ft0, 504(sp)", FLoad { width: FWidth::D, rd: 0, rs1: SP, offset: 504 }),
+        ("c.fsdsp fs11, 8(sp)", FStore { width: FWidth::D, rs1: SP, rs2: 27, offset: 8 }),
     ];
     check(
         include_str!("../../../tests/fixtures/rv64c.s"),
         include_bytes!("../../../tests/fixtures/rv64c.bin"),
+        &expected,
+    );
+}
+
+#[test]
+fn rv64fd() {
+    use FWidth::{D, S};
+    use Inst::*;
+    use SgnjKind::*;
+    // f register numbers by ABI name.
+    const FT0: u8 = 0;
+    const FT1: u8 = 1;
+    const FT3: u8 = 3;
+    const FT4: u8 = 4;
+    const FT5: u8 = 5;
+    const FS0: u8 = 8;
+    const FA0: u8 = 10;
+    const FA1: u8 = 11;
+    const FA2: u8 = 12;
+    const FA5: u8 = 15;
+    const FA7: u8 = 17;
+    const FS11: u8 = 27;
+    const T2: u8 = 7;
+    let expected = [
+        ("flw fa0, -4(sp)", FLoad { width: S, rd: FA0, rs1: SP, offset: -4 }),
+        ("fld fs11, 2040(a0)", FLoad { width: D, rd: FS11, rs1: A0, offset: 2040 }),
+        ("fsw ft0, 0(a1)", FStore { width: S, rs1: A1, rs2: FT0, offset: 0 }),
+        ("fsd fa7, -2048(s0)", FStore { width: D, rs1: S0, rs2: FA7, offset: -2048 }),
+        ("fmv.x.w a0, fa1", FMvToInt { width: S, rd: A0, rs1: FA1 }),
+        ("fmv.w.x ft1, t2", FMvFromInt { width: S, rd: FT1, rs1: T2 }),
+        ("fmv.x.d a2, fs0", FMvToInt { width: D, rd: A2, rs1: FS0 }),
+        ("fmv.d.x fa5, zero", FMvFromInt { width: D, rd: FA5, rs1: ZERO }),
+        ("fsgnj.s fa0, fa1, fa2", FSgnj { kind: Sgnj, width: S, rd: FA0, rs1: FA1, rs2: FA2 }),
+        ("fsgnjn.s fa0, fa1, fa2", FSgnj { kind: Sgnjn, width: S, rd: FA0, rs1: FA1, rs2: FA2 }),
+        ("fsgnjx.s fa0, fa1, fa2", FSgnj { kind: Sgnjx, width: S, rd: FA0, rs1: FA1, rs2: FA2 }),
+        ("fsgnj.d ft3, ft4, ft5", FSgnj { kind: Sgnj, width: D, rd: FT3, rs1: FT4, rs2: FT5 }),
+        ("fsgnjn.d ft3, ft4, ft5", FSgnj { kind: Sgnjn, width: D, rd: FT3, rs1: FT4, rs2: FT5 }),
+        ("fsgnjx.d ft3, ft4, ft5", FSgnj { kind: Sgnjx, width: D, rd: FT3, rs1: FT4, rs2: FT5 }),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/rv64fd.s"),
+        include_bytes!("../../../tests/fixtures/rv64fd.bin"),
         &expected,
     );
 }

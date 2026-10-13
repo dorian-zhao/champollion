@@ -4,10 +4,10 @@
 //! never need to know an instruction was compressed (beyond its 2-byte length, which only
 //! matters for the link value and the next pc).
 //!
-//! The floating-point forms (`c.fld`, `c.fsd`, `c.fldsp`, `c.fsdsp`) decode as illegal
-//! until the D extension lands.
+//! The double-precision forms (`c.fld`, `c.fsd`, `c.fldsp`, `c.fsdsp`) expand to D
+//! loads and stores; RV64 has no single-precision compressed forms.
 
-use super::{AluOp, AluOp32, BranchCond, DecodeError, Inst, LoadWidth, StoreWidth};
+use super::{AluOp, AluOp32, BranchCond, DecodeError, FWidth, Inst, LoadWidth, StoreWidth};
 
 const SP: u8 = 2;
 
@@ -86,7 +86,9 @@ pub fn decode_compressed(h: u16) -> Result<Inst, DecodeError> {
             Inst::OpImm { op: AluOp::Add, rd: rd_, rs1: SP, imm: imm as i32 }
         }
         (0b00, 0b010) => Inst::Load { width: LoadWidth::W, rd: rd_, rs1: rs1_, offset: off_w },
+        (0b00, 0b001) => Inst::FLoad { width: FWidth::D, rd: rd_, rs1: rs1_, offset: off_d },
         (0b00, 0b011) => Inst::Load { width: LoadWidth::D, rd: rd_, rs1: rs1_, offset: off_d },
+        (0b00, 0b101) => Inst::FStore { width: FWidth::D, rs1: rs1_, rs2: rd_, offset: off_d },
         (0b00, 0b110) => Inst::Store { width: StoreWidth::W, rs1: rs1_, rs2: rd_, offset: off_w },
         (0b00, 0b111) => Inst::Store { width: StoreWidth::D, rs1: rs1_, rs2: rd_, offset: off_d },
 
@@ -145,6 +147,11 @@ pub fn decode_compressed(h: u16) -> Result<Inst, DecodeError> {
             let off = field(h, 12, 12, 5) | field(h, 6, 4, 2) | field(h, 3, 2, 6);
             Inst::Load { width: LoadWidth::W, rd, rs1: SP, offset: off as i32 }
         }
+        (0b10, 0b001) => {
+            // c.fldsp: same offset encoding as c.ldsp; rd = f0 is allowed
+            let off = field(h, 12, 12, 5) | field(h, 6, 5, 3) | field(h, 4, 2, 6);
+            Inst::FLoad { width: FWidth::D, rd, rs1: SP, offset: off as i32 }
+        }
         (0b10, 0b011) if rd != 0 => {
             // c.ldsp: uimm[5] in bit 12, uimm[4:3|8:6] in bits 6:2
             let off = field(h, 12, 12, 5) | field(h, 6, 5, 3) | field(h, 4, 2, 6);
@@ -162,6 +169,11 @@ pub fn decode_compressed(h: u16) -> Result<Inst, DecodeError> {
             // c.swsp: uimm[5:2|7:6] in bits 12:7
             let off = field(h, 12, 9, 2) | field(h, 8, 7, 6);
             Inst::Store { width: StoreWidth::W, rs1: SP, rs2, offset: off as i32 }
+        }
+        (0b10, 0b101) => {
+            // c.fsdsp: same offset encoding as c.sdsp
+            let off = field(h, 12, 10, 3) | field(h, 9, 7, 6);
+            Inst::FStore { width: FWidth::D, rs1: SP, rs2, offset: off as i32 }
         }
         (0b10, 0b111) => {
             // c.sdsp: uimm[5:3|8:6] in bits 12:7

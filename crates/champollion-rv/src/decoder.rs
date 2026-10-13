@@ -1,8 +1,11 @@
 //! RISC-V instruction decoder.
 //!
-//! Covers RV64I, M, A, and C (see [`compressed`]). Immediates are stored already sign-extended (`lui`/`auipc` already
-//! shifted left by 12), and branch/jump offsets are byte offsets relative to the
-//! instruction's own pc. Every immediate fits in an `i32`, which keeps [`Inst`] at 8 bytes.
+//! Covers RV64I, M, A, C (see [`compressed`]), and the data-movement subset of F and D
+//! (loads, stores, `fmv`, `fsgnj`); floating-point arithmetic is M3.
+//!
+//! Immediates are stored already sign-extended (`lui`/`auipc` already shifted left by 12),
+//! and branch/jump offsets are byte offsets relative to the instruction's own pc. Every
+//! immediate fits in an `i32`, which keeps [`Inst`] at 8 bytes.
 
 /// A decoded instruction.
 ///
@@ -11,6 +14,9 @@
 /// - `Fence`: `pred`/`succ` are IORW bit sets; `fm` is 0b1000 for `fence.tso`.
 /// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
 ///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
+/// - `FLoad` / `FStore` / `FSgnj`: register numbers name `f` registers, except `rs1` of the
+///   loads/stores (the base address). `FMvToInt` reads `f[rs1]` into `x[rd]`;
+///   `FMvFromInt` reads `x[rs1]` into `f[rd]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inst {
     Lui { rd: u8, imm: i32 },
@@ -30,6 +36,27 @@ pub enum Inst {
     Lr { width: AmoWidth, rd: u8, rs1: u8, aq: bool, rl: bool },
     Sc { width: AmoWidth, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
     Amo { op: AmoOp, width: AmoWidth, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
+    FLoad { width: FWidth, rd: u8, rs1: u8, offset: i32 },
+    FStore { width: FWidth, rs1: u8, rs2: u8, offset: i32 },
+    FMvToInt { width: FWidth, rd: u8, rs1: u8 },
+    FMvFromInt { width: FWidth, rd: u8, rs1: u8 },
+    FSgnj { kind: SgnjKind, width: FWidth, rd: u8, rs1: u8, rs2: u8 },
+}
+
+/// Floating-point operand width: single (F) or double (D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FWidth {
+    S,
+    D,
+}
+
+/// Sign injection: take the sign of `rs2` (`Sgnj`), its inverse (`Sgnjn`), or the XOR of
+/// both signs (`Sgnjx`). `fmv`, `fneg`, and `fabs` are aliases of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SgnjKind {
+    Sgnj,
+    Sgnjn,
+    Sgnjx,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +157,9 @@ pub enum DecodeError {
 }
 
 const LOAD: u32 = 0b000_0011;
+const LOAD_FP: u32 = 0b000_0111;
+const STORE_FP: u32 = 0b010_0111;
+const OP_FP: u32 = 0b101_0011;
 const MISC_MEM: u32 = 0b000_1111;
 const OP_IMM: u32 = 0b001_0011;
 const AUIPC: u32 = 0b001_0111;
@@ -332,6 +362,34 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
             pred: ((w >> 24) & 0xf) as u8,
             succ: ((w >> 20) & 0xf) as u8,
         },
+        LOAD_FP | STORE_FP => {
+            let width = match f3 {
+                0b010 => FWidth::S,
+                0b011 => FWidth::D,
+                _ => return illegal, // flh/flq: Zfh, Q
+            };
+            if w & 0x7f == LOAD_FP {
+                Inst::FLoad { width, rd, rs1, offset: imm_i(w) }
+            } else {
+                Inst::FStore { width, rs1, rs2, offset: imm_s(w) }
+            }
+        }
+        OP_FP => {
+            // funct7 = funct5 << 2 | fmt, with fmt 0 = S, 1 = D.
+            let width = match f7 & 0b11 {
+                0b00 => FWidth::S,
+                0b01 => FWidth::D,
+                _ => return illegal,
+            };
+            match (f7 >> 2, f3, rs2) {
+                (0b00100, 0b000, _) => Inst::FSgnj { kind: SgnjKind::Sgnj, width, rd, rs1, rs2 },
+                (0b00100, 0b001, _) => Inst::FSgnj { kind: SgnjKind::Sgnjn, width, rd, rs1, rs2 },
+                (0b00100, 0b010, _) => Inst::FSgnj { kind: SgnjKind::Sgnjx, width, rd, rs1, rs2 },
+                (0b11100, 0b000, 0) => Inst::FMvToInt { width, rd, rs1 },
+                (0b11110, 0b000, 0) => Inst::FMvFromInt { width, rd, rs1 },
+                _ => return illegal, // arithmetic, conversions, compares: M3
+            }
+        }
         AMO => {
             let width = match f3 {
                 0b010 => AmoWidth::W,
@@ -451,6 +509,18 @@ pub(crate) mod enc {
     }
 
     /// AMO with funct5 `f5` (2=lr 3=sc 1=swap 0=add ...) and funct3 `f3` (2=w 3=d).
+    /// FP load/store with funct3 `f3` (2=w 3=d).
+    pub fn fload(f3: u32, rd: u32, rs1: u32, off: i32) -> u32 {
+        i(LOAD_FP, f3, rd, rs1, off)
+    }
+    pub fn fstore(f3: u32, rs1: u32, rs2: u32, off: i32) -> u32 {
+        s(STORE_FP, f3, rs1, rs2, off)
+    }
+    /// OP-FP with funct5 `f5`, fmt (0=S 1=D), and funct3 `f3`.
+    pub fn op_fp(f5: u32, fmt: u32, f3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+        r(OP_FP, f3, f5 << 2 | fmt, rd, rs1, rs2)
+    }
+
     pub fn amo(f5: u32, f3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
         r(AMO, f3, f5 << 2, rd, rs1, rs2)
     }
@@ -513,11 +583,15 @@ mod tests {
             op_32(0b010, 0, 1, 2, 3),           // no sltw
             0x0000_100f,                        // fence.i: Zifencei, not yet
             0x0020_0073,                        // uret-shaped SYSTEM encoding
-            0x0000_1073,                        // csrrw: Zicsr, not yet
-            amo(0b00010, 0b010, 1, 2, 3),       // lr.w with rs2 != 0
-            amo(0b00000, 0b000, 1, 2, 3),       // amoadd.b: Zabha
-            amo(0b00101, 0b011, 1, 2, 3),       // amocas.d: Zacas
-            amo(0b00110, 0b010, 1, 2, 3),       // unassigned funct5
+            0x0000_1073,
+            fload(0b001, 1, 2, 0),                // flh: Zfh
+            op_fp(0b00000, 0b01, 0b111, 1, 2, 3), // fadd.d: arithmetic is M3
+            op_fp(0b11100, 0b01, 0b000, 1, 2, 3), // fmv.x.d with rs2 != 0
+            op_fp(0b00100, 0b10, 0b000, 1, 2, 3), // fsgnj.h: Zfh                        // csrrw: Zicsr, not yet
+            amo(0b00010, 0b010, 1, 2, 3),         // lr.w with rs2 != 0
+            amo(0b00000, 0b000, 1, 2, 3),         // amoadd.b: Zabha
+            amo(0b00101, 0b011, 1, 2, 3),         // amocas.d: Zacas
+            amo(0b00110, 0b010, 1, 2, 3),         // unassigned funct5
         ];
         for w in illegal {
             assert_eq!(decode(w), Err(DecodeError::Illegal(w)), "{w:#010x}");
@@ -525,7 +599,6 @@ mod tests {
         let illegal_c = [
             0x0000, // all zeros: defined illegal
             0x0010, // c.addi4spn with nzuimm = 0
-            0x2000, // c.fld: D, not yet
             0x8000, // reserved (Zcb loads/stores)
             0x2001, // c.addiw with rd = 0
             0x6101, // c.addi16sp with nzimm = 0
@@ -533,7 +606,6 @@ mod tests {
             0x9c41, // c.mulw-shaped: Zcb
             0x4002, // c.lwsp with rd = 0
             0x8002, // c.jr with rs1 = 0
-            0xa002, // c.fsdsp: D, not yet
         ];
         for h in illegal_c {
             assert_eq!(decode(h), Err(DecodeError::Illegal(h)), "{h:#06x}");
