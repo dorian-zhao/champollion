@@ -174,7 +174,20 @@ A CPU-bound C benchmark (sieve, array traffic, integer hashing; 228 M guest inst
 | Same, lock and permission checks removed (experiment only) | 147 MIPS | 1.55 s | — |
 | **Engine: block cache + software TLB + chaining** | **~270 MIPS** | **0.85 s** | **~23× slower** |
 
-Real program (Lua 5.4 running a fib + table sort + concat script, 1.94 G guest instructions): native 100 ms, engine 10.4 s (183 MIPS), **~104× slower**. Interpreters like Lua are dominated by indirect jumps (their own dispatch loop), which break into short blocks that our chaining cannot link; this is the workload M4's indirect-jump prediction and inline lookup must fix.
+Real program (Lua 5.4 running a fib + table sort + concat script, 1.94 G guest instructions): native 100 ms, engine 10.4 s (183 MIPS), **~104× slower**.
+
+### JIT progress (M4, Oct 14, 2026)
+
+| Step | C benchmark | Lua script | SQLite (300k-row insert, index, aggregates) |
+| --- | --- | --- | --- |
+| Native arm64 | 29.5 ms | 96 ms | 182 ms |
+| Engine (interpreter) | 28.5× slower | 106× slower | — |
+| JIT, no chaining | 10.2× slower | 113× slower | — |
+| + direct block chaining | 1.6× slower | 75× slower | — |
+| + inline jump cache, code generation | 1.5× slower | 69× slower | — |
+| + FP moves, lr/sc, AMOs translated | **1.5× slower** | **2.7× slower** | **3.0× slower** |
+
+JIT statistics (`RVRUN_STATS=1`) drove every step after chaining: they showed Lua flushing the JIT on each data `mmap`, then 8.3M instructions bouncing through the interpreter. Remaining gaps: FP arithmetic is still interpreted, ~600k dispatcher round trips remain on Lua (jump-cache misses and unchained exits), each costing a full register save/restore, and every block pays an `instret` read-modify-write. Interpreters like Lua are dominated by indirect jumps (their own dispatch loop), which break into short blocks that our chaining cannot link; this is the workload M4's indirect-jump prediction and inline lookup must fix.
 
 The per-access lock and B-tree lookup cost the reference interpreter 3.6×, mostly on instruction fetch. The engine (below) recovers that and more without giving up thread safety. Closing the remaining gap is the JIT's job (M4), as it is for QEMU's TCG.
 
