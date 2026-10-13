@@ -192,7 +192,7 @@ impl Jit {
                             guest_pc: pc,
                             guest: block.iter().map(|&(inst, _)| inst).collect(),
                             host_offset: at,
-                            host_words: t.code.clone(),
+                            host_len: t.code.len(),
                         });
                     }
                     for (index, site) in t.sites {

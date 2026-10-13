@@ -56,7 +56,8 @@ pub struct BlockInfo {
     pub guest_pc: u64,
     pub guest: Vec<Inst>,
     pub host_offset: usize,
-    pub host_words: Vec<u32>,
+    /// Length of the generated code, in instructions.
+    pub host_len: usize,
 }
 
 pub struct Profiler {
@@ -110,7 +111,7 @@ impl Profiler {
             let _ = sampler.join();
         }
         let counts = |b: &BlockInfo| -> Vec<u32> {
-            (0..b.host_words.len())
+            (0..b.host_len)
                 .map(|i| self.samples.per_insn[b.host_offset / 4 + i].load(Relaxed))
                 .collect()
         };
@@ -145,7 +146,15 @@ impl Profiler {
             for inst in &b.guest {
                 let _ = writeln!(out, "  guest {inst:?}");
             }
-            for (w, c) in b.host_words.iter().zip(counts(b)) {
+            // The code as it is now, with chained exits patched.
+            // SAFETY: the block's code is still mapped (blocks are forgotten on reset).
+            let words = unsafe {
+                std::slice::from_raw_parts(
+                    (self.samples.code_base + b.host_offset) as *const u32,
+                    b.host_len,
+                )
+            };
+            for (w, c) in words.iter().zip(counts(b)) {
                 let _ = writeln!(out, "  host {w:08x} {c}");
             }
         }
