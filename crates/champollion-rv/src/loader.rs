@@ -1,5 +1,5 @@
-//! Static ELF loader: parse an executable, map its segments into a [`GuestMemory`], and
-//! build the Linux initial stack (argc, argv, envp, auxv).
+//! Static ELF loader: parse an executable (fixed-address or static-PIE), map its segments
+//! into a [`GuestMemory`], and build the Linux initial stack (argc, argv, envp, auxv).
 //!
 //! [`load_flat`] instead places an image into a [`FlatMemory`], which is enough for
 //! freestanding test binaries such as riscv-tests.
@@ -30,8 +30,6 @@ pub enum LoadError {
     NotElf,
     Not64BitLittleEndian,
     WrongMachine(u16),
-    /// PIE or shared object; static PIE support is a later milestone.
-    PositionIndependent,
     /// Has a PT_INTERP; dynamic linking is M5.
     DynamicallyLinked,
     UnsupportedType(u16),
@@ -61,9 +59,22 @@ pub struct Elf<'a> {
     /// covered by a loadable segment. musl's static startup needs it to find `PT_TLS`.
     pub phdr: Option<u64>,
     pub phnum: u16,
+    /// Position-independent (`ET_DYN` without an interpreter: static-PIE, the default for
+    /// Rust's musl targets). Must be [`relocate`](Elf::relocate)d to a load base; the
+    /// program applies its own relocations at startup.
+    pub pie: bool,
 }
 
 impl Elf<'_> {
+    /// Shift every address by `bias` (the load base of a PIE).
+    pub fn relocate(&mut self, bias: u64) {
+        self.entry += bias;
+        self.phdr = self.phdr.map(|p| p + bias);
+        for seg in &mut self.segments {
+            seg.vaddr += bias;
+        }
+    }
+
     /// Lowest and one-past-highest virtual address covered by loadable segments.
     pub fn span(&self) -> Option<(u64, u64)> {
         let lo = self.segments.iter().map(|s| s.vaddr).min()?;
@@ -102,11 +113,11 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
     if machine != EM_RISCV {
         return Err(LoadError::WrongMachine(machine));
     }
-    match u16_at(file, 16)? {
-        ET_EXEC => {}
-        ET_DYN => return Err(LoadError::PositionIndependent),
+    let pie = match u16_at(file, 16)? {
+        ET_EXEC => false,
+        ET_DYN => true,
         t => return Err(LoadError::UnsupportedType(t)),
-    }
+    };
     let entry = u64_at(file, 24)?;
     let phoff = u64_at(file, 32)? as usize;
     let flags = u32_at(file, 48)?;
@@ -147,7 +158,7 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
         }
         segments.push(Segment { vaddr, mem_size, data, flags: seg_flags });
     }
-    Ok(Elf { entry, flags, segments, phdr, phnum: phnum as u16 })
+    Ok(Elf { entry, flags, segments, phdr, phnum: phnum as u16, pie })
 }
 
 /// Copy every loadable segment into a single [`FlatMemory`] spanning them all, plus
@@ -393,7 +404,8 @@ mod tests {
         };
         assert_eq!(parse(&patched(4, &[1])), Err(LoadError::Not64BitLittleEndian));
         assert_eq!(parse(&patched(18, &62u16.to_le_bytes())), Err(LoadError::WrongMachine(62)));
-        assert_eq!(parse(&patched(16, &3u16.to_le_bytes())), Err(LoadError::PositionIndependent));
+        assert!(parse(&patched(16, &3u16.to_le_bytes())).unwrap().pie, "ET_DYN is a static PIE");
+        assert_eq!(parse(&patched(16, &4u16.to_le_bytes())), Err(LoadError::UnsupportedType(4)));
         // Headers intact, but a segment's file range runs past the end.
         assert!(matches!(parse(&HELLO[..HELLO.len() / 2]), Err(LoadError::BadSegment { .. })));
     }

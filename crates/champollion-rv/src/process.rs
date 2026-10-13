@@ -16,7 +16,8 @@
 //!              ⋮
 //!              │ heap (brk), growing up
 //! image end    ┼ brk start
-//!              │ ELF image (where the linker put it, typically ~0x10000)
+//!              │ ELF image: fixed-address images where the linker put them
+//!              │ (typically ~0x10000); static-PIE images at PIE_BASE (2/3 up)
 //! 0            ┴
 //! ```
 
@@ -32,6 +33,9 @@ use crate::syscall::{self, Flow, HostOs, SysResult, SyscallLog, errno};
 pub const STACK_TOP: u64 = GUEST_SIZE;
 pub const STACK_SIZE: u64 = 8 << 20;
 pub const MMAP_TOP: u64 = STACK_TOP - (1 << 30);
+/// Load base for static-PIE executables: two thirds up the address space, as Linux does
+/// (`ELF_ET_DYN_BASE`), leaving room below for fixed-address images and above for brk.
+pub const PIE_BASE: u64 = (GUEST_SIZE / 3 * 2) & !(GUEST_PAGE_SIZE - 1);
 
 /// `AT_HWCAP`: one bit per single-letter extension we implement (bit n = letter 'a' + n).
 const HWCAP: u64 = hwcap(b"imafdc");
@@ -125,7 +129,10 @@ impl Process {
         execfn: &[u8],
         host: &dyn HostOs,
     ) -> Result<(Self, Thread), SpawnError> {
-        let elf = loader::parse(file).map_err(SpawnError::Load)?;
+        let mut elf = loader::parse(file).map_err(SpawnError::Load)?;
+        if elf.pie {
+            elf.relocate(PIE_BASE);
+        }
         if elf.span().is_none_or(|(_, hi)| hi > MMAP_TOP) {
             return Err(SpawnError::BadLayout);
         }
