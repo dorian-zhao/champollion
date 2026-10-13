@@ -153,24 +153,23 @@ pub fn logical_imm(value: u64, width: u32) -> Option<(u32, u32, u32)> {
     }
     let mask = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
     let elem = value & mask;
-    // The element must be a rotated run of ones.
-    let ones = elem.count_ones();
-    // Rotate right until the run starts at bit 0 (trailing ones, then zeros).
-    let mut rot = 0;
-    let mut e = elem;
-    while rot < size {
-        let run = (1u64 << ones) - 1;
-        if e == run {
-            break;
+    // The element must be a run of ones rotated by some amount (as in LLVM): either a
+    // contiguous run, or one that wraps around the element's top and bottom.
+    let shifted_mask = |v: u64| v != 0 && ((v | (v - 1)) + 1) & (v | (v - 1)) == 0;
+    let (rot, ones) = if shifted_mask(elem) {
+        let rot = elem.trailing_zeros();
+        (rot, (elem >> rot).trailing_ones())
+    } else {
+        // Wrapping run: its complement (within the element) is a contiguous run of zeros.
+        let filled = elem | !mask;
+        if !shifted_mask(!filled) {
+            return None;
         }
-        e = ((e >> 1) | ((e & 1) << (size - 1))) & mask;
-        rot += 1;
-    }
-    if rot == size {
-        return None;
-    }
-    // e = elem rotated right by `rot`; the encoding stores the right-rotation that turns
-    // the run into elem, which is (size - rot) % size.
+        let leading = filled.leading_ones(); // the run's high part, plus the fill
+        let rot = 64 - leading;
+        (rot, leading + filled.trailing_ones() - (64 - size))
+    };
+    // The encoding stores the right-rotation that turns the run (at bit 0) into `elem`.
     let immr = (size - rot) % size;
     let n = u32::from(size == 64);
     let imms = ((!(size - 1) << 1) & 0x3f) | (ones - 1);
@@ -852,6 +851,63 @@ mod tests {
         assert_eq!(logical_imm(u64::MAX, 64), None);
         assert_eq!(logical_imm(0x1234, 64), None);
         assert_eq!(logical_imm(0xffff_fffe, 32), Some((0, 31, 30)));
+    }
+
+    /// The architecture's `DecodeBitMasks` for a 64-bit operation.
+    fn decode_bit_masks(n: u32, immr: u32, imms: u32) -> Option<u64> {
+        let combined = (n << 6) | (!imms & 0x3f);
+        if combined < 2 {
+            return None; // element size below 2: reserved
+        }
+        let len = 31 - combined.leading_zeros();
+        let size = 1u32 << len;
+        let s = imms & (size - 1);
+        let r = immr & (size - 1);
+        if s == size - 1 {
+            return None; // all ones: reserved
+        }
+        let mask = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
+        let run = (1u64 << (s + 1)) - 1;
+        let elem = ((run >> r) | (run << ((size - r) % size))) & mask;
+        let mut value = elem;
+        let mut width = size;
+        while width < 64 {
+            value |= value << width;
+            width *= 2;
+        }
+        Some(value)
+    }
+
+    #[test]
+    fn every_bitmask_immediate_round_trips() {
+        let mut count = 0;
+        for n in 0..2 {
+            for immr in 0..64 {
+                for imms in 0..64 {
+                    let Some(value) = decode_bit_masks(n, immr, imms) else { continue };
+                    let (en, er, es) = logical_imm(value, 64)
+                        .unwrap_or_else(|| panic!("{n} {immr} {imms}: {value:#x}"));
+                    assert_eq!(decode_bit_masks(en, er, es), Some(value), "{value:#x}");
+                    count += 1;
+                }
+            }
+        }
+        assert!(count >= 5334, "{count}"); // distinct values, some with several encodings
+    }
+
+    #[test]
+    fn bitmask_immediates_reject_other_values() {
+        // Random values, and runs with a bit flipped: any accepted value must decode back.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for i in 0..200_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let v = if i % 2 == 0 { x } else { (u64::MAX >> (x % 64)) ^ (1 << (x >> 58)) };
+            if let Some((n, immr, imms)) = logical_imm(v, 64) {
+                assert_eq!(decode_bit_masks(n, immr, imms), Some(v), "{v:#x}");
+            }
+        }
     }
 
     #[test]
