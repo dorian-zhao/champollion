@@ -127,20 +127,18 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             let v = load_value(mem, addr, amo_load_width(width))
                 .map_err(|fault| Trap::LoadFault { pc, fault })?;
             cpu.set_x(rd, v);
-            cpu.reservation = Some((addr, v));
+            (cpu.reserved_addr, cpu.reserved_value) = (addr, v);
         }
         Inst::Sc { width, rd, rs1, rs2, .. } => {
             let addr = atomic_addr(cpu, rs1, width)?;
             let size = amo_bytes(width);
             let mask = if size == 4 { 0xffff_ffff } else { u64::MAX };
-            let stored = match cpu.reservation {
-                Some((a, v)) if a == addr => mem
-                    .compare_exchange(addr, size, v & mask, cpu.x(rs2) & mask)
-                    .map_err(|fault| Trap::StoreFault { pc, fault })?,
-                _ => false,
-            };
+            let stored = cpu.reserved_addr == addr
+                && mem
+                    .compare_exchange(addr, size, cpu.reserved_value & mask, cpu.x(rs2) & mask)
+                    .map_err(|fault| Trap::StoreFault { pc, fault })?;
             cpu.set_x(rd, if stored { 0 } else { 1 });
-            cpu.reservation = None;
+            cpu.reserved_addr = crate::cpu::NO_RESERVATION;
         }
         Inst::Amo { op, width, rd, rs1, rs2, .. } => {
             let addr = atomic_addr(cpu, rs1, width)?;
@@ -645,7 +643,7 @@ mod tests {
         let (cpu, mem) = exec(&[lr_d, sc_d], &regs);
         assert_eq!(cpu.x[13], 0);
         assert_eq!(mem.bytes()[0x800], 0x55);
-        assert_eq!(cpu.reservation, None);
+        assert_eq!(cpu.reserved_addr, crate::cpu::NO_RESERVATION);
 
         // sc without lr fails (rd != 0) and does not store.
         let (cpu, mem) = exec(&[sc_d], &regs);
@@ -667,7 +665,7 @@ mod tests {
         cpu.set_x(11, DATA);
         step(&mut cpu, &mem).unwrap();
         assert_eq!(cpu.x[10], 0xffff_ffff_8000_0000);
-        assert_eq!(cpu.reservation, Some((DATA, 0xffff_ffff_8000_0000)));
+        assert_eq!((cpu.reserved_addr, cpu.reserved_value), (DATA, 0xffff_ffff_8000_0000));
     }
 
     #[test]

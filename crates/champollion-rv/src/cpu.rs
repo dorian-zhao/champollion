@@ -1,5 +1,9 @@
 //! Architectural state of one RISC-V hart.
 
+/// `reserved_addr` when no reservation is held. Never a valid atomic address: atomics are
+/// naturally aligned.
+pub const NO_RESERVATION: u64 = u64::MAX;
+
 /// Register file and control state for a single RV64GC hart.
 ///
 /// `#[repr(C)]` so the JIT and the arm64 trampolines can address fields by fixed offsets.
@@ -15,17 +19,27 @@ pub struct CpuState {
     pub pc: u64,
     /// `fcsr`: `frm` in bits 7:5, `fflags` in bits 4:0.
     pub fcsr: u32,
-    /// `(address, value)` loaded by the last `lr`, cleared by any `sc`. `sc` succeeds only
-    /// if memory still holds `value` (checked with a host compare-and-swap), so stores by
-    /// other threads in between make it fail, as on real hardware (except for ABA).
-    pub reservation: Option<(u64, u64)>,
+    /// Address loaded by the last `lr` ([`NO_RESERVATION`] if none), cleared by any `sc`.
+    /// `sc` succeeds only if memory still holds `reserved_value` (checked with a host
+    /// compare-and-swap), so stores by other threads in between make it fail, as on real
+    /// hardware (except for ABA). Plain fields so generated code can reach them.
+    pub reserved_addr: u64,
+    pub reserved_value: u64,
     /// Instructions retired (the `instret` CSR; also what `cycle` reports).
     pub instret: u64,
 }
 
 impl CpuState {
     pub fn new(pc: u64) -> Self {
-        Self { x: [0; 32], f: [0; 32], pc, fcsr: 0, reservation: None, instret: 0 }
+        Self {
+            x: [0; 32],
+            f: [0; 32],
+            pc,
+            fcsr: 0,
+            reserved_addr: NO_RESERVATION,
+            reserved_value: 0,
+            instret: 0,
+        }
     }
 
     #[inline]
