@@ -9,6 +9,13 @@ import subprocess
 import sys
 
 LLVM_MC = "/opt/homebrew/opt/llvm/bin/llvm-mc"
+LLVM_CXXFILT = "/opt/homebrew/opt/llvm/bin/llvm-cxxfilt"
+
+
+def demangle(names):
+    out = subprocess.run([LLVM_CXXFILT], input="\n".join(names), capture_output=True, text=True)
+    lines = out.stdout.splitlines()
+    return lines if len(lines) == len(names) else names
 
 
 def disassemble(words):
@@ -31,8 +38,13 @@ def flush(block_lines, words, counts):
 
 
 def main(path):
+    lines = open(path).read().splitlines()
+    symbols = [i for i, l in enumerate(lines) if l.startswith("  symbol ")]
+    names = demangle([lines[i].split(" ", 4)[4] for i in symbols])
+    for i, name in zip(symbols, names):
+        lines[i] = f"  {int(lines[i].split()[1]):6d} {name}"
     block, words, counts = [], [], []
-    for line in open(path):
+    for line in lines:
         line = line.rstrip("\n")
         if line.startswith("  host "):
             _, w, c = line.split()

@@ -88,7 +88,7 @@ fn main() -> ExitCode {
         },
     };
     if let (Some(path), Some(p)) =
-        (std::env::var_os("RVRUN_PROF"), main_thread.jit.as_ref().and_then(|j| j.profiler.as_ref()))
+        (std::env::var_os("RVRUN_PROF"), main_thread.jit.as_mut().and_then(|j| j.profiler.as_mut()))
         && let Err(e) = std::fs::write(&path, p.report(20))
     {
         eprintln!("rvrun: cannot write profile: {e}");
