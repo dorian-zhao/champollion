@@ -4,12 +4,18 @@ Oct 13, 2026 · Dorian Verlaine
 
 ## Goals and Positioning
 
-Champollion is a user-mode binary translator that runs RISC-V Linux executables directly on macOS arm64, without a VM: `rvrun ./hello`. It is a learning project with no production use case. The goal is to implement CS61C (ISA, CPU) and CS162 (syscalls, threads, virtual memory) in reverse, then add a JIT on top.
+Champollion is a user-mode binary translator that runs RISC-V Linux executables on macOS arm64: `rvrun ./hello`. It has two goals:
 
-- **Route: B-lite.** Run natively on macOS; Linux syscalls are caught by our own runtime and translated into Darwin calls. Start with static, single-threaded programs that use few syscalls.
-- **Why not route A (arm64 Linux VM + binfmt\_misc):** QEMU user mode can already run RISC-V programs inside a VM, so route A would just produce "a faster QEMU." QEMU linux-user does not support macOS as a host, so route B is the open space.
-- **A stays as an escape hatch:** the syscall layer is designed as a `HostOs` trait, so if M5 gets crushed by futex/clone/epoll, a VM-passthrough implementation can be plugged in.
-- **Differences from Rosetta 2:** transparent execution is impossible (macOS has no binfmt\_misc), so a launcher is required; but we borrow Rosetta's strategy of AOT first, JIT to fill the gaps.
+1. **A testing and emulation environment for RISC-V developers on Apple Silicon Macs.** Cross-compile on the Mac, then run and debug the result immediately: `rvrun` as the test runner for `cargo test` / `ctest`, a built-in gdbstub for debugging, no VM to boot and no files to sync.
+2. **A learning project:** implement CS61C (ISA, CPU) and CS162 (syscalls, threads, virtual memory) in reverse, then add a JIT on top.
+
+The plan is **route B first, then route A**, sharing one translation core:
+
+- **Route B (native, primary).** Run directly on macOS; Linux syscalls are caught by our own runtime and translated into Darwin calls. This covers the developer's daily build → test → debug loop with zero startup cost and the Mac's own file system. QEMU linux-user does not support macOS as a host, so this is the open space.
+- **Route A (Linux VM, full compatibility, M6).** An arm64 Linux VM (`Virtualization.framework`) runs the same translator as a binfmt\_misc handler, and syscalls pass through to a real Linux kernel. This covers what B fundamentally cannot: containers, full distribution userlands, `/proc`-heavy and `ptrace`-based tools. It is the model of Rosetta for Linux.
+- **Why both:** B alone tops out at "most developer programs" (an estimated 85–90% of developers' own programs and tests, 60–70% of arbitrary distribution binaries, no containers). WSL1, which took the same approach on Windows, hit the same ceiling and was succeeded by a VM (WSL2). A alone gives up B's instant, integrated developer loop.
+- **Consequence for the core:** the translator must also build and run on arm64 Linux. In particular, JIT code memory must sit behind an interface (macOS: `MAP_JIT` + `pthread_jit_write_protect_np`; Linux: `mprotect` or a dual mapping), decided before M4.
+- **Differences from Rosetta 2:** transparent execution on macOS is impossible (no binfmt\_misc), so B needs a launcher; but we borrow Rosetta's strategy of AOT first, JIT to fill the gaps.
 
 ## Why RISC-V → ARM64 Is Easier Than x86 → ARM64
 
@@ -73,7 +79,7 @@ Rust at the core; ARM64 assembly and Swift at the edges.
 | --- | --- | --- |
 | Translator core, runtime | Rust | A JIT is full of raw pointers, so memory safety is worth a lot; `dynasm-rs` can serve as the ARM64 emitter |
 | Dispatcher, trampolines, context switch | ARM64 assembly (`global_asm!` or `.s`) | Entering and leaving translated blocks needs precise register control |
-| Launcher, future GUI or VM escape hatch | Swift | Smoothest path to `Virtualization.framework` and macOS APIs |
+| Launcher, route A VM host (M6) | Swift | Smoothest path to `Virtualization.framework` and macOS APIs |
 | Test generation, benchmarks | Python | Generate random instruction sequences, run differential comparisons |
 | Building RISC-V test executables | Zig (`zig cc`) | `zig cc -target riscv64-linux-musl -static hello.c -o hello`, no cross toolchain to install |
 | Reference oracle | Spike, QEMU (on Linux) | Compare register state instruction by instruction |
@@ -151,15 +157,16 @@ Do these only once the JIT is correct and the benchmarks run, and pick them by p
 
 ## Milestones
 
-Reaching M4 makes a complete, hardcore project; M5 is a bonus. Each step uses the previous step's interpreter as its correctness baseline.
+Each step uses the previous step's interpreter as its correctness baseline. M1–M5 are route B; M6 is route A.
 
 | Milestone | Content | Done when | Course |
 | --- | --- | --- | --- |
 | M1 | RV64I decoder + interpreter | Passes `riscv-tests` rv64ui | CS61C |
-| M2 | ELF loader (auxv, initial stack) + about 10 syscalls + common C instructions | A static `hello` built with `zig cc` prints on the Mac | CS162 |
-| M3 | M, A, F, D extensions, rest of C + remaining syscalls | Runs a static `lua` or `sqlite` | CS61C |
+| M2 | M, A, C extensions + guest address space + ELF loader (auxv, initial stack) + core syscalls | A static `hello` built with `zig cc` prints on the Mac | CS162 |
+| M3 | F, D, Zicsr, Zifencei + remaining syscalls + gdbstub + test-runner integration | Runs a static `lua` or `sqlite`; `cargo test` for a riscv64 target runs through `rvrun` | CS61C |
 | M4 | Basic-block JIT, block chaining, indirect-jump optimization, AOT cache | Zero differences in differential tests against the interpreter; clear benchmark speedup | Extracurricular |
-| M5 | Multithreading, `futex`, signals, dynamic linking | Runs multithreaded programs | CS162 |
+| M5 | Multithreading, `futex`, signals, dynamic linking (with a riscv64 sysroot) | Runs multithreaded programs and Go binaries | CS162 |
+| M6 | Route A: arm64 Linux VM via `Virtualization.framework`, translator as binfmt\_misc handler, Linux syscall passthrough | A riscv64 Docker image runs on the Mac | CS162 |
 
 ## Testing Strategy
 
@@ -177,6 +184,8 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 ## Decision Log
 
+- **Oct 14, 2026 — Route B first, then route A as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. B covers the daily build → test → debug loop best (instant, no VM, Mac file system); A (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux; see [Goals and Positioning](#goals-and-positioning).
+- **Oct 14, 2026 — M and A move into M2.** The static musl `hello` already uses `mul`, `divu`, `lr.w`, and `sc.w`.
 - **Oct 13, 2026 — RV64 only.** RV32 is not supported; see [Instruction Set Scope](#instruction-set-scope).
 - **Oct 13, 2026 — C extension moves into M2.** Real binaries are full of compressed instructions, so `hello` cannot run without them.
 - **Oct 13, 2026 — Guest address-space layout is decided in M2.** Guest memory lives at a fixed host offset (identity mapping collides with `__PAGEZERO`), and the layout dictates the JIT's memory addressing; see [Performance Strategy](#performance-strategy).
