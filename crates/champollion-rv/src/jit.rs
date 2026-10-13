@@ -175,7 +175,7 @@ impl Jit {
         if let Some(&at) = self.blocks.get(&pc) {
             return Ok(Some(at));
         }
-        let block = decode_block(mem, pc)?;
+        let block = decode_block(mem, pc, false)?;
         for attempt in 0..2 {
             let word = (self.code.used() / 4) as i64;
             let cache = self.jump_cache.as_ptr() as u64;
@@ -287,7 +287,7 @@ impl Jit {
                 exit::ECALL => return Trap::Ecall { pc: cpu.pc },
                 exit::INTERPRET => {
                     if self.stats.detailed
-                        && let Ok(block) = decode_block(mem, cpu.pc)
+                        && let Ok(block) = decode_block(mem, cpu.pc, false)
                     {
                         *self.stats.interpreted.entry(kind(&block[0].0)).or_default() += 1;
                     }
@@ -389,6 +389,32 @@ mod tests {
             jalr(0, 1, 0),     // 0x24: indirect, back to 0x08
         ]);
         assert_eq!((cpu.x[10], cpu.x[1], cpu.x[7]), (101, CODE + 8, CODE));
+    }
+
+    #[test]
+    fn side_exits_match_the_interpreter() {
+        // One block with two mid-block branches; the loop takes each both ways, so side
+        // exits (with their instret correction) and fall-through paths both run.
+        let (_, cpu) = same_as_interpreter(&[
+            addi(10, 10, 1),      // 0x00: a0 += 1
+            op_imm(7, 12, 10, 1), // 0x04: andi a2, a0, 1
+            beq(12, 0, 8),        // 0x08: even -> 0x10 (side exit)
+            addi(13, 13, 1),      // 0x0c: a3 += 1 (odd)
+            addi(14, 0, 5),       // 0x10: a4 = 5
+            b(4, 10, 14, -0x14),  // 0x14: blt a0, a4, 0x00 (side exit, backward)
+            store(3, 11, 10, 0),  // 0x18: sd a0, 0(a1)
+            ECALL,                // 0x1c
+        ]);
+        assert_eq!((cpu.x[10], cpu.x[13]), (5, 3));
+        // A fault after a mid-block branch fell through.
+        let (trap, cpu) = same_as_interpreter(&[
+            addi(10, 0, 1),       // a0 = 1
+            beq(10, 0, 8),        // not taken
+            load(3, 12, 0, 0x40), // ld a2, 0x40(zero): faults
+            ECALL,
+        ]);
+        assert!(matches!(trap, Trap::LoadFault { .. }));
+        assert_eq!(cpu.instret, 2);
     }
 
     #[test]

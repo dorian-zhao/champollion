@@ -84,7 +84,7 @@ impl BlockCache {
         if let Some(&i) = self.by_pc.get(&pc) {
             return Ok(i);
         }
-        let insts = decode_block(tm, pc)?;
+        let insts = decode_block(tm, pc, true)?;
         let i = self.blocks.len() as u32;
         self.blocks.push(CachedBlock { insts, successors: [(0, u32::MAX); 2] });
         self.by_pc.insert(pc, i);
@@ -103,22 +103,21 @@ pub struct Engine {
 
 /// Whether `inst` may change the pc non-sequentially (or must end a block for another
 /// reason), so nothing after it belongs to the same block.
-fn ends_block(inst: Inst) -> bool {
-    matches!(
-        inst,
-        Inst::Jal { .. }
-            | Inst::Jalr { .. }
-            | Inst::Branch { .. }
-            | Inst::Ecall
-            | Inst::Ebreak
-            | Inst::FenceI
-    )
+/// Whether `inst` ends a block; conditional branches do only if `at_branches`.
+fn ends_block(inst: Inst, at_branches: bool) -> bool {
+    match inst {
+        Inst::Jal { .. } | Inst::Jalr { .. } | Inst::Ecall | Inst::Ebreak | Inst::FenceI => true,
+        Inst::Branch { .. } => at_branches,
+        _ => false,
+    }
 }
 
 /// Decode the block starting at `pc`. Fails only if its very first instruction cannot be
 /// fetched or decoded, with the same trap `interpreter::step` would raise; later failures
 /// just end the block early, so the trap is raised when execution actually gets there.
-pub(crate) fn decode_block(mem: &impl Memory, pc: u64) -> Result<Block, Trap> {
+/// With `at_branches` false, the block continues past conditional branches (the JIT
+/// leaves through a side exit when one is taken).
+pub(crate) fn decode_block(mem: &impl Memory, pc: u64, at_branches: bool) -> Result<Block, Trap> {
     let mut insts = Vec::new();
     let mut at = pc;
     loop {
@@ -140,7 +139,10 @@ pub(crate) fn decode_block(mem: &impl Memory, pc: u64) -> Result<Block, Trap> {
         insts.push((inst, len as u8));
         at += len;
         // Stop at page boundaries so a block never depends on two pages' permissions.
-        if ends_block(inst) || insts.len() == MAX_BLOCK || at.is_multiple_of(GUEST_PAGE_SIZE) {
+        if ends_block(inst, at_branches)
+            || insts.len() == MAX_BLOCK
+            || at.is_multiple_of(GUEST_PAGE_SIZE)
+        {
             break;
         }
     }

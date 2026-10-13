@@ -171,6 +171,10 @@ enum Tail {
     /// Leave mid-block to interpret the instruction at `pc`, of which `retired_before`
     /// instructions of this block had retired (instret is corrected accordingly).
     Interpret { pc: u64, retired_before: u32 },
+    /// A taken conditional branch in the middle of a block, of which `retired_before`
+    /// instructions had retired (including the branch): correct instret, then a chainable
+    /// jump to `pc`.
+    Side { pc: u64, retired_before: u32 },
     /// Continue at the pc computed into `ADDR` (a jump-cache miss).
     Dynamic,
 }
@@ -198,6 +202,8 @@ struct Tx {
     retired: u32,
     /// Host address of the jump cache.
     jump_cache: u64,
+    /// Chainable exits inside tails (side exits): instruction index and target pc.
+    tail_exits: Vec<(usize, Option<u64>)>,
     /// Guest register whose host address (see [`ADDR_MASK`]) is in `ADDR`, if any.
     addr_base: Option<u8>,
     /// Whether the access being translated has its base register reused by a later one.
@@ -925,6 +931,19 @@ impl Tx {
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, code as u16, 0);
                 }
+                Tail::Side { pc, retired_before } => {
+                    let undo = self.retired - retired_before;
+                    if undo > 0 {
+                        self.a.sub_imm(INSTRET_REG, INSTRET_REG, undo);
+                    }
+                    // Chained later; until then it falls through into the exit below.
+                    let b = self.a.pos();
+                    self.a.b(b + 1);
+                    self.tail_exits.push((b, Some(pc)));
+                    self.a.mov_imm(ADDR, pc);
+                    self.a.str_off(ADDR, CTX, PC);
+                    self.a.movz(EXIT_CODE, exit::NEXT as u16, 0);
+                }
                 Tail::Interpret { pc, retired_before } => {
                     // The block added all its instructions to instret at entry.
                     self.a.sub_imm(INSTRET_REG, INSTRET_REG, self.retired - retired_before);
@@ -961,7 +980,11 @@ fn mem_base(inst: Inst) -> Option<u8> {
 fn keeps_addr(inst: Inst) -> bool {
     use AluOp::{Div, Divu, Mulhsu, Rem, Remu};
     match inst {
-        Inst::Lui { .. } | Inst::Auipc { .. } | Inst::OpImm { .. } | Inst::OpImm32 { .. } => true,
+        Inst::Lui { .. }
+        | Inst::Auipc { .. }
+        | Inst::OpImm { .. }
+        | Inst::OpImm32 { .. }
+        | Inst::Branch { .. } => true,
         Inst::Op { op, .. } => !matches!(op, Mulhsu | Div | Divu | Rem | Remu),
         Inst::Op32 { op, .. } => {
             !matches!(op, AluOp32::Div | AluOp32::Divu | AluOp32::Rem | AluOp32::Remu)
@@ -1024,6 +1047,7 @@ pub fn translate(
         accesses: Vec::new(),
         retired: 0,
         jump_cache,
+        tail_exits: Vec::new(),
         addr_base: None,
         base_reused: false,
     };
@@ -1092,12 +1116,23 @@ pub fn translate(
                     BranchCond::Geu => Cond::Hs,
                 };
                 retired += 1;
+                let target = at.wrapping_add(sext(offset));
+                if i + 1 < block.len() {
+                    // Not the end of the block: fall through into the rest of it, and
+                    // leave through a side exit when taken.
+                    let bcond = tx.a.pos();
+                    tx.a.b_cond(c, bcond); // patched once the tail exists
+                    tx.tails.push((bcond, Tail::Side { pc: target, retired_before: retired }));
+                    tx.retired = retired;
+                    known = None;
+                    at = next;
+                    continue;
+                }
                 // b.cond taken; b fallthrough-tail; taken: b taken-tail
                 let bcond = tx.a.pos();
                 tx.a.b_cond(c, bcond + 2);
                 exits.push((tx.a.pos(), Some(next)));
                 tx.exit(Tail::Static { pc: next, code: exit::NEXT });
-                let target = at.wrapping_add(sext(offset));
                 exits.push((tx.a.pos(), Some(target)));
                 tx.exit(Tail::Static { pc: target, code: exit::NEXT });
                 ended = true;
@@ -1152,6 +1187,7 @@ pub fn translate(
         a.code[0]
     };
     tx.emit_tails();
+    exits.append(&mut tx.tail_exits);
     for &b in &tx.stub_branches {
         let delta = stub_word - (block_word + b as i64);
         tx.a.code[b] = super::arm64::encode_branch_to(tx.a.code[b], delta);
