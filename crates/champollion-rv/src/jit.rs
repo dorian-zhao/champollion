@@ -610,4 +610,341 @@ mod tests {
         assert!(matches!(trap, Trap::Ecall { .. }));
         assert_eq!((cpu.x[12], cpu.x[13], cpu.x[14]), (4, 1, 3));
     }
+
+    /// Differential fuzzing: random programs must leave the JIT and the interpreter in
+    /// exactly the same state (registers, fcsr, reservation, instret, trap, and memory).
+    mod fuzz {
+        use super::*;
+
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                // xorshift64*
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+            fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+                items[self.below(items.len() as u64) as usize]
+            }
+            fn chance(&mut self, one_in: u64) -> bool {
+                self.below(one_in) == 0
+            }
+        }
+
+        /// Base registers, pointing into the data page (only moved by a few bytes, never
+        /// overwritten): a1 (pinned) -> DATA, s0 (pinned) -> DATA + 0x800, t3 (unpinned)
+        /// -> DATA + 0x400. s1 counts loop iterations.
+        const BASES: [(u32, u64); 3] = [(11, DATA), (8, DATA + 0x800), (28, DATA + 0x400)];
+        const COUNTER: u32 = 9;
+
+        fn int_dest(rng: &mut Rng) -> u32 {
+            loop {
+                let r = rng.below(32) as u32;
+                if !matches!(r, 8 | 9 | 11 | 28) {
+                    return r;
+                }
+            }
+        }
+
+        fn reg(rng: &mut Rng) -> u32 {
+            rng.below(32) as u32
+        }
+
+        /// A load or store address: a base register and an offset that stays inside the
+        /// first data page, or rarely any offset (faulting below the data). Random registers
+        /// are no bases: addresses at or above 2^38 alias in generated code (a known
+        /// deviation).
+        fn mem_operand(rng: &mut Rng, size: u64) -> (u32, i32) {
+            let (base, at) = rng.pick(&BASES);
+            if rng.chance(64) {
+                return (base, rng.below(4096) as i32 - 2048);
+            }
+            let addr = DATA + rng.below(0x1000 - size + 1);
+            let addr = if rng.chance(4) { addr } else { addr & !(size - 1) };
+            (base, (addr as i64 - at as i64) as i32)
+        }
+
+        /// A body item: a plain instruction, or a forward jump whose target is chosen once
+        /// the body is laid out (so jumps only ever land on the first word of an item).
+        enum Item {
+            Plain(u32),
+            /// Conditional branch with funct3 and sources.
+            Branch(u32, u32, u32),
+            /// `jal rd`.
+            Jal(u32),
+            /// `auipc t, 0; jalr rd, t, off`: a direct far jump.
+            Direct(u32, u32),
+            /// `auipc t, 0; addi t, t, off; jalr rd, t, 0`: an indirect jump, to an odd
+            /// address (bit 0 is cleared by `jalr`) if the flag is set.
+            Indirect(u32, u32, bool),
+        }
+
+        impl Item {
+            fn len(&self) -> usize {
+                match self {
+                    Item::Direct(..) => 2,
+                    Item::Indirect(..) => 3,
+                    _ => 1,
+                }
+            }
+        }
+
+        fn instruction(rng: &mut Rng) -> Item {
+            use Item::Plain;
+            match rng.below(20) {
+                0..=4 => {
+                    let (f3, f7) = rng.pick(&[
+                        (0, 0),
+                        (0, 0x20),
+                        (1, 0),
+                        (2, 0),
+                        (3, 0),
+                        (4, 0),
+                        (5, 0),
+                        (5, 0x20),
+                        (6, 0),
+                        (7, 0),
+                        (0, 1),
+                        (1, 1),
+                        (2, 1),
+                        (3, 1),
+                        (4, 1),
+                        (5, 1),
+                        (6, 1),
+                        (7, 1),
+                    ]);
+                    Plain(op(f3, f7, int_dest(rng), reg(rng), reg(rng)))
+                }
+                5..=7 => {
+                    let f3 = rng.below(8) as u32;
+                    let imm = match f3 {
+                        1 => rng.below(64) as i32,
+                        5 => rng.below(64) as i32 | if rng.chance(2) { 0x400 } else { 0 },
+                        _ => rng.below(4096) as i32 - 2048,
+                    };
+                    Plain(op_imm(f3, int_dest(rng), reg(rng), imm))
+                }
+                8 => {
+                    let (f3, f7) = rng.pick(&[
+                        (0, 0),
+                        (0, 0x20),
+                        (1, 0),
+                        (5, 0),
+                        (5, 0x20),
+                        (0, 1),
+                        (4, 1),
+                        (5, 1),
+                        (6, 1),
+                        (7, 1),
+                    ]);
+                    if rng.chance(2) {
+                        Plain(op_32(f3, f7, int_dest(rng), reg(rng), reg(rng)))
+                    } else {
+                        let (f3, imm) = match f3 {
+                            1 => (1, rng.below(32) as i32),
+                            5 => (5, rng.below(32) as i32 | if f7 != 0 { 0x400 } else { 0 }),
+                            _ => (0, rng.below(4096) as i32 - 2048),
+                        };
+                        Plain(op_imm_32(f3, int_dest(rng), reg(rng), imm))
+                    }
+                }
+                9 => Plain(if rng.chance(2) {
+                    lui(int_dest(rng), rng.next() as u32)
+                } else {
+                    auipc(int_dest(rng), rng.next() as u32)
+                }),
+                10..=11 => {
+                    let f3 = rng.below(7) as u32;
+                    let (base, off) = mem_operand(rng, 1 << (f3 & 3));
+                    Plain(load(f3, int_dest(rng), base, off))
+                }
+                12..=13 => {
+                    let f3 = rng.below(4) as u32;
+                    let (base, off) = mem_operand(rng, 1 << f3);
+                    Plain(store(f3, base, reg(rng), off))
+                }
+                14 => Item::Branch(rng.pick(&[0, 1, 4, 5, 6, 7]), reg(rng), reg(rng)),
+                15 => Item::Jal(int_dest(rng)),
+                16 if rng.chance(2) => Item::Direct(int_dest(rng), int_dest(rng)),
+                16 => Item::Indirect(int_dest(rng), int_dest(rng), rng.chance(2)),
+                17 => {
+                    // AMOs and lr/sc on aligned data through a base register.
+                    let (base, _) = rng.pick(&BASES);
+                    let f5 = rng.pick(&[0, 1, 2, 3, 4, 8, 12, 16, 20, 24, 28]);
+                    let rs2 = if f5 == 2 { 0 } else { reg(rng) };
+                    Plain(amo(f5, rng.pick(&[2, 3]), int_dest(rng), base, rs2))
+                }
+                18 if rng.chance(2) => {
+                    // Move a base register a little (accesses through it then drift by as
+                    // much, at worst off the page), so cached base addresses go stale.
+                    let (base, _) = rng.pick(&BASES);
+                    Plain(addi(base, base, (rng.below(9) as i32 - 4) * 8))
+                }
+                _ => Plain(fp(rng)),
+            }
+        }
+
+        /// A random F/D instruction, including ones the JIT leaves to the interpreter.
+        fn fp(rng: &mut Rng) -> u32 {
+            let f = |rng: &mut Rng| rng.below(32) as u32;
+            let fmt = rng.below(2) as u32;
+            let rm = rng.pick(&[0, 1, 2, 3, 4, 7, 7, 7]);
+            match rng.below(9) {
+                0 => {
+                    let (base, off) = mem_operand(rng, 4 << fmt);
+                    fload(2 + fmt, f(rng), base, off)
+                }
+                1 => {
+                    let (base, off) = mem_operand(rng, 4 << fmt);
+                    fstore(2 + fmt, base, f(rng), off)
+                }
+                2 => op_fp(rng.below(4) as u32, fmt, rm, f(rng), f(rng), f(rng)),
+                3 => op_fp(0b01011, fmt, rm, f(rng), f(rng), 0),
+                // fsgnj/fsgnjn/fsgnjx, fmin/fmax
+                4 => op_fp(rng.pick(&[4, 4, 5]), fmt, rng.below(3) as u32, f(rng), f(rng), f(rng)),
+                5 => op_fp(0b10100, fmt, rng.below(3) as u32, int_dest(rng), f(rng), f(rng)),
+                6 => op_fp(0b11000, fmt, rm, int_dest(rng), f(rng), rng.below(4) as u32),
+                7 => op_fp(0b11010, fmt, rm, f(rng), reg(rng), rng.below(4) as u32),
+                _ => match rng.below(3) {
+                    0 => op_fp(0b11100, fmt, 0, int_dest(rng), f(rng), 0), // fmv.x.*
+                    1 => op_fp(0b11110, fmt, 0, f(rng), reg(rng), 0),      // fmv.*.x
+                    _ => op_fp(0b01000, fmt, rm, f(rng), f(rng), 1 - fmt), // fcvt.s.d / fcvt.d.s
+                },
+            }
+        }
+
+        /// A loop over a body of about `n` random words, run `COUNTER` times, then `ecall`.
+        /// Jumps only go forward, so every program terminates.
+        fn program(rng: &mut Rng, n: usize) -> Vec<u32> {
+            let mut items = Vec::new();
+            let mut len = 0;
+            while len < n {
+                let item = instruction(rng);
+                len += item.len();
+                items.push(item);
+            }
+            // Word index of each item; the loop tail (at `len`) is a target too.
+            let starts: Vec<usize> = items
+                .iter()
+                .scan(0, |at, item| {
+                    let start = *at;
+                    *at += item.len();
+                    Some(start)
+                })
+                .chain([len])
+                .collect();
+            let mut words = Vec::new();
+            for (k, item) in items.iter().enumerate() {
+                // A byte offset from word `from` to a random item after this one.
+                let mut target = |from: usize| {
+                    let to = starts[k + 1 + rng.below((items.len() - k) as u64) as usize];
+                    ((to - from) * 4) as i32
+                };
+                let at = starts[k];
+                match *item {
+                    Item::Plain(w) => words.push(w),
+                    Item::Branch(f3, rs1, rs2) => words.push(b(f3, rs1, rs2, target(at))),
+                    Item::Jal(rd) => words.push(jal(rd, target(at))),
+                    Item::Direct(t, rd) => {
+                        let off = target(at);
+                        words.extend([auipc(t, 0), jalr(rd, t, off)]);
+                    }
+                    Item::Indirect(t, rd, odd) => {
+                        let off = target(at) + odd as i32;
+                        words.extend([auipc(t, 0), addi(t, t, off), jalr(rd, t, 0)]);
+                    }
+                }
+            }
+            let back = -(words.len() as i32 + 1) * 4;
+            words.push(addi(COUNTER, COUNTER, -1));
+            words.push(b(1, COUNTER, 0, back)); // bne s1, zero, body
+            words.push(ECALL);
+            words
+        }
+
+        /// Bytes of data: a whole host page, so that accesses leaving it fault in generated
+        /// code too (a guest page sharing a host page with a mapped one does not fault).
+        const DATA_SIZE: u64 = 0x4000;
+
+        fn run(prog: &[u32], init: &CpuState, data: &[u8], jit: bool) -> (Trap, CpuState, Vec<u8>) {
+            let mem = setup(prog);
+            mem.map(DATA + 0x1000, DATA_SIZE - 0x1000, Prot::RW).unwrap();
+            mem.write_privileged(DATA, data).unwrap();
+            let mut cpu = init.clone();
+            let trap = if jit {
+                Jit::new().unwrap().run(&mut cpu, &mem)
+            } else {
+                let mut steps = 0;
+                loop {
+                    if let Err(t) = interpreter::step(&mut cpu, &mem) {
+                        break t;
+                    }
+                    steps += 1;
+                    assert!(steps < 1 << 20, "generated program does not terminate");
+                }
+            };
+            let mut out = vec![0; data.len()];
+            mem.read_privileged(DATA, &mut out).unwrap();
+            (trap, cpu, out)
+        }
+
+        #[test]
+        fn random_programs_match_the_interpreter() {
+            // FUZZ_CASES=n runs more (or fewer) cases, FUZZ_SEED=x a different sequence.
+            let env = |name, default| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v: String| {
+                        let v = v.trim_start_matches("0x");
+                        u64::from_str_radix(v, if v.len() > 10 { 16 } else { 10 }).ok()
+                    })
+                    .unwrap_or(default)
+            };
+            let mut rng = Rng(env("FUZZ_SEED", 0x9e37_79b9_7f4a_7c15));
+            for case in 0..env("FUZZ_CASES", 1000) {
+                // Each case: a seed that reproduces it alone (set `rng.0` to it).
+                let seed = rng.0;
+                let n = 16 + rng.below(160) as usize;
+                let prog = program(&mut rng, n);
+                let mut init = CpuState::new(CODE);
+                for r in 1..32 {
+                    init.x[r] = match rng.below(4) {
+                        0 => rng.below(16),
+                        1 => rng.pick(&[
+                            0,
+                            1,
+                            u64::MAX,
+                            i64::MIN as u64,
+                            i64::MAX as u64,
+                            0xffff_ffff,
+                            0x8000_0000,
+                        ]),
+                        _ => rng.next(),
+                    };
+                    init.f[r] = if rng.chance(2) {
+                        rng.next()
+                    } else {
+                        (rng.next() as f64 % 1e6).to_bits()
+                    };
+                }
+                for (base, at) in BASES {
+                    init.x[base as usize] = at;
+                }
+                init.x[COUNTER as usize] = 1 + rng.below(3);
+                init.fcsr = (rng.below(5) as u32) << 5;
+                let data: Vec<u8> = (0..DATA_SIZE).map(|_| rng.next() as u8).collect();
+                let want = run(&prog, &init, &data, false);
+                let got = run(&prog, &init, &data, true);
+                assert_eq!(got.0, want.0, "case {case} (seed {seed:#x}): trap");
+                assert_eq!(got.1, want.1, "case {case} (seed {seed:#x}): state");
+                assert!(got.2 == want.2, "case {case} (seed {seed:#x}): memory");
+            }
+        }
+    }
 }
