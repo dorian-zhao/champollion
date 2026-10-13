@@ -911,6 +911,8 @@ pub fn translate(
     let mut at = pc;
     let mut exits = Vec::new();
     let mut ended = false;
+    // The register the previous instruction set to a constant (`lui`, `auipc`), and its value.
+    let mut known: Option<(u8, u64)> = None;
     for &(inst, len) in block {
         let len = len as u64;
         let next = at + len;
@@ -925,9 +927,25 @@ pub fn translate(
                 break;
             }
             Inst::Jalr { rd, rs1, offset } => {
+                if let Some((_, base)) = known.filter(|&(r, _)| r == rs1) {
+                    // `auipc`/`lui` + `jalr` (a far call or tail call): a direct jump that
+                    // chains like `jal`.
+                    let target = base.wrapping_add(sext(offset)) & !1;
+                    tx.link(rd, next);
+                    retired += 1;
+                    exits.push((tx.a.pos(), Some(target)));
+                    tx.exit(Tail::Static { pc: target, code: exit::NEXT });
+                    ended = true;
+                    break;
+                }
                 // Target first: rd may be rs1.
-                tx.add_imm_to(ADDR, rs1, offset);
-                tx.a.and_imm(ADDR, ADDR, !1).unwrap();
+                if offset == 0 && rs1 != 0 {
+                    let base = tx.src(rs1, SRC0);
+                    tx.a.and_imm(ADDR, base, !1).unwrap();
+                } else {
+                    tx.add_imm_to(ADDR, rs1, offset);
+                    tx.a.and_imm(ADDR, ADDR, !1).unwrap();
+                }
                 tx.link(rd, next);
                 retired += 1;
                 exits.push((tx.a.pos(), None));
@@ -986,6 +1004,11 @@ pub fn translate(
             }
         }
         tx.retired = retired;
+        known = match inst {
+            Inst::Lui { rd, imm } if rd != 0 => Some((rd, sext(imm))),
+            Inst::Auipc { rd, imm } if rd != 0 => Some((rd, at.wrapping_add(sext(imm)))),
+            _ => None,
+        };
         at = next;
     }
     if !ended {

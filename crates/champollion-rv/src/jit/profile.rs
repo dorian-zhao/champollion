@@ -94,6 +94,9 @@ impl Profiler {
     /// Forget recorded blocks and their samples when the JIT resets (their code is about to
     /// be overwritten). Resets are rare, so the report covers the run after the last one.
     pub fn reset(&mut self) {
+        if self.blocks.is_empty() {
+            return; // nothing translated, nothing sampled in generated code
+        }
         self.blocks.clear();
         for c in self.samples.per_insn.iter() {
             c.store(0, Relaxed);

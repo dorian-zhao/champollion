@@ -375,6 +375,23 @@ mod tests {
     }
 
     #[test]
+    fn auipc_and_lui_jumps_become_direct() {
+        let (_, cpu) = same_as_interpreter(&[
+            auipc(1, 0),       // 0x00: ra = CODE
+            jalr(1, 1, 17),    // 0x04: -> 0x10 (bit 0 cleared), ra = 0x08; rd == rs1
+            addi(10, 10, 100), // 0x08
+            ECALL,             // 0x0c
+            addi(10, 0, 1),    // 0x10
+            lui(7, 0x10),      // 0x14: t2 = CODE
+            jalr(0, 7, 0x24),  // 0x18: -> 0x24
+            0,                 // 0x1c (skipped)
+            0,                 // 0x20 (skipped)
+            jalr(0, 1, 0),     // 0x24: indirect, back to 0x08
+        ]);
+        assert_eq!((cpu.x[10], cpu.x[1], cpu.x[7]), (101, CODE + 8, CODE));
+    }
+
+    #[test]
     fn atomics_match_the_interpreter() {
         let (lr_d, sc_d, lr_w, sc_w) = (0b00010, 0b00011, 0b00010, 0b00011);
         // a1 = DATA. lr/sc success, sc without a reservation, sc to another address,
