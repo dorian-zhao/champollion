@@ -274,6 +274,7 @@ impl Jit {
                 continue;
             };
             self.stats.entries += 1;
+            self.code.commit();
             let code = {
                 let _active = fault::Active::enter(&self.faults);
                 unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at), fpcr) }

@@ -1,7 +1,10 @@
 //! Executable memory for generated code.
 //!
-//! One fixed region per JIT, filled bump-style and reset wholesale on flush. The platform
-//! details sit behind [`CodeBuffer::write`]:
+//! One fixed region per JIT, filled bump-style and reset wholesale on flush. Writes collect
+//! until [`CodeBuffer::commit`], which must run before generated code does: switching the
+//! region between writable and executable and invalidating the instruction cache cost
+//! barriers, so they happen once per batch rather than once per write (a block and the
+//! branches chained to it). The platform details sit behind `write` and `commit`:
 //!
 //! - macOS: the region is mapped `MAP_JIT`, and each thread toggles it between writable and
 //!   executable with `pthread_jit_write_protect_np` (W^X per thread); `sys_icache_invalidate`
@@ -17,7 +20,14 @@ pub struct CodeBuffer {
     base: *mut u8,
     size: usize,
     used: usize,
+    /// Byte ranges written since the last commit.
+    dirty: Vec<(usize, usize)>,
+    /// Whether this thread has the region writable (macOS).
+    writable: bool,
 }
+
+/// Instruction cache line size, for merging nearby dirty ranges.
+const LINE: usize = 64;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -44,7 +54,7 @@ impl CodeBuffer {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { base: base.cast(), size, used: 0 })
+        Ok(Self { base: base.cast(), size, used: 0, dirty: Vec::new(), writable: false })
     }
 
     pub fn base(&self) -> *const u8 {
@@ -77,24 +87,54 @@ impl CodeBuffer {
         Some(at)
     }
 
-    /// Overwrite already generated code at `at` (e.g. to chain a branch).
+    /// Overwrite already generated code at `at` (e.g. to chain a branch). Takes effect for
+    /// execution at the next [`CodeBuffer::commit`].
     pub fn write(&mut self, at: CodeOffset, words: &[u32]) {
         let len = words.len() * 4;
         assert!(at.is_multiple_of(4) && at + len <= self.size);
         // SAFETY: the range is inside our mapping. On macOS, making it writable affects only
-        // this thread, which is not executing it while we write.
+        // this thread, which runs no generated code until `commit`.
         unsafe {
-            let dst = self.base.add(at);
             #[cfg(target_os = "macos")]
-            libc::pthread_jit_write_protect_np(0);
-            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), dst, len);
-            #[cfg(target_os = "macos")]
-            {
-                libc::pthread_jit_write_protect_np(1);
-                sys_icache_invalidate(dst.cast(), len);
+            if !self.writable {
+                libc::pthread_jit_write_protect_np(0);
+                self.writable = true;
             }
-            #[cfg(not(target_os = "macos"))]
-            flush_icache(dst, len);
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), self.base.add(at), len);
+        }
+        self.dirty.push((at, at + len));
+    }
+
+    /// Make everything written since the last commit executable and visible to instruction
+    /// fetch. Call before running generated code.
+    pub fn commit(&mut self) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if self.writable {
+            // SAFETY: switching this thread's view of the MAP_JIT region back to executable.
+            unsafe { libc::pthread_jit_write_protect_np(1) };
+            self.writable = false;
+        }
+        self.dirty.sort_unstable();
+        let mut ranges = self.dirty.drain(..);
+        let mut current = ranges.next();
+        for (start, end) in ranges.chain([(usize::MAX, usize::MAX)]) {
+            let Some((lo, hi)) = current else { break };
+            if start <= hi + LINE {
+                current = Some((lo, hi.max(end)));
+                continue;
+            }
+            // SAFETY: the range lies inside our mapping.
+            unsafe {
+                let dst = self.base.add(lo);
+                #[cfg(target_os = "macos")]
+                sys_icache_invalidate(dst.cast(), hi - lo);
+                #[cfg(not(target_os = "macos"))]
+                flush_icache(dst, hi - lo);
+            }
+            current = Some((start, end));
         }
     }
 
@@ -111,7 +151,6 @@ impl CodeBuffer {
 #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
 unsafe fn flush_icache(start: *mut u8, len: usize) {
     use std::arch::asm;
-    const LINE: usize = 64;
     let begin = start as usize & !(LINE - 1);
     let end = start as usize + len;
     // SAFETY: cache maintenance by virtual address on mapped memory.
@@ -146,6 +185,7 @@ mod tests {
         a.mov_imm(0, 42);
         a.ret();
         let at = buf.append(&a.code).unwrap();
+        buf.commit();
         // SAFETY: the buffer holds a valid function with the C ABI: `mov x0, #42; ret`.
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buf.ptr(at)) };
         assert_eq!(f(), 42);
@@ -153,6 +193,7 @@ mod tests {
         let mut a = Asm::new();
         a.mov_imm(0, 7);
         buf.write(at, &a.code);
+        buf.commit();
         assert_eq!(f(), 7, "patched code is visible to instruction fetch");
         assert!(buf.contains(buf.ptr(at) as usize));
     }
