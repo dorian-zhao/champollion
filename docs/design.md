@@ -159,13 +159,23 @@ Do these only once the JIT is correct and the benchmarks run, and pick them by p
 
 A CPU-bound C benchmark (sieve, array traffic, integer hashing; 228 M guest instructions), Apple silicon, release build:
 
-| Configuration | Speed | Time |
-| --- | --- | --- |
-| Native arm64 | — | 29.5 ms |
-| Interpreter, thread-safe `GuestMemory` | 41 MIPS | 5.6 s |
-| Interpreter, lock and permission checks removed (experiment only) | 147 MIPS | 1.55 s |
+| Configuration | Speed | Time | vs. native |
+| --- | --- | --- | --- |
+| Native arm64 | — | 29.5–37 ms | 1× |
+| Reference interpreter, thread-safe `GuestMemory` | 41 MIPS | 5.6 s | ~150× slower |
+| Same, lock and permission checks removed (experiment only) | 147 MIPS | 1.55 s | — |
+| **Engine: block cache + software TLB + chaining** | **~270 MIPS** | **0.85 s** | **~23× slower** |
 
-The interpreter runs at about 0.5% of native. That is expected: speed comes from the JIT (M4), as it does for QEMU's TCG. The per-access lock and B-tree lookup cost the interpreter 3.6×, mostly on instruction fetch; see [Concurrency Model](#concurrency-model) for how to recover that without giving up thread safety.
+The per-access lock and B-tree lookup cost the reference interpreter 3.6×, mostly on instruction fetch. The engine (below) recovers that and more without giving up thread safety. Closing the remaining gap is the JIT's job (M4), as it is for QEMU's TCG.
+
+### What we borrow from Rosetta 2
+
+Rosetta 2 has no interpreter for ordinary code; it translates. Two of its principles still shape our interpreter:
+
+- **Translate once, per block, and cache by guest pc.** The engine decodes each basic block once and runs the cached `Inst`s; blocks are chained to their recent successors. M4 keeps this exact cache (same key, same invalidation by mapping generation and `fence.i`) and swaps decoded `Inst`s for arm64 code.
+- **No checks on the hot path.** Rosetta runs x86 code in the same address space as arm64 code, so memory accesses need no translation and faults come from the MMU. Safe Rust cannot recover from a host fault mid-interpreter, so the engine approximates this with a per-thread software TLB; the JIT will use the real thing (base register + host fault handler).
+
+Profile of the engine (`sample`): ~63% instruction dispatch in `execute`, ~15% block lookup and loop, the rest loads/stores. Further interpreter gains would need threaded code; we stop here and invest in the JIT.
 
 ## Concurrency Model
 
@@ -185,7 +195,7 @@ The locks and per-access permission checks above belong to the **interpreter onl
 - **JIT atomics** are single ARM64 LSE instructions (`ldadd`, `swp`, `cas`, ...); `lr`/`sc` become `ldaxr`/`stlxr` or a `cas` against the reserved value.
 - **JIT fences** map RISC-V `pred`/`succ` sets to the cheapest sufficient `dmb` variant (`ish`, `ishld`, `ishst`).
 
-To speed up the interpreter later without changing any interface: a per-thread software TLB (guest page → host pointer and permissions) plus a predecoded-block cache, both invalidated by a global mapping-generation counter bumped on every mapping change. With threads, `munmap` must then wait until every running thread has observed the new generation before it decommits host pages.
+The engine (M2) adds a per-thread software TLB and a decoded-block cache, both invalidated by a global mapping-generation counter bumped on every mapping change, without changing any interface. With threads (M5), `munmap` must wait until every running thread has observed the new generation before it decommits host pages, since TLB hits skip the lock.
 
 ## Milestones
 
@@ -218,6 +228,7 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 ## Decision Log
 
 - **Oct 14, 2026 — Route B first, then route A as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. B covers the daily build → test → debug loop best (instant, no VM, Mac file system); A (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux; see [Goals and Positioning](#goals-and-positioning).
+- **Oct 14, 2026 — Fast interpreter before M3.** A decoded-block cache with chaining plus a software TLB takes the CPU benchmark from 41 to ~270 MIPS (6.6×), and is the cache structure the JIT will reuse; see [What we borrow from Rosetta 2](#what-we-borrow-from-rosetta-2).
 - **Oct 14, 2026 — The runtime is thread-ready from M2.** Process/thread split, `&self` memory with atomic accesses, host atomics for AMOs and `lr`/`sc`, and lock-free host I/O on raw guest buffers; see [Concurrency Model](#concurrency-model). Locks stay interpreter-only.
 - **Oct 14, 2026 — F/D data movement moves into M2.** musl's `printf` saves FP registers and moves bits with `fmv`/`fsgnj`, so every program that prints needs them; FP arithmetic stays in M3.
 - **Oct 14, 2026 — M and A move into M2.** The static musl `hello` already uses `mul`, `divu`, `lr.w`, and `sc.w`.
