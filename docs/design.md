@@ -256,13 +256,13 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 ## Open Questions
 
-- **Keep masking guest addresses?** The mask is what keeps a guest from reaching host memory outside its reservation, as a sandbox would; QEMU linux-user does not mask. It costs Lua 5% and SQLite 3%, on pointer chasing.
 - Crate name is `champollion-rv` (crates.io: no existing crate as of Oct 13, 2026); CLI is `rvrun`.
 - Introduce an IR from the start, or lift directly to ARM64 until M4?
 - **M6 foundation:** build route A on [apple/containerization](https://github.com/apple/containerization) (the package behind [apple/container](https://github.com/apple/container))? It already provides per-container VMs on `Virtualization.framework`, a fast-booting kernel config, the `vminitd` init, ext4 and OCI image handling, and runs linux/amd64 images through Rosetta, which is structurally what we need for riscv64. Unverified: whether a custom binfmt\_misc handler can be registered without forking it. Requires macOS 26+.
 
 ## Decision Log
 
+- **Oct 14, 2026 — Generated code keeps masking guest addresses.** The mask keeps a guest from reaching host memory outside its reservation, as a sandbox would (QEMU linux-user does not mask). It costs Lua 5% and SQLite 3%, on pointer chasing; isolation is worth more than that.
 - **Oct 14, 2026 — `instret` stays exact.** Counted per block in x30, it costs under 1% (removing it entirely measured 0.6–0.8%), so there is no case for a cheaper approximate mode.
 - **Oct 14, 2026 — No return-address prediction for guest returns.** We translated guest calls to `bl` into a call stub with a landing pad, and returns to `ret` through the jump cache, as Rosetta 2 does. The first version made recursive code 2× slower: overlapping blocks each had their own landing pad for the same call, so the `bl` pushed one pad while the jump cache held another and every return mispredicted. With one shared stub per call the mispredicts were gone (no profile samples on landing pads), but Lua, SQLite, and Rust tests ended within ±3% of plain `br`: Apple's indirect predictor already predicts our returns well, and the stubs cost a host register (t2 went back to memory). Dropped; revisit for call-heavy C++ code with many callers per function.
 - **Oct 14, 2026 — Mask the base register, not the sum, behind guard pages.** Generated loads and stores mask a base register once into the guest space and reuse the host address across accesses with immediate offsets. Offsets can then reach up to 32 KiB past either end of the guest space, so the reservation has 64 KiB guard regions there; such accesses fault with their true address instead of wrapping.
