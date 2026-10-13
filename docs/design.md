@@ -120,7 +120,7 @@ Performance is protected in three layers: define what "fast" means and measure i
 - **Workloads:** CoreMark, Embench, a few lua benchmark scripts, and sqlite's `speedtest1`.
 - **Regression tracking:** time with `hyperfine`, store results in the repository, and from M4 onward run the suite on every JIT-related commit.
 - **JIT counters:** blocks translated, direct-chain ratio, indirect-jump lookup miss rate, and dispatcher re-entries. Performance problems usually show up here before they show up in wall-clock time.
-- **Profiling:** Instruments (Time Profiler, CPU Counters) or `samply`. The JIT should emit a symbol map so profiles can show guest function names.
+- **Profiling:** host profilers cannot attribute samples inside generated code, so `RVRUN_PROF=FILE` runs our own sampler: a thread suspends the guest thread every 0.5 ms and records its pc (per host instruction in generated code, symbolized with `dladdr` elsewhere). `tools/jitprof.py FILE` disassembles the hottest blocks next to their guest code with per-instruction counts. `/usr/bin/time -l` gives instructions retired and cycles, which tell instruction-count problems (low IPC is not our issue) from latency problems.
 
 ### Architecture That Sets the Ceiling
 
@@ -129,10 +129,10 @@ These must be decided before M4; changing them later means rewriting the JIT.
 | Area | Approach | Why it matters |
 | --- | --- | --- |
 | Register mapping | Pin the ~20 most used guest registers in host registers; spill the rest to `CpuState` | The single largest factor. Not 1:1, because `x18` is reserved on macOS and `x29`, `x30`, and `sp` are spoken for; pick by usage frequency |
-| Memory addressing | Keep the guest memory base in a host register and use register-offset addressing (`ldr x, [base, xN]`) with no software bounds checks | Out-of-range accesses are caught by host page protection instead of per-access checks |
+| Memory addressing | Keep the guest memory base in a host register; mask the guest base register into the guest space, add the memory base once per base register, and use immediate offsets (`ldr x, [x17, #off]`), with guard pages around the guest space and no software bounds checks | Out-of-range accesses are caught by host page protection instead of per-access checks; runs of stack accesses cost one instruction each |
 | Block chaining | Once a direct branch target is translated, patch the branch to jump straight to it | Hot loops never return to the dispatcher |
-| Indirect jumps | Inline hash-table lookup in generated code for `jalr`; a shadow return stack to predict `ret` | Calls and switch jump tables are typically a translator's biggest bottleneck |
-| Lazy state | Write back `pc` only at block exits; compute `instret` and `cycle` only when the guest reads them | Avoids per-instruction overhead |
+| Indirect jumps | Inline jump-cache lookup in generated code for `jalr`; constant targets (`auipc`/`lui` + `jalr`) chain like `jal` | Calls and switch jump tables are typically a translator's biggest bottleneck. A return-address stack was tried and dropped (see the decision log) |
+| Lazy state | Write back `pc` only at block exits; count `instret` per block in a host register | Avoids per-instruction overhead; exact `instret` costs under 1% |
 | Self-modifying code | Write-protect translated pages and invalidate on fault | Zero cost in the common case |
 | AOT cache | Persist translations to `~/Library/Caches` | Removes translation warmup from startup |
 
@@ -179,18 +179,27 @@ Real program (Lua 5.4 running a fib + table sort + concat script, 1.94 G guest i
 
 ### JIT progress (M4, Oct 14, 2026)
 
-| Step | C benchmark | Lua script | SQLite (300k-row insert, index, aggregates) |
-| --- | --- | --- | --- |
-| Native arm64 | 29.5 ms | 96 ms | 182 ms |
-| Engine (interpreter) | 28.5× slower | 106× slower | — |
-| JIT, no chaining | 10.2× slower | 113× slower | — |
-| + direct block chaining | 1.6× slower | 75× slower | — |
-| + inline jump cache, code generation | 1.5× slower | 69× slower | — |
-| + FP moves, lr/sc, AMOs translated | **1.5× slower** | **2.7× slower** | **3.0× slower** |
+| Step | C benchmark | n-body (FP) | Lua script | SQLite (300k-row insert, index, aggregates) |
+| --- | --- | --- | --- | --- |
+| Native arm64 | 29.9 ms | 71.9 ms | 97.6 ms | 187 ms |
+| Engine (interpreter) | 28.5× slower | — | 106× slower | — |
+| JIT, no chaining | 10.2× slower | — | 113× slower | — |
+| + direct block chaining | 1.6× slower | — | 75× slower | — |
+| + inline jump cache, code generation | 1.5× slower | — | 69× slower | — |
+| + FP moves, lr/sc, AMOs translated | 1.5× slower | 7.6× slower | 2.7× slower | 3.0× slower |
+| + FP arithmetic on the host FPU, FP registers pinned | 1.55× slower | 1.52× slower | 2.7× slower | 2.9× slower |
+| + `instret` in x30, t0–t2 pinned | 1.53× slower | 1.43× slower | 2.6× slower | 2.2× slower |
+| + direct `auipc`/`lui` + `jalr`, probe inlined | 1.49× slower | 1.39× slower | 2.3× slower | 2.1× slower |
+| + base-register address cache | **1.48× slower** | **1.36× slower** | **2.2× slower** | **1.98× slower** |
 
-FP-heavy code (n-body, double precision, 2M steps): native 73 ms. With FP arithmetic interpreted per instruction the JIT needed ~357 s (extrapolated from 1% of the work); with FP arithmetic translated it takes 554 ms, **7.6× slower**. Floating-point registers still live in `CpuState`, so every FP operation loads its operands and stores its result; pinning them in host vector registers is the next step.
+JIT statistics (`RVRUN_STATS=1`) drove the steps up to FP: they showed Lua flushing the JIT on each data `mmap`, then 8.3M instructions bouncing through the interpreter. The sampling profiler (`RVRUN_PROF`) drove the rest:
 
-JIT statistics (`RVRUN_STATS=1`) drove every step after chaining: they showed Lua flushing the JIT on each data `mmap`, then 8.3M instructions bouncing through the interpreter. Remaining gaps: FP arithmetic is still interpreted, ~600k dispatcher round trips remain on Lua (jump-cache misses and unchained exits), each costing a full register save/restore, and every block pays an `instret` read-modify-write. Interpreters like Lua are dominated by indirect jumps (their own dispatch loop), which break into short blocks that our chaining cannot link; this is the workload M4's indirect-jump prediction and inline lookup must fix.
+- SQLite's hottest loops (string and memory compares) spilled t0–t2 through `CpuState` on every use, so frequency counts alone had picked the wrong registers to pin.
+- The `instret` load-add-store at every block entry made a store-to-load forwarding chain through all blocks; in a register it costs one `add`.
+- Far calls (`auipc` + `jalr`) went through the jump cache although their target is a constant.
+- Prologues and epilogues are runs of stack accesses, each paying add, mask, and a register-offset access.
+
+Lua and SQLite now run at a higher IPC than native (5.6 vs. 4.5–4.9 instructions per cycle) but execute 2.5× the instructions: 1.2× from RISC-V needing more instructions than arm64, the rest our expansion. Instructions off the critical path are nearly free on these wide cores (a leaner jump-cache probe and canonical `mov`s measured no change); what still costs is per-block overhead (exits, branch tails) and latency chains. Masking each new base register costs Lua 5% and SQLite 3% on pointer chasing.
 
 The per-access lock and B-tree lookup cost the reference interpreter 3.6×, mostly on instruction fetch. The engine (below) recovers that and more without giving up thread safety. Closing the remaining gap is the JIT's job (M4), as it is for QEMU's TCG.
 
@@ -247,11 +256,16 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 ## Open Questions
 
+- **Keep masking guest addresses?** The mask is what keeps a guest from reaching host memory outside its reservation, as a sandbox would; QEMU linux-user does not mask. It costs Lua 5% and SQLite 3%, on pointer chasing.
 - Crate name is `champollion-rv` (crates.io: no existing crate as of Oct 13, 2026); CLI is `rvrun`.
 - Introduce an IR from the start, or lift directly to ARM64 until M4?
 - **M6 foundation:** build route A on [apple/containerization](https://github.com/apple/containerization) (the package behind [apple/container](https://github.com/apple/container))? It already provides per-container VMs on `Virtualization.framework`, a fast-booting kernel config, the `vminitd` init, ext4 and OCI image handling, and runs linux/amd64 images through Rosetta, which is structurally what we need for riscv64. Unverified: whether a custom binfmt\_misc handler can be registered without forking it. Requires macOS 26+.
 
 ## Decision Log
+
+- **Oct 14, 2026 — `instret` stays exact.** Counted per block in x30, it costs under 1% (removing it entirely measured 0.6–0.8%), so there is no case for a cheaper approximate mode.
+- **Oct 14, 2026 — No return-address prediction for guest returns.** We translated guest calls to `bl` into a call stub with a landing pad, and returns to `ret` through the jump cache, as Rosetta 2 does. The first version made recursive code 2× slower: overlapping blocks each had their own landing pad for the same call, so the `bl` pushed one pad while the jump cache held another and every return mispredicted. With one shared stub per call the mispredicts were gone (no profile samples on landing pads), but Lua, SQLite, and Rust tests ended within ±3% of plain `br`: Apple's indirect predictor already predicts our returns well, and the stubs cost a host register (t2 went back to memory). Dropped; revisit for call-heavy C++ code with many callers per function.
+- **Oct 14, 2026 — Mask the base register, not the sum, behind guard pages.** Generated loads and stores mask a base register once into the guest space and reuse the host address across accesses with immediate offsets. Offsets can then reach up to 32 KiB past either end of the guest space, so the reservation has 64 KiB guard regions there; such accesses fault with their true address instead of wrapping.
 
 - **Oct 14, 2026 — Route B first, then route A as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. B covers the daily build → test → debug loop best (instant, no VM, Mac file system); A (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux; see [Goals and Positioning](#goals-and-positioning).
 - **Oct 14, 2026 — M3 done; gdbstub runs on the reference interpreter.** `rvrun -g PORT` serves the GDB remote protocol through the `gdbstub` crate. While attached, the guest single-steps on the oracle interpreter, so breakpoints (kept on our side, code is never patched), stepping, and Ctrl-C are exact; detaching hands the guest back to the engine. Only x0–x31 and pc are exposed for now (the stock RISC-V target description); FP registers need a custom description.
