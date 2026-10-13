@@ -144,6 +144,7 @@ ARM64 hardware lines up with RISC-V floating-point semantics closely enough that
 - **`fflags`:** the cumulative exception bits in ARM's `FPSR` map one-to-one onto RISC-V `fflags` (IOC→NV, DZC→DZ, OFC→OF, UFC→UF, IXC→NX). Hardware accumulates them; read `FPSR` only when the guest reads `fflags`.
 - **Rounding modes:** static rounding modes encoded in the instruction map to ARM instruction variants (e.g. `fcvtzs` / `fcvtms`); dynamic `frm` is written to `FPCR` only when it changes.
 - **Exception:** NaN-boxing checks (a single-precision value requires the upper 32 bits to be all ones) have no hardware equivalent. Track the type held in each register at translation time to elide most of them.
+- **JIT deviation (tininess):** ARM detects tininess before rounding, RISC-V after. The interpreter's `fpu` module recomputes the rare affected results with SoftFloat, but generated code does not: when a result rounds to exactly ±the smallest normal, the JIT may raise UF where RISC-V does not. Results are identical; only that flag can differ.
 
 ### Peephole Optimizations (Later)
 
@@ -186,6 +187,8 @@ Real program (Lua 5.4 running a fib + table sort + concat script, 1.94 G guest i
 | + direct block chaining | 1.6× slower | 75× slower | — |
 | + inline jump cache, code generation | 1.5× slower | 69× slower | — |
 | + FP moves, lr/sc, AMOs translated | **1.5× slower** | **2.7× slower** | **3.0× slower** |
+
+FP-heavy code (n-body, double precision, 2M steps): native 73 ms. With FP arithmetic interpreted per instruction the JIT needed ~357 s (extrapolated from 1% of the work); with FP arithmetic translated it takes 554 ms, **7.6× slower**. Floating-point registers still live in `CpuState`, so every FP operation loads its operands and stores its result; pinning them in host vector registers is the next step.
 
 JIT statistics (`RVRUN_STATS=1`) drove every step after chaining: they showed Lua flushing the JIT on each data `mmap`, then 8.3M instructions bouncing through the interpreter. Remaining gaps: FP arithmetic is still interpreted, ~600k dispatcher round trips remain on Lua (jump-cache misses and unchained exits), each costing a full register save/restore, and every block pays an `instret` read-modify-write. Interpreters like Lua are dominated by indirect jumps (their own dispatch loop), which break into short blocks that our chaining cannot link; this is the workload M4's indirect-jump prediction and inline lookup must fix.
 
