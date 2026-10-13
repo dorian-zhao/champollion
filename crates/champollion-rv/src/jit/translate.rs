@@ -4,17 +4,24 @@
 //!
 //! | host | use |
 //! | --- | --- |
-//! | x0–x13, x19–x26 | 22 guest registers, pinned (see [`HOST_REG`]) |
+//! | x0–x13, x19–x26, x29 | 23 guest registers, pinned (see [`HOST_REG`]) |
 //! | x14, x15 | scratch for unpinned sources |
 //! | x16 | scratch for unpinned destinations; exit code on the way to the exit stub |
 //! | x17 | scratch for addresses and jump targets |
 //! | x18 | untouched (reserved by macOS) |
 //! | x27 | host address of guest memory (`GuestMemory::host_base`) |
 //! | x28 | `&mut CpuState` |
-//! | x29, x30, sp | host frame, link register, and stack |
+//! | x30 | `CpuState::instret` |
+//! | sp | host stack |
+//!
+//! Generated code never calls, so it needs neither a frame pointer nor a link register and
+//! takes both x29 and x30. Keeping `instret` in a register matters: as a memory counter, its
+//! load-add-store at every block entry forms a store-to-load forwarding chain through all
+//! blocks, several cycles per block.
 //!
 //! The pinned set was chosen by measuring dynamic register use on a C benchmark, Lua, and
-//! SQLite: a0–a7, sp, ra, and s0–s11 cover all three; t0–t6, gp, and tp were each under 1%.
+//! SQLite: a0–a7, sp, ra, and s0–s9 are common to all three, and t0–t2 carry SQLite's hot
+//! string and memory loops. s10, s11, t3–t6, gp, and tp are each about 1% or less.
 //!
 //! Block layout: an `instret` update, the translated body, then one out-of-line *tail* per
 //! exit. Every exit leaves the body through a plain `b` to its tail, so a later chaining step
@@ -38,6 +45,8 @@ const DST: Reg = 16;
 const ADDR: Reg = 17;
 /// Register carrying the exit code into the exit stub.
 pub const EXIT_CODE: Reg = 16;
+/// Register holding `CpuState::instret` while generated code runs.
+pub const INSTRET_REG: Reg = 30;
 
 /// Host register holding each guest register, or `None` if it lives in [`CpuState`].
 pub const HOST_REG: [Option<Reg>; 32] = {
@@ -54,10 +63,13 @@ pub const HOST_REG: [Option<Reg>; 32] = {
     map[18] = Some(12); // s2
     map[19] = Some(13); // s3
     let mut j = 0;
-    while j < 8 {
-        map[20 + j] = Some(19 + j as Reg); // s4–s11 -> x19–x26
+    while j < 6 {
+        map[20 + j] = Some(19 + j as Reg); // s4–s9 -> x19–x24
         j += 1;
     }
+    map[5] = Some(25); // t0
+    map[6] = Some(26); // t1
+    map[7] = Some(29); // t2
     map
 };
 
@@ -842,9 +854,7 @@ impl Tx {
                 }
                 Tail::Interpret { pc, retired_before } => {
                     // The block added all its instructions to instret at entry.
-                    self.a.ldr_off(DST, CTX, INSTRET);
-                    self.a.sub_imm(DST, DST, self.retired - retired_before);
-                    self.a.str_off(DST, CTX, INSTRET);
+                    self.a.sub_imm(INSTRET_REG, INSTRET_REG, self.retired - retired_before);
                     self.a.mov_imm(ADDR, pc);
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, exit::INTERPRET as u16, 0);
@@ -895,9 +905,7 @@ pub fn translate(
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
     let instret_at = tx.a.pos();
-    tx.a.ldr_off(DST, CTX, INSTRET);
-    tx.a.add_imm(DST, DST, 0); // patched below
-    tx.a.str_off(DST, CTX, INSTRET);
+    tx.a.add_imm(INSTRET_REG, INSTRET_REG, 0); // patched below
 
     let mut retired = 0u32;
     let mut at = pc;
@@ -986,9 +994,9 @@ pub fn translate(
         tx.exit(Tail::Static { pc: at, code: exit::NEXT });
     }
     tx.retired = retired;
-    tx.a.code[instret_at + 1] = {
+    tx.a.code[instret_at] = {
         let mut a = Asm::new();
-        a.add_imm(DST, DST, retired);
+        a.add_imm(INSTRET_REG, INSTRET_REG, retired);
         a.code[0]
     };
     tx.emit_tails();
@@ -1025,7 +1033,6 @@ pub fn trampoline() -> (Vec<u32>, usize) {
     for pair in [(8, 9), (10, 11), (12, 13), (14, 15)] {
         a.stp_pre_d(pair.0, pair.1, 31, -16);
     }
-    a.add_imm(29, 31, 0); // frame pointer = sp
     a.mov(CTX, 0);
     a.mov(MEMBASE, 1);
     a.mov(ADDR, 2);
@@ -1039,10 +1046,12 @@ pub fn trampoline() -> (Vec<u32>, usize) {
             a.ldr_fp(Fp::D, *h, CTX, f_offset(guest as u8));
         }
     }
+    a.ldr_off(INSTRET_REG, CTX, INSTRET);
     a.br(ADDR);
 
     // Exit stub: generated code branches here with the exit code in EXIT_CODE.
     let stub = a.pos();
+    a.str_off(INSTRET_REG, CTX, INSTRET);
     for (guest, host) in HOST_REG.iter().enumerate() {
         if let Some(h) = host {
             a.str_off(*h, CTX, x_offset(guest as u8));

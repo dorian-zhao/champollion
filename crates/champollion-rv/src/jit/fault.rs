@@ -3,10 +3,10 @@
 //! Generated loads and stores access guest memory directly, so a guest access to an
 //! unmapped page faults on the host (`SIGSEGV`/`SIGBUS`). The handler installed here checks
 //! that the faulting host pc is a load or store the translator recorded, then rewrites the
-//! interrupted context: the guest pc and `instret` are set to the faulting instruction's,
-//! and the host pc is sent to the shared exit stub with a fault exit code. On return from
-//! the signal, the stub saves the pinned guest registers as usual, so the guest state is
-//! exactly as the interpreter would leave it at the fault.
+//! interrupted context: the guest pc and `instret` (in its host register) are set to the
+//! faulting instruction's, and the host pc is sent to the shared exit stub with a fault
+//! exit code. On return from the signal, the stub saves the pinned guest registers as
+//! usual, so the guest state is exactly as the interpreter would leave it at the fault.
 //!
 //! Faults anywhere else (or in code that is not a recorded access) are passed to the
 //! handler that was installed before ours, e.g. Rust's stack-overflow reporter.
@@ -15,7 +15,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use super::translate::{CTX, EXIT_CODE, MEMBASE, exit};
+use super::translate::{CTX, EXIT_CODE, INSTRET_REG, MEMBASE, exit};
 use crate::cpu::CpuState;
 
 /// What generated code was doing at a recorded host instruction.
@@ -123,7 +123,9 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
         let regs = &mut (*mc).__ss.__x;
         let cpu = regs[CTX as usize] as *mut CpuState;
         (*cpu).pc = site.guest_pc;
-        (*cpu).instret -= site.instret_undo as u64;
+        // x30 is `lr` in the thread state.
+        const _: () = assert!(INSTRET_REG == 30);
+        (*mc).__ss.__lr -= site.instret_undo as u64;
         let far = (*mc).__es.__far;
         t.fault_addr.set(far.wrapping_sub(regs[MEMBASE as usize]));
         regs[EXIT_CODE as usize] = if site.store { exit::FAULT_STORE } else { exit::FAULT_LOAD };
