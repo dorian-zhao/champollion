@@ -238,6 +238,7 @@ pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
         Err(e) => (-(e as i64)) as u64,
     };
     t.cpu.pc += 4;
+    t.cpu.instret += 1;
     Flow::Continue
 }
 

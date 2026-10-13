@@ -19,11 +19,13 @@ pub struct CpuState {
     /// if memory still holds `value` (checked with a host compare-and-swap), so stores by
     /// other threads in between make it fail, as on real hardware (except for ABA).
     pub reservation: Option<(u64, u64)>,
+    /// Instructions retired (the `instret` CSR; also what `cycle` reports).
+    pub instret: u64,
 }
 
 impl CpuState {
     pub fn new(pc: u64) -> Self {
-        Self { x: [0; 32], f: [0; 32], pc, fcsr: 0, reservation: None }
+        Self { x: [0; 32], f: [0; 32], pc, fcsr: 0, reservation: None, instret: 0 }
     }
 
     #[inline]

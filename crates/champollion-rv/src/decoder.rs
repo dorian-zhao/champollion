@@ -1,7 +1,8 @@
 //! RISC-V instruction decoder.
 //!
-//! Covers RV64I, M, A, C (see [`compressed`]), and the data-movement subset of F and D
-//! (loads, stores, `fmv`, `fsgnj`), and Zifencei; floating-point arithmetic is M3.
+//! Covers RV64I, M, A, C (see [`compressed`]), Zicsr (for the CSRs user programs can
+//! reach), Zifencei, and the data-movement subset of F and D (loads, stores, `fmv`,
+//! `fsgnj`); floating-point arithmetic is M3.
 //!
 //! Immediates are stored already sign-extended (`lui`/`auipc` already shifted left by 12),
 //! and branch/jump offsets are byte offsets relative to the instruction's own pc. Every
@@ -13,6 +14,8 @@
 /// - `OpImm32` / `Op32` (`*w` ops): operate on the low 32 bits, sign-extend the result.
 /// - `Fence`: `pred`/`succ` are IORW bit sets; `fm` is 0b1000 for `fence.tso`.
 /// - `FenceI` (Zifencei): make this hart's earlier stores visible to its instruction fetches.
+/// - `Csr`: `src` is `rs1`, or the 5-bit immediate if `imm`. Only CSRs in [`Csr`] decode, and
+///   writes to read-only ones are rejected here, so execution never sees an illegal access.
 /// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
 ///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
 /// - `FLoad` / `FStore` / `FSgnj`: register numbers name `f` registers, except `rs1` of the
@@ -33,6 +36,7 @@ pub enum Inst {
     Op32 { op: AluOp32, rd: u8, rs1: u8, rs2: u8 },
     Fence { fm: u8, pred: u8, succ: u8 },
     FenceI,
+    Csr { op: CsrOp, csr: Csr, rd: u8, src: u8, imm: bool },
     Ecall,
     Ebreak,
     Lr { width: AmoWidth, rd: u8, rs1: u8, aq: bool, rl: bool },
@@ -145,6 +149,44 @@ pub enum AmoOp {
     Max,
     Minu,
     Maxu,
+}
+
+/// `csrrw` (swap), `csrrs` (set bits), `csrrc` (clear bits), and their immediate forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsrOp {
+    Rw,
+    Rs,
+    Rc,
+}
+
+/// The CSRs reachable from user mode that we implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Csr {
+    Fflags,
+    Frm,
+    Fcsr,
+    Cycle,
+    Time,
+    Instret,
+}
+
+impl Csr {
+    fn from_number(n: u32) -> Option<Csr> {
+        Some(match n {
+            0x001 => Csr::Fflags,
+            0x002 => Csr::Frm,
+            0x003 => Csr::Fcsr,
+            0xc00 => Csr::Cycle,
+            0xc01 => Csr::Time,
+            0xc02 => Csr::Instret,
+            _ => return None,
+        })
+    }
+
+    /// CSR numbers with bits 11:10 = 0b11 are read-only.
+    fn read_only(self) -> bool {
+        matches!(self, Csr::Cycle | Csr::Time | Csr::Instret)
+    }
 }
 
 mod compressed;
@@ -417,6 +459,20 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
         }
         // fence.i: imm, rs1, and rd are reserved and ignored, like fence's.
         MISC_MEM if f3 == 0b001 => Inst::FenceI,
+        SYSTEM if f3 != 0b000 && f3 != 0b100 => {
+            let csr = Csr::from_number(w >> 20).ok_or(DecodeError::Illegal(w))?;
+            let op = match f3 & 0b11 {
+                0b01 => CsrOp::Rw,
+                0b10 => CsrOp::Rs,
+                _ => CsrOp::Rc,
+            };
+            // csrrw always writes; csrrs/csrrc write unless the source is x0 / 0.
+            let writes = op == CsrOp::Rw || rs1 != 0;
+            if writes && csr.read_only() {
+                return illegal;
+            }
+            Inst::Csr { op, csr, rd, src: rs1, imm: f3 & 0b100 != 0 }
+        }
         SYSTEM if w == ECALL => Inst::Ecall,
         SYSTEM if w == EBREAK => Inst::Ebreak,
         _ => return illegal,
@@ -572,29 +628,32 @@ mod tests {
     fn rejects_reserved_encodings() {
         let illegal = [
             0xffff_ffff,
-            0x0000_607f,                        // unknown major opcode
-            jalr(1, 2, 0) | 0b001 << 12,        // jalr with funct3 != 0
-            b(0b010, 1, 2, 8),                  // branch funct3 010
-            load(0b111, 1, 2, 0),               // ldu does not exist
-            store(0b100, 1, 2, 0),              // sq is RV128
-            op_imm(0b001, 1, 2, 0x400 | 3),     // slli with funct6 != 0
-            op_imm(0b101, 1, 2, 0x200 | 3),     // srli/srai with bad funct6
-            op(0b001, 0b010_0000, 1, 2, 3),     // "subl"
-            op(0b000, 0b000_0011, 1, 2, 3),     // unassigned funct7
-            op_32(0b001, 0b000_0001, 1, 2, 3),  // no mulhw
-            op_imm_32(0b001, 1, 2, 32),         // slliw with shamt[5] set
-            op_imm_32(0b101, 1, 2, 0x400 | 32), // sraiw with shamt[5] set
-            op_32(0b010, 0, 1, 2, 3),           // no sltw
-            0x0020_0073,                        // uret-shaped SYSTEM encoding
-            0x0000_1073,
-            fload(0b001, 1, 2, 0),                // flh: Zfh
+            0x0000_607f,                          // unknown major opcode
+            jalr(1, 2, 0) | 0b001 << 12,          // jalr with funct3 != 0
+            b(0b010, 1, 2, 8),                    // branch funct3 010
+            load(0b111, 1, 2, 0),                 // ldu does not exist
+            store(0b100, 1, 2, 0),                // sq is RV128
+            op_imm(0b001, 1, 2, 0x400 | 3),       // slli with funct6 != 0
+            op_imm(0b101, 1, 2, 0x200 | 3),       // srli/srai with bad funct6
+            op(0b001, 0b010_0000, 1, 2, 3),       // "subl"
+            op(0b000, 0b000_0011, 1, 2, 3),       // unassigned funct7
+            op_32(0b001, 0b000_0001, 1, 2, 3),    // no mulhw
+            op_imm_32(0b001, 1, 2, 32),           // slliw with shamt[5] set
+            op_imm_32(0b101, 1, 2, 0x400 | 32),   // sraiw with shamt[5] set
+            op_32(0b010, 0, 1, 2, 3),             // no sltw
+            0x0020_0073,                          // uret-shaped SYSTEM encoding
+            0x0000_1073,           // csrrw on ustatus: not a user-mode CSR we implement
+            fload(0b001, 1, 2, 0), // flh: Zfh
             op_fp(0b00000, 0b01, 0b111, 1, 2, 3), // fadd.d: arithmetic is M3
             op_fp(0b11100, 0b01, 0b000, 1, 2, 3), // fmv.x.d with rs2 != 0
-            op_fp(0b00100, 0b10, 0b000, 1, 2, 3), // fsgnj.h: Zfh                        // csrrw: Zicsr, not yet
-            amo(0b00010, 0b010, 1, 2, 3),         // lr.w with rs2 != 0
-            amo(0b00000, 0b000, 1, 2, 3),         // amoadd.b: Zabha
-            amo(0b00101, 0b011, 1, 2, 3),         // amocas.d: Zacas
-            amo(0b00110, 0b010, 1, 2, 3),         // unassigned funct5
+            op_fp(0b00100, 0b10, 0b000, 1, 2, 3), // fsgnj.h: Zfh
+            0xc000_1073,           // csrrw cycle: read-only CSR
+            0xc011_6073,           // csrrsi time, 2: writes a read-only CSR
+            0x0010_4073,           // SYSTEM funct3 100: reserved
+            amo(0b00010, 0b010, 1, 2, 3), // lr.w with rs2 != 0
+            amo(0b00000, 0b000, 1, 2, 3), // amoadd.b: Zabha
+            amo(0b00101, 0b011, 1, 2, 3), // amocas.d: Zacas
+            amo(0b00110, 0b010, 1, 2, 3), // unassigned funct5
         ];
         for w in illegal {
             assert_eq!(decode(w), Err(DecodeError::Illegal(w)), "{w:#010x}");

@@ -2,8 +2,8 @@
 
 use crate::cpu::CpuState;
 use crate::decoder::{
-    self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, DecodeError, FWidth, Inst, LoadWidth,
-    SgnjKind, StoreWidth,
+    self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, DecodeError, FWidth, Inst,
+    LoadWidth, SgnjKind, StoreWidth,
 };
 use crate::memory::{MemFault, Memory};
 
@@ -98,6 +98,22 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         // This interpreter fetches from memory on every step, so it has no stale code to
         // discard; the caching engine flushes its decoded blocks here.
         Inst::FenceI => {}
+        Inst::Csr { op, csr, rd, src, imm } => {
+            let operand = if imm { src as u64 } else { cpu.x(src) };
+            let old = read_csr(cpu, csr);
+            // The decoder already rejected writes to read-only CSRs; csrrs/csrrc with a
+            // zero source do not write at all.
+            let writes = op == CsrOp::Rw || src != 0;
+            if writes {
+                let new = match op {
+                    CsrOp::Rw => operand,
+                    CsrOp::Rs => old | operand,
+                    CsrOp::Rc => old & !operand,
+                };
+                write_csr(cpu, csr, new);
+            }
+            cpu.set_x(rd, old);
+        }
         Inst::Ecall => return Err(Trap::Ecall { pc }),
         Inst::Ebreak => return Err(Trap::Ebreak { pc }),
         // Atomics map onto host atomics (sequentially consistent, which covers every aq/rl
@@ -169,7 +185,39 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         }
     }
     cpu.pc = next;
+    cpu.instret = cpu.instret.wrapping_add(1);
     Ok(())
+}
+
+/// `time` ticks at 10 MHz, the timebase QEMU's `virt` machine reports, counted from the
+/// host's monotonic clock.
+fn host_time() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: ts is a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 10_000_000 + ts.tv_nsec as u64 / 100
+}
+
+fn read_csr(cpu: &CpuState, csr: Csr) -> u64 {
+    let fcsr = cpu.fcsr as u64;
+    match csr {
+        Csr::Fflags => fcsr & 0x1f,
+        Csr::Frm => (fcsr >> 5) & 0b111,
+        Csr::Fcsr => fcsr & 0xff,
+        // No cycle model: report retired instructions, which is monotonic and cheap.
+        Csr::Cycle | Csr::Instret => cpu.instret,
+        Csr::Time => host_time(),
+    }
+}
+
+fn write_csr(cpu: &mut CpuState, csr: Csr, v: u64) {
+    let v = v as u32;
+    cpu.fcsr = match csr {
+        Csr::Fflags => (cpu.fcsr & !0x1f) | (v & 0x1f),
+        Csr::Frm => (cpu.fcsr & !0xe0) | ((v & 0b111) << 5),
+        Csr::Fcsr => v & 0xff,
+        Csr::Cycle | Csr::Time | Csr::Instret => unreachable!("read-only, rejected by decode"),
+    };
 }
 
 /// Effective address of an atomic, which must be naturally aligned.
@@ -740,6 +788,46 @@ mod tests {
             step(&mut cpu, &mem).unwrap();
             assert_eq!(cpu.f[3], want, "case {i}");
         }
+    }
+
+    #[test]
+    fn csr_read_modify_write() {
+        // csrrw/csrrs/csrrc and immediates on fflags/frm/fcsr, which share one register.
+        let csr =
+            |f3: u32, rd: u32, rs1: u32, n: u32| n << 20 | rs1 << 15 | f3 << 12 | rd << 7 | 0x73;
+        let (fflags, frm, fcsr) = (0x001, 0x002, 0x003);
+        let (cpu, _) = exec(
+            &[
+                csr(0b001, 10, 11, fcsr),        // csrrw a0, fcsr, a1 (a1 = 0x1ff): a0 = 0
+                csr(0b010, 12, 0, fflags),       // csrrs a2, fflags, zero: a2 = 0x1f, no write
+                csr(0b010, 13, 0, frm),          // frrm a3: a3 = 0b111
+                csr(0b111, 0, 0b00101, fflags),  // csrrci zero, fflags, 5
+                csr(0b101, 14, 0b00001, frm),    // csrrwi a4, frm, 1: a4 = 7
+                csr(0b110, 15, 0b00010, fflags), // csrrsi a5, fflags, 2: a5 = 0x1a
+                csr(0b010, 16, 0, fcsr),         // frcsr a6
+            ],
+            &[(11, 0x1ff)],
+        );
+        assert_eq!(cpu.x[10], 0);
+        assert_eq!(cpu.x[12], 0x1f, "fcsr keeps only 8 bits");
+        assert_eq!(cpu.x[13], 0b111);
+        assert_eq!(cpu.x[14], 0b111);
+        assert_eq!(cpu.x[15], 0x1a);
+        assert_eq!(cpu.x[16], 1 << 5 | 0x1a);
+        assert_eq!(cpu.fcsr, 1 << 5 | 0x1a);
+    }
+
+    #[test]
+    fn counters() {
+        let csr = |rd: u32, n: u32| n << 20 | 0b010 << 12 | rd << 7 | 0x73;
+        let (cpu, _) = exec(
+            &[addi(0, 0, 0), csr(10, 0xc02), csr(11, 0xc00), csr(12, 0xc01), csr(13, 0xc01)],
+            &[],
+        );
+        assert_eq!(cpu.x[10], 1, "instret counts instructions retired before it");
+        assert_eq!(cpu.x[11], 2, "cycle reports instret");
+        assert!(cpu.x[12] > 0 && cpu.x[13] >= cpu.x[12], "time is monotonic");
+        assert_eq!(cpu.instret, 5);
     }
 
     #[test]

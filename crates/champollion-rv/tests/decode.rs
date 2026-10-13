@@ -313,3 +313,27 @@ fn rv64fd() {
         &expected,
     );
 }
+
+#[test]
+fn zicsr() {
+    use Inst::Csr as I;
+    use champollion_rv::decoder::Csr::*;
+    use champollion_rv::decoder::CsrOp::*;
+    let expected = [
+        ("csrrw a0, fcsr, a1", I { op: Rw, csr: Fcsr, rd: A0, src: A1, imm: false }),
+        ("csrrs t0, fflags, zero", I { op: Rs, csr: Fflags, rd: T0, src: ZERO, imm: false }),
+        ("csrrc zero, frm, a2", I { op: Rc, csr: Frm, rd: ZERO, src: A2, imm: false }),
+        ("csrrwi a0, frm, 3", I { op: Rw, csr: Frm, rd: A0, src: 3, imm: true }),
+        ("csrrsi a1, fflags, 31", I { op: Rs, csr: Fflags, rd: A1, src: 31, imm: true }),
+        ("csrrci a2, fcsr, 1", I { op: Rc, csr: Fcsr, rd: A2, src: 1, imm: true }),
+        ("csrrs a3, cycle, zero", I { op: Rs, csr: Cycle, rd: A3, src: ZERO, imm: false }),
+        ("csrrs a4, time, zero", I { op: Rs, csr: Time, rd: A4, src: ZERO, imm: false }),
+        ("csrrs a5, instret, zero", I { op: Rs, csr: Instret, rd: A5, src: ZERO, imm: false }),
+        ("csrrc s0, instret, zero", I { op: Rc, csr: Instret, rd: S0, src: ZERO, imm: false }),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/zicsr.s"),
+        include_bytes!("../../../tests/fixtures/zicsr.bin"),
+        &expected,
+    );
+}

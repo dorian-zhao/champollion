@@ -44,7 +44,7 @@ fn main() -> ExitCode {
     let exit = proc.run(&mut main_thread, &host);
     if std::env::var_os("RVRUN_STATS").is_some_and(|v| v != "0") {
         let secs = start.elapsed().as_secs_f64();
-        let n = main_thread.instret;
+        let n = main_thread.cpu.instret;
         eprintln!("[rvrun] {n} instructions in {secs:.3} s = {:.1} MIPS", n as f64 / secs / 1e6);
     }
     match exit {
