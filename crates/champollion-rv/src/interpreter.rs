@@ -40,11 +40,7 @@ pub fn step(cpu: &mut CpuState, mem: &mut impl Memory) -> Result<(), Trap> {
     let pc = cpu.pc;
     let lo = mem.read_u16(pc).map_err(Trap::FetchFault)?;
     let len = decoder::inst_len(lo);
-    let word = if len == 4 {
-        mem.read_u32(pc).map_err(Trap::FetchFault)?
-    } else {
-        lo as u32
-    };
+    let word = if len == 4 { mem.read_u32(pc).map_err(Trap::FetchFault)? } else { lo as u32 };
     let inst = decoder::decode(word).map_err(|err| Trap::IllegalInstruction { pc, err })?;
     execute(cpu, mem, inst, len)
 }
@@ -81,32 +77,17 @@ pub fn execute(
             cpu.set_x(rd, next);
             next = target;
         }
-        Inst::Branch {
-            cond,
-            rs1,
-            rs2,
-            offset,
-        } => {
+        Inst::Branch { cond, rs1, rs2, offset } => {
             if branch_taken(cond, cpu.x(rs1), cpu.x(rs2)) {
                 next = pc.wrapping_add(sext(offset));
             }
         }
-        Inst::Load {
-            width,
-            rd,
-            rs1,
-            offset,
-        } => {
+        Inst::Load { width, rd, rs1, offset } => {
             let addr = cpu.x(rs1).wrapping_add(sext(offset));
             let v = load_value(mem, addr, width).map_err(|fault| Trap::LoadFault { pc, fault })?;
             cpu.set_x(rd, v);
         }
-        Inst::Store {
-            width,
-            rs1,
-            rs2,
-            offset,
-        } => {
+        Inst::Store { width, rs1, rs2, offset } => {
             let addr = cpu.x(rs1).wrapping_add(sext(offset));
             let bytes = cpu.x(rs2).to_le_bytes();
             let n = match width {
@@ -115,8 +96,7 @@ pub fn execute(
                 StoreWidth::W => 4,
                 StoreWidth::D => 8,
             };
-            mem.write(addr, &bytes[..n])
-                .map_err(|fault| Trap::StoreFault { pc, fault })?;
+            mem.write(addr, &bytes[..n]).map_err(|fault| Trap::StoreFault { pc, fault })?;
         }
         Inst::OpImm { op, rd, rs1, imm } => cpu.set_x(rd, alu(op, cpu.x(rs1), sext(imm))),
         Inst::Op { op, rd, rs1, rs2 } => cpu.set_x(rd, alu(op, cpu.x(rs1), cpu.x(rs2))),
@@ -342,42 +322,17 @@ mod tests {
     fn word_ops_sign_extend() {
         // (encoding with rd=a0, rs1=a1, rs2=a2; a1; a2; expected a0)
         let cases = [
-            (
-                op_imm_32(0b000, 10, 11, 1),
-                0x7fff_ffff,
-                0,
-                0xffff_ffff_8000_0000,
-            ), // addiw overflow
+            (op_imm_32(0b000, 10, 11, 1), 0x7fff_ffff, 0, 0xffff_ffff_8000_0000), // addiw overflow
             (op_imm_32(0b000, 10, 11, 0), 0x1_0000_0001, 0, 1), // sext.w drops upper bits
             (op_imm_32(0b001, 10, 11, 31), 1, 0, 0xffff_ffff_8000_0000), // slliw
-            (
-                op_imm_32(0b101, 10, 11, 0),
-                0x8000_0000,
-                0,
-                0xffff_ffff_8000_0000,
-            ), // srliw 0
-            (
-                op_imm_32(0b101, 10, 11, 1),
-                0xffff_ffff_8000_0000,
-                0,
-                0x4000_0000,
-            ), // srliw ignores upper
-            (op_imm_32(0b101, 10, 11, 0x400 | 31), 0x8000_0000, 0, NEG1), // sraiw
+            (op_imm_32(0b101, 10, 11, 0), 0x8000_0000, 0, 0xffff_ffff_8000_0000), // srliw 0
+            (op_imm_32(0b101, 10, 11, 1), 0xffff_ffff_8000_0000, 0, 0x4000_0000), // srliw ignores upper
+            (op_imm_32(0b101, 10, 11, 0x400 | 31), 0x8000_0000, 0, NEG1),         // sraiw
             (op_32(0b000, 0x00, 10, 11, 12), 0xffff_ffff, 1, 0), // addw wraps at 32
-            (op_32(0b000, 0x20, 10, 11, 12), 0, 1, NEG1),       // subw
-            (
-                op_32(0b001, 0x00, 10, 11, 12),
-                1,
-                32 + 31,
-                0xffff_ffff_8000_0000,
-            ), // sllw: low 5 bits
+            (op_32(0b000, 0x20, 10, 11, 12), 0, 1, NEG1),        // subw
+            (op_32(0b001, 0x00, 10, 11, 12), 1, 32 + 31, 0xffff_ffff_8000_0000), // sllw: low 5 bits
             (op_32(0b101, 0x00, 10, 11, 12), NEG1, 4, 0x0fff_ffff), // srlw
-            (
-                op_32(0b101, 0x20, 10, 11, 12),
-                0x8000_0000,
-                4,
-                0xffff_ffff_f800_0000,
-            ), // sraw
+            (op_32(0b101, 0x20, 10, 11, 12), 0x8000_0000, 4, 0xffff_ffff_f800_0000), // sraw
         ];
         for (i, &(w, a, b, want)) in cases.iter().enumerate() {
             assert_eq!(one(w, a, b), want, "case {i}: {:?}", decoder::decode(w));
@@ -448,15 +403,7 @@ mod tests {
         //   0x04: addi a0, a0, 1
         //   0x08: beq  a0, a1, +8      -> exit
         //   0x0c: beq  zero, zero, -8  -> 0x04
-        let (cpu, _) = exec(
-            &[
-                addi(11, 0, 5),
-                addi(10, 10, 1),
-                beq(10, 11, 8),
-                beq(0, 0, -8),
-            ],
-            &[],
-        );
+        let (cpu, _) = exec(&[addi(11, 0, 5), addi(10, 10, 1), beq(10, 11, 8), beq(0, 0, -8)], &[]);
         assert_eq!(cpu.x[10], 5);
     }
 
@@ -506,8 +453,7 @@ mod tests {
     #[test]
     fn loads_extend_correctly() {
         let (mut cpu, mut mem) = setup(&[]);
-        mem.write(DATA, &0x8899_aabb_ccdd_eeffu64.to_le_bytes())
-            .unwrap();
+        mem.write(DATA, &0x8899_aabb_ccdd_eeffu64.to_le_bytes()).unwrap();
         // (funct3, expected)
         let cases = [
             (0b000, 0xffff_ffff_ffff_ffff), // lb  0xff
@@ -571,26 +517,11 @@ mod tests {
         let cases: [(u32, Trap); 5] = [
             (ECALL, Trap::Ecall { pc: BASE + 4 }),
             (EBREAK, Trap::Ebreak { pc: BASE + 4 }),
-            (
-                load(3, 12, 0, 0x10),
-                Trap::LoadFault {
-                    pc: BASE + 4,
-                    fault,
-                },
-            ),
-            (
-                store(3, 0, 10, 0x10),
-                Trap::StoreFault {
-                    pc: BASE + 4,
-                    fault,
-                },
-            ),
+            (load(3, 12, 0, 0x10), Trap::LoadFault { pc: BASE + 4, fault }),
+            (store(3, 0, 10, 0x10), Trap::StoreFault { pc: BASE + 4, fault }),
             (
                 0xffff_ffff,
-                Trap::IllegalInstruction {
-                    pc: BASE + 4,
-                    err: DecodeError::Illegal(0xffff_ffff),
-                },
+                Trap::IllegalInstruction { pc: BASE + 4, err: DecodeError::Illegal(0xffff_ffff) },
             ),
         ];
         for (w, want) in cases {
@@ -605,9 +536,6 @@ mod tests {
 
         let (_, mut mem) = setup(&[]);
         let mut cpu = CpuState::new(0x10);
-        assert_eq!(
-            step(&mut cpu, &mut mem),
-            Err(Trap::FetchFault(MemFault { addr: 0x10 }))
-        );
+        assert_eq!(step(&mut cpu, &mut mem), Err(Trap::FetchFault(MemFault { addr: 0x10 })));
     }
 }

@@ -4,76 +4,25 @@
 //! shifted left by 12), and branch/jump offsets are byte offsets relative to the
 //! instruction's own pc. Every immediate fits in an `i32`, which keeps [`Inst`] at 8 bytes.
 
+/// A decoded instruction.
+///
+/// - `OpImm`: for shifts, `imm` is the shift amount.
+/// - `OpImm32` / `Op32` (`*w` ops): operate on the low 32 bits, sign-extend the result.
+/// - `Fence`: `pred`/`succ` are IORW bit sets; `fm` is 0b1000 for `fence.tso`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inst {
-    Lui {
-        rd: u8,
-        imm: i32,
-    },
-    Auipc {
-        rd: u8,
-        imm: i32,
-    },
-    Jal {
-        rd: u8,
-        offset: i32,
-    },
-    Jalr {
-        rd: u8,
-        rs1: u8,
-        offset: i32,
-    },
-    Branch {
-        cond: BranchCond,
-        rs1: u8,
-        rs2: u8,
-        offset: i32,
-    },
-    Load {
-        width: LoadWidth,
-        rd: u8,
-        rs1: u8,
-        offset: i32,
-    },
-    Store {
-        width: StoreWidth,
-        rs1: u8,
-        rs2: u8,
-        offset: i32,
-    },
-    /// Register-immediate ALU op. For shifts, `imm` is the shift amount.
-    OpImm {
-        op: AluOp,
-        rd: u8,
-        rs1: u8,
-        imm: i32,
-    },
-    Op {
-        op: AluOp,
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    /// `*iw` ops: operate on the low 32 bits, sign-extend the result.
-    OpImm32 {
-        op: AluOp32,
-        rd: u8,
-        rs1: u8,
-        imm: i32,
-    },
-    /// `*w` ops: operate on the low 32 bits, sign-extend the result.
-    Op32 {
-        op: AluOp32,
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    /// `pred`/`succ` are IORW bit sets; `fm` is 0b1000 for `fence.tso`.
-    Fence {
-        fm: u8,
-        pred: u8,
-        succ: u8,
-    },
+    Lui { rd: u8, imm: i32 },
+    Auipc { rd: u8, imm: i32 },
+    Jal { rd: u8, offset: i32 },
+    Jalr { rd: u8, rs1: u8, offset: i32 },
+    Branch { cond: BranchCond, rs1: u8, rs2: u8, offset: i32 },
+    Load { width: LoadWidth, rd: u8, rs1: u8, offset: i32 },
+    Store { width: StoreWidth, rs1: u8, rs2: u8, offset: i32 },
+    OpImm { op: AluOp, rd: u8, rs1: u8, imm: i32 },
+    Op { op: AluOp, rd: u8, rs1: u8, rs2: u8 },
+    OpImm32 { op: AluOp32, rd: u8, rs1: u8, imm: i32 },
+    Op32 { op: AluOp32, rd: u8, rs1: u8, rs2: u8 },
+    Fence { fm: u8, pred: u8, succ: u8 },
     Ecall,
     Ebreak,
 }
@@ -239,15 +188,8 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
     let inst = match w & 0x7f {
         LUI => Inst::Lui { rd, imm: imm_u(w) },
         AUIPC => Inst::Auipc { rd, imm: imm_u(w) },
-        JAL => Inst::Jal {
-            rd,
-            offset: imm_j(w),
-        },
-        JALR if f3 == 0 => Inst::Jalr {
-            rd,
-            rs1,
-            offset: imm_i(w),
-        },
+        JAL => Inst::Jal { rd, offset: imm_j(w) },
+        JALR if f3 == 0 => Inst::Jalr { rd, rs1, offset: imm_i(w) },
         BRANCH => {
             let cond = match f3 {
                 0b000 => BranchCond::Eq,
@@ -258,12 +200,7 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 0b111 => BranchCond::Geu,
                 _ => return illegal,
             };
-            Inst::Branch {
-                cond,
-                rs1,
-                rs2,
-                offset: imm_b(w),
-            }
+            Inst::Branch { cond, rs1, rs2, offset: imm_b(w) }
         }
         LOAD => {
             let width = match f3 {
@@ -276,12 +213,7 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 0b110 => LoadWidth::Wu,
                 _ => return illegal,
             };
-            Inst::Load {
-                width,
-                rd,
-                rs1,
-                offset: imm_i(w),
-            }
+            Inst::Load { width, rd, rs1, offset: imm_i(w) }
         }
         STORE => {
             let width = match f3 {
@@ -291,12 +223,7 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 0b011 => StoreWidth::D,
                 _ => return illegal,
             };
-            Inst::Store {
-                width,
-                rs1,
-                rs2,
-                offset: imm_s(w),
-            }
+            Inst::Store { width, rs1, rs2, offset: imm_s(w) }
         }
         OP_IMM => {
             // RV64 shifts take a 6-bit shamt, leaving funct6 (bits 31:26) as the selector.
@@ -489,44 +416,23 @@ mod tests {
         for imm in [-2048, -1, 0, 1, 2047] {
             assert_eq!(
                 decode(addi(1, 2, imm)),
-                Ok(Inst::OpImm {
-                    op: AluOp::Add,
-                    rd: 1,
-                    rs1: 2,
-                    imm
-                })
+                Ok(Inst::OpImm { op: AluOp::Add, rd: 1, rs1: 2, imm })
             );
             assert_eq!(
                 decode(store(3, 2, 1, imm)),
-                Ok(Inst::Store {
-                    width: StoreWidth::D,
-                    rs1: 2,
-                    rs2: 1,
-                    offset: imm
-                })
+                Ok(Inst::Store { width: StoreWidth::D, rs1: 2, rs2: 1, offset: imm })
             );
         }
         for offset in [-4096, -2, 2, 4094] {
             assert_eq!(
                 decode(beq(3, 4, offset)),
-                Ok(Inst::Branch {
-                    cond: BranchCond::Eq,
-                    rs1: 3,
-                    rs2: 4,
-                    offset
-                })
+                Ok(Inst::Branch { cond: BranchCond::Eq, rs1: 3, rs2: 4, offset })
             );
         }
         for offset in [-(1 << 20), -2, 2, (1 << 20) - 2] {
             assert_eq!(decode(jal(1, offset)), Ok(Inst::Jal { rd: 1, offset }));
         }
-        assert_eq!(
-            decode(lui(1, 0x80000)),
-            Ok(Inst::Lui {
-                rd: 1,
-                imm: i32::MIN
-            })
-        );
+        assert_eq!(decode(lui(1, 0x80000)), Ok(Inst::Lui { rd: 1, imm: i32::MIN }));
     }
 
     #[test]
@@ -562,11 +468,7 @@ mod tests {
         // rd and rs1 set, which software must not do but hardware must tolerate.
         assert_eq!(
             decode(FENCE | 5 << 7 | 6 << 15),
-            Ok(Inst::Fence {
-                fm: 0,
-                pred: 0xf,
-                succ: 0xf
-            })
+            Ok(Inst::Fence { fm: 0, pred: 0xf, succ: 0xf })
         );
     }
 }

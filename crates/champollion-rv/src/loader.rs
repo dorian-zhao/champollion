@@ -128,18 +128,9 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
         }
         let end = offset.checked_add(file_size).ok_or(bad)?;
         let data = file.get(offset as usize..end as usize).ok_or(bad)?;
-        segments.push(Segment {
-            vaddr,
-            mem_size,
-            data,
-            flags: seg_flags,
-        });
+        segments.push(Segment { vaddr, mem_size, data, flags: seg_flags });
     }
-    Ok(Elf {
-        entry,
-        flags,
-        segments,
-    })
+    Ok(Elf { entry, flags, segments })
 }
 
 /// Copy every loadable segment into a single [`FlatMemory`] spanning them all, plus
@@ -167,11 +158,7 @@ mod tests {
         assert!(!elf.segments.is_empty());
         let text = elf.segments.iter().find(|s| s.flags & PF_X != 0).unwrap();
         assert!((text.vaddr..text.vaddr + text.mem_size).contains(&elf.entry));
-        assert!(
-            elf.segments
-                .iter()
-                .all(|s| s.data.len() as u64 <= s.mem_size)
-        );
+        assert!(elf.segments.iter().all(|s| s.data.len() as u64 <= s.mem_size));
     }
 
     #[test]
@@ -184,22 +171,10 @@ mod tests {
             v[off..off + bytes.len()].copy_from_slice(bytes);
             v
         };
-        assert_eq!(
-            parse(&patched(4, &[1])),
-            Err(LoadError::Not64BitLittleEndian)
-        );
-        assert_eq!(
-            parse(&patched(18, &62u16.to_le_bytes())),
-            Err(LoadError::WrongMachine(62))
-        );
-        assert_eq!(
-            parse(&patched(16, &3u16.to_le_bytes())),
-            Err(LoadError::PositionIndependent)
-        );
+        assert_eq!(parse(&patched(4, &[1])), Err(LoadError::Not64BitLittleEndian));
+        assert_eq!(parse(&patched(18, &62u16.to_le_bytes())), Err(LoadError::WrongMachine(62)));
+        assert_eq!(parse(&patched(16, &3u16.to_le_bytes())), Err(LoadError::PositionIndependent));
         // Headers intact, but a segment's file range runs past the end.
-        assert!(matches!(
-            parse(&HELLO[..HELLO.len() / 2]),
-            Err(LoadError::BadSegment { .. })
-        ));
+        assert!(matches!(parse(&HELLO[..HELLO.len() / 2]), Err(LoadError::BadSegment { .. })));
     }
 }

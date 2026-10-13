@@ -19,12 +19,7 @@ pub struct CpuState {
 
 impl CpuState {
     pub fn new(pc: u64) -> Self {
-        Self {
-            x: [0; 32],
-            f: [0; 32],
-            pc,
-            fcsr: 0,
-        }
+        Self { x: [0; 32], f: [0; 32], pc, fcsr: 0 }
     }
 
     #[inline]

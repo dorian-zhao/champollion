@@ -13,9 +13,7 @@ const SYS_EXIT: u64 = 93;
 const MAX_STEPS: u64 = 1_000_000;
 
 fn fixtures(suite: &str) -> Vec<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(suite);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures").join(suite);
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("{}: {e}; run tests/riscv-tests/build.sh", dir.display()))
         .map(|e| e.unwrap().path())
@@ -43,11 +41,7 @@ fn run_test(path: &Path) -> Result<(), String> {
 
 fn run_suite(suite: &str, min_tests: usize) {
     let paths = fixtures(suite);
-    assert!(
-        paths.len() >= min_tests,
-        "{suite}: only {} tests found",
-        paths.len()
-    );
+    assert!(paths.len() >= min_tests, "{suite}: only {} tests found", paths.len());
 
     let failures: Vec<String> = paths
         .iter()

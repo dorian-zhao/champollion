@@ -34,10 +34,7 @@ pub struct FlatMemory {
 
 impl FlatMemory {
     pub fn new(base: u64, size: usize) -> Self {
-        Self {
-            base,
-            bytes: vec![0; size],
-        }
+        Self { base, bytes: vec![0; size] }
     }
 
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, MemFault> {

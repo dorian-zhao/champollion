@@ -6,9 +6,6 @@ fn main() -> ExitCode {
         eprintln!("usage: rvrun <riscv64-linux-elf> [args...]");
         return ExitCode::from(2);
     };
-    eprintln!(
-        "rvrun: ELF loading lands in M2; cannot run {} yet",
-        path.to_string_lossy()
-    );
+    eprintln!("rvrun: ELF loading lands in M2; cannot run {} yet", path.to_string_lossy());
     ExitCode::FAILURE
 }
