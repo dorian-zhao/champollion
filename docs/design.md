@@ -153,7 +153,39 @@ Do these only once the JIT is correct and the benchmarks run, and pick them by p
 
 - **Do not optimize the interpreter.** It is the correctness oracle; clarity beats speed.
 - **Get the data structures right now:** `CpuState` stays `#[repr(C)]` for fixed-offset JIT access, and `Inst` stays small and `Copy`. The `Memory` trait is for the interpreter only; JIT code reaches guest memory through the base register, so the trait never becomes a bottleneck.
-- **Fix the guest address-space layout in M2** (offset and reserved range), since it determines the M4 addressing scheme.
+- **Fix the guest address-space layout in M2** (offset and reserved range), since it determines the M4 addressing scheme. Done: 256 GiB (Sv39 user space) reserved up front, guest address `g` at host `base + g`.
+
+### Baseline (Oct 14, 2026)
+
+A CPU-bound C benchmark (sieve, array traffic, integer hashing; 228 M guest instructions), Apple silicon, release build:
+
+| Configuration | Speed | Time |
+| --- | --- | --- |
+| Native arm64 | — | 29.5 ms |
+| Interpreter, thread-safe `GuestMemory` | 41 MIPS | 5.6 s |
+| Interpreter, lock and permission checks removed (experiment only) | 147 MIPS | 1.55 s |
+
+The interpreter runs at about 0.5% of native. That is expected: speed comes from the JIT (M4), as it does for QEMU's TCG. The per-access lock and B-tree lookup cost the interpreter 3.6×, mostly on instruction fetch; see [Concurrency Model](#concurrency-model) for how to recover that without giving up thread safety.
+
+## Concurrency Model
+
+Threads arrive in M5, but the runtime is shaped for them from M2 so that adding `clone` does not mean redesigning memory, atomics, or the syscall layer.
+
+- **Process vs. thread.** `Process` (shared, `Sync`, used only through `&Process`) owns the address space, the program break, and syscall logging. `Thread` owns `CpuState` (including the `lr` reservation), its tid, and `clear_child_tid`. Each guest thread will run on its own host thread. `exit` ends a thread; `exit_group` ends the process.
+- **Guest memory is shared, never borrowed.** All `Memory` methods take `&self`. Data accesses use relaxed host atomics, which compile to plain `ldr`/`str` on arm64 when aligned, so racing guest threads are the guest's business and never undefined behavior on the host side.
+- **Atomics are host atomics.** AMOs are host compare-and-swap loops (LSE single instructions in the JIT). `lr` records `(address, value)` and `sc` is a host compare-and-swap against that value, as in QEMU; the only deviation from hardware is ABA, which a value-based reservation cannot see. `fence` is a host fence.
+- **The mapping table is behind an `RwLock`.** Interpreter accesses hold the read lock for the duration of one access; `mmap`/`munmap`/`mprotect`/`brk` take the write lock, and "find a free range and map it" is a single atomic step.
+- **Host I/O never holds the lock.** Syscalls validate guest buffers under the lock, release it, and hand raw `GuestBuf`s (layout-compatible with `struct iovec`) to the host kernel. If another thread unmaps the buffer meanwhile, the kernel returns `EFAULT` instead of crashing us, and a blocking `read` cannot deadlock against a concurrent `mmap`. `HostOs` is `&self + Sync`.
+
+### Performance boundary
+
+The locks and per-access permission checks above belong to the **interpreter only**, which is the correctness oracle and the cold-code tier. They must never reach JIT-generated code:
+
+- **JIT loads and stores** are `ldr`/`str` relative to the guest base register, with no lock and no software permission check. Accesses to unmapped memory are caught by the host fault handler and turned into guest `SIGSEGV`, as in QEMU.
+- **JIT atomics** are single ARM64 LSE instructions (`ldadd`, `swp`, `cas`, ...); `lr`/`sc` become `ldaxr`/`stlxr` or a `cas` against the reserved value.
+- **JIT fences** map RISC-V `pred`/`succ` sets to the cheapest sufficient `dmb` variant (`ish`, `ishld`, `ishst`).
+
+To speed up the interpreter later without changing any interface: a per-thread software TLB (guest page → host pointer and permissions) plus a predecoded-block cache, both invalidated by a global mapping-generation counter bumped on every mapping change. With threads, `munmap` must then wait until every running thread has observed the new generation before it decommits host pages.
 
 ## Milestones
 
@@ -186,6 +218,8 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 ## Decision Log
 
 - **Oct 14, 2026 — Route B first, then route A as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. B covers the daily build → test → debug loop best (instant, no VM, Mac file system); A (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux; see [Goals and Positioning](#goals-and-positioning).
+- **Oct 14, 2026 — The runtime is thread-ready from M2.** Process/thread split, `&self` memory with atomic accesses, host atomics for AMOs and `lr`/`sc`, and lock-free host I/O on raw guest buffers; see [Concurrency Model](#concurrency-model). Locks stay interpreter-only.
+- **Oct 14, 2026 — F/D data movement moves into M2.** musl's `printf` saves FP registers and moves bits with `fmv`/`fsgnj`, so every program that prints needs them; FP arithmetic stays in M3.
 - **Oct 14, 2026 — M and A move into M2.** The static musl `hello` already uses `mul`, `divu`, `lr.w`, and `sc.w`.
 - **Oct 13, 2026 — RV64 only.** RV32 is not supported; see [Instruction Set Scope](#instruction-set-scope).
 - **Oct 13, 2026 — C extension moves into M2.** Real binaries are full of compressed instructions, so `hello` cannot run without them.
