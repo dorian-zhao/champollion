@@ -12,3 +12,7 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [profile.release]
 debug = "line-tables-only"
+
+# The interpreter is unusably slow unoptimized; keep debug info but optimize the core.
+[profile.dev.package.champollion-rv]
+opt-level = 2

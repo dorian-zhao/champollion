@@ -1,0 +1,30 @@
+count(*)|sum(score)|avg(score)|min(name)|max(name)
+5000|356785.71428571426|71.357142857142847|name0|name99
+grp|count(*)|printf('%.6f', avg(score))
+0|384|72.366071
+1|385|72.269017
+2|385|71.988868
+3|385|71.708720
+4|385|71.428571
+id|score|r
+81|142.42857142857142|1
+1108|142.28571428571428|2
+2135|142.14285714285714|3
+3162|142.0|4
+4189|141.85714285714286|5
+id|id
+1|1001
+1|2001
+1|3001
+1|4001
+2|1002
+json_object('n', 1, 'list', json_array(1, 2.5, 'x'))|json_extract('{"a":{"b":[10,20]}}', '$.a.b[1]')
+{"n":1,"list":[1,2.5,"x"]}|20
+printf('%.17g', 0.1 + 0.2)|1e308 * 10|round(2.5)|round(-2.5)|7 / 2|7 % 3|cast('12abc' AS INTEGER)
+0.3|Inf|3.0|-3.0|3|1|12
+upper('héllo')|length('héllo')|substr('abcdef', 2, 3)|replace('aaa', 'a', 'bb')|hex('AZ')
+HéLLO|5|bcd|bbbbbb|415A
+count(*)
+5000
+QUERY PLAN
+`--SEARCH t USING INDEX t_grp (grp=? AND score>?)
