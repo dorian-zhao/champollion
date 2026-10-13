@@ -39,6 +39,26 @@ What would actually sink this project is the Linux→Darwin syscall compatibilit
 - Signals and ucontext translation, `epoll`→`kqueue`
 - RVV vector extension (VLEN 128 maps onto NEON, but dynamic vtype/LMUL changes are complex)
 
+## Instruction Set Scope
+
+The target is **RV64GC**, which is what the RVA20U64 profile requires and what mainstream riscv64 Linux distributions (Debian, Fedora, Alpine) and `zig cc` emit by default. `G` is shorthand for I + M + A + F + D + Zicsr + Zifencei.
+
+| Extension | Contents | Approx. count | Milestone |
+| --- | --- | --- | --- |
+| RV64I | Integer ALU, loads/stores, branches, `jal`/`jalr`, `lui`/`auipc`, `ecall`, `fence` | 52 (40 from RV32I + 12 RV64-only) | M1 |
+| Zicsr | `csrrw` and friends, for `fcsr`, `cycle`, `time`, `instret` | 6 | M1–M3 |
+| C | 16-bit compressed forms; each expands to an existing 32-bit `Inst` | ~40 | M2 (common subset), M3 (complete) |
+| M | Multiply/divide, including `*w` variants | 13 | M3 |
+| A | `lr`/`sc` and AMOs, word and doubleword | 22 | M3 |
+| F, D | Single and double precision floating point | ~60 | M3 |
+| Zifencei | `fence.i` (ties into JIT invalidation later) | 1 | M3 |
+| Zba, Zbb | Address generation and bit manipulation (RVA22) | ~30 | Around M4 |
+| V | Vector extension (mandatory in RVA23) | Hundreds | Out of scope |
+
+**C is pulled forward into M2.** Compilers emit compressed instructions by default, so most of the instructions in a static `hello` are 2 bytes long. Compressed instructions are decoded into the same `Inst` values as their 32-bit equivalents, so the interpreter and the JIT never see the difference.
+
+**RV64 only; no RV32.** RV64I contains every RV32I instruction (with 64-bit registers, plus `ld`/`sd`/`lwu` and the `*w` family), so everything CS61C covers is still implemented. There is essentially no RV32 Linux userland to run, and none of the milestone targets (lua, sqlite, busybox) need it. If RV32 is ever wanted for CS61C exercises, it can be added later as an XLEN parameter on the decoder.
+
 ## System Architecture
 
 The translation core (5 layers) is shared by both routes; only the `HostOs` implementation behind the syscall layer (part of a 4-layer runtime) changes.
@@ -81,8 +101,8 @@ Reaching M4 makes a complete, hardcore project; M5 is a bonus. Each step uses th
 | Milestone | Content | Done when | Course |
 | --- | --- | --- | --- |
 | M1 | RV64I decoder + interpreter | Passes `riscv-tests` rv64ui | CS61C |
-| M2 | ELF loader (auxv, initial stack) + about 10 syscalls | A static `hello` built with `zig cc` prints on the Mac | CS162 |
-| M3 | M, A, F, D, C extensions + remaining syscalls | Runs a static `lua` or `sqlite` | CS61C |
+| M2 | ELF loader (auxv, initial stack) + about 10 syscalls + common C instructions | A static `hello` built with `zig cc` prints on the Mac | CS162 |
+| M3 | M, A, F, D extensions, rest of C + remaining syscalls | Runs a static `lua` or `sqlite` | CS61C |
 | M4 | Basic-block JIT, block chaining, indirect-jump optimization, AOT cache | Zero differences in differential tests against the interpreter; clear benchmark speedup | Extracurricular |
 | M5 | Multithreading, `futex`, signals, dynamic linking | Runs multithreaded programs | CS162 |
 
@@ -99,4 +119,8 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 - Crate name is `champollion-rv` (crates.io: no existing crate as of Oct 13, 2026); CLI is `rvrun`.
 - Introduce an IR from the start, or lift directly to ARM64 until M4?
-- Support RV32 (CS61C uses RV32I), or RV64 only?
+
+## Decision Log
+
+- **Oct 13, 2026 — RV64 only.** RV32 is not supported; see [Instruction Set Scope](#instruction-set-scope).
+- **Oct 13, 2026 — C extension moves into M2.** Real binaries are full of compressed instructions, so `hello` cannot run without them.
