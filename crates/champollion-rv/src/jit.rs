@@ -315,7 +315,7 @@ impl Jit {
 mod tests {
     use super::*;
     use crate::decoder::enc::*;
-    use crate::memory::Prot;
+    use crate::memory::{GUEST_SIZE, Prot};
 
     const CODE: u64 = 0x10000;
     const DATA: u64 = 0x20000;
@@ -389,6 +389,52 @@ mod tests {
             jalr(0, 1, 0),     // 0x24: indirect, back to 0x08
         ]);
         assert_eq!((cpu.x[10], cpu.x[1], cpu.x[7]), (101, CODE + 8, CODE));
+    }
+
+    #[test]
+    fn base_register_cache_matches_the_interpreter() {
+        let (_, cpu) = same_as_interpreter(&[
+            addi(10, 0, 0x55),     // a0 = 0x55
+            store(3, 11, 10, 0),   // sd a0, 0(a1): sets up a1's host address
+            store(3, 11, 10, 8),   // sd a0, 8(a1): reuses it
+            load(3, 12, 11, 8),    // ld a2, 8(a1)
+            addi(11, 11, 16),      // a1 += 16: the cached address is stale now
+            store(2, 11, 12, -4),  // sw a2, -4(a1): negative offset (ldur)
+            load(2, 13, 11, -4),   // lw a3, -4(a1)
+            op(4, 1, 14, 13, 10),  // div a4, a3, a0: borrows the address register
+            load(0, 14, 11, -16),  // lb a4, -16(a1)
+            addi(3, 11, 0),        // gp = a1: an unpinned base
+            store(3, 3, 10, 24),   // sd a0, 24(gp)
+            load(3, 15, 3, 24),    // ld a5, 24(gp)
+            load(3, 3, 3, 24),     // ld gp, 24(gp): overwrites its own base
+            load(2, 16, 11, 1022), // lw a6, 1022(a1): misaligned, no immediate form
+            load(3, 17, 11, 2000), // ld a7, 2000(a1): large scaled offset
+            ECALL,
+        ]);
+        assert_eq!((cpu.x[12], cpu.x[13], cpu.x[15], cpu.x[3]), (0x55, 0x55, 0x55, 0x55));
+    }
+
+    #[test]
+    fn offsets_past_the_guest_space_fault_precisely() {
+        // Base just below the top of the guest space, offset past it: the access lands in
+        // the guard region above, and the fault reports the unmasked address.
+        let (trap, _) = same_as_interpreter(&[
+            addi(5, 0, 1),
+            op_imm(1, 5, 5, 38), // t0 = GUEST_SIZE
+            addi(5, 5, -8),      // t0 = GUEST_SIZE - 8
+            load(3, 10, 5, 16),  // ld a0, 16(t0)
+            ECALL,
+        ]);
+        assert!(matches!(trap, Trap::LoadFault { fault, .. } if fault.addr == GUEST_SIZE + 8));
+        // And below the bottom.
+        let (trap, _) = same_as_interpreter(&[
+            addi(5, 0, 8),        // t0 = 8
+            store(3, 5, 10, -16), // sd a0, -16(t0)
+            ECALL,
+        ]);
+        assert!(
+            matches!(trap, Trap::StoreFault { fault, .. } if fault.addr == 8u64.wrapping_sub(16))
+        );
     }
 
     #[test]

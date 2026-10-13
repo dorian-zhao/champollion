@@ -7,7 +7,7 @@
 //! | x0–x13, x19–x26, x29 | 23 guest registers, pinned (see [`HOST_REG`]) |
 //! | x14, x15 | scratch for unpinned sources |
 //! | x16 | scratch for unpinned destinations; exit code on the way to the exit stub |
-//! | x17 | scratch for addresses and jump targets |
+//! | x17 | scratch for addresses and jump targets; caches a base register's host address |
 //! | x18 | untouched (reserved by macOS) |
 //! | x27 | host address of guest memory (`GuestMemory::host_base`) |
 //! | x28 | `&mut CpuState` |
@@ -35,7 +35,7 @@ use crate::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FArithOp, FCmpOp, FWidth, FmaOp, Inst, IntType,
     LoadWidth, RM_DYN, SgnjKind, StoreWidth,
 };
-use crate::memory::GUEST_SIZE;
+use crate::memory::{GUARD_SIZE, GUEST_SIZE};
 
 pub const CTX: Reg = 28;
 pub const MEMBASE: Reg = 27;
@@ -139,7 +139,15 @@ fn f_offset(r: u8) -> u32 {
 }
 /// Guest addresses are masked to the guest address space, so generated code can never touch
 /// host memory outside the reservation, whatever address the guest computes.
+///
+/// Accesses through a base register mask the base, not the sum: `ADDR` gets the host
+/// address `MEMBASE + (rs1 & ADDR_MASK)`, and the access adds its offset as an immediate.
+/// The offset (under 32 KiB, or down to -256) can then step just past either end of the
+/// guest space, into the guard region that [`GUARD_SIZE`] reserves there, and fault. While
+/// the base register is not written, later accesses through it reuse `ADDR`: a run of
+/// stack accesses costs one instruction each, plus two for the first.
 const ADDR_MASK: u64 = GUEST_SIZE - 1;
+const _: () = assert!(GUARD_SIZE >= 4096 * 8 + 256);
 
 /// A way out of a translated block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +198,10 @@ struct Tx {
     retired: u32,
     /// Host address of the jump cache.
     jump_cache: u64,
+    /// Guest register whose host address (see [`ADDR_MASK`]) is in `ADDR`, if any.
+    addr_base: Option<u8>,
+    /// Whether the access being translated has its base register reused by a later one.
+    base_reused: bool,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -254,6 +266,35 @@ impl Tx {
         }
     }
 
+    /// Prepare a `size`-byte access to `rs1 + imm`. Returns the immediate offset to use from
+    /// `ADDR` (which holds the base register's host address, see [`ADDR_MASK`]), or `None`
+    /// to use `[MEMBASE, ADDR]` with the masked guest address in `ADDR`.
+    fn mem_operand(&mut self, rs1: u8, imm: i32, size: u32) -> Option<i32> {
+        let cached = self.addr_base == Some(rs1);
+        // With a zero offset and no reuse, the masked address alone is one instruction
+        // shorter than setting up the base.
+        if rs1 != 0 && Asm::imm_offset_fits(size, imm) && (cached || imm != 0 || self.base_reused) {
+            if !cached {
+                let base = self.src(rs1, SRC0);
+                self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
+                self.a.add(ADDR, MEMBASE, ADDR);
+                self.addr_base = Some(rs1);
+            }
+            return Some(imm);
+        }
+        self.address(rs1, imm);
+        self.addr_base = None;
+        None
+    }
+
+    /// Integer load into `d` through an operand from [`Tx::mem_operand`].
+    fn load_int(&mut self, mem: Mem, d: Reg, operand: Option<i32>) {
+        match operand {
+            Some(off) => assert!(self.a.ldr_imm(mem, d, ADDR, off)),
+            None => self.a.ldr_reg(mem, d, MEMBASE, ADDR),
+        }
+    }
+
     /// Leave the body through a `b` to a tail.
     fn exit(&mut self, tail: Tail) {
         let at = self.a.pos();
@@ -286,7 +327,6 @@ impl Tx {
             Inst::Op { op, rd, rs1, rs2 } => self.op(op, rd, rs1, rs2),
             Inst::Op32 { op, rd, rs1, rs2 } => self.op32(op, rd, rs1, rs2),
             Inst::Load { width, rd, rs1, offset } => {
-                self.address(rs1, offset);
                 let mem = match width {
                     LoadWidth::B => Mem::S8,
                     LoadWidth::H => Mem::S16,
@@ -296,39 +336,50 @@ impl Tx {
                     LoadWidth::Hu => Mem::U16,
                     LoadWidth::Wu => Mem::U32,
                 };
+                let operand = self.mem_operand(rs1, offset, mem.size());
                 // A load to x0 still accesses memory (and may fault).
                 let d = self.dst(rd);
                 self.accesses.push((self.a.pos(), pc, self.retired, false));
-                self.a.ldr_reg(mem, d, MEMBASE, ADDR);
+                match operand {
+                    Some(off) => assert!(self.a.ldr_imm(mem, d, ADDR, off)),
+                    None => self.a.ldr_reg(mem, d, MEMBASE, ADDR),
+                }
                 self.commit(rd, d);
             }
             Inst::Store { width, rs1, rs2, offset } => {
                 let v = self.src(rs2, SRC1);
-                self.address(rs1, offset);
                 let mem = match width {
                     StoreWidth::B => Mem::U8,
                     StoreWidth::H => Mem::U16,
                     StoreWidth::W => Mem::U32,
                     StoreWidth::D => Mem::U64,
                 };
+                let operand = self.mem_operand(rs1, offset, mem.size());
                 self.accesses.push((self.a.pos(), pc, self.retired, true));
-                self.a.str_reg(mem, v, MEMBASE, ADDR);
+                match operand {
+                    Some(off) => assert!(self.a.str_imm(mem, v, ADDR, off)),
+                    None => self.a.str_reg(mem, v, MEMBASE, ADDR),
+                }
             }
             // Conservatively a full barrier; mapping pred/succ to dmb variants comes later.
             Inst::Fence { .. } => self.a.dmb_ish(),
             // F/D data movement. Doubles are moved as raw bits; singles are NaN-boxed when
             // written to an f register.
             Inst::FLoad { width, rd, rs1, offset } => {
-                self.address(rs1, offset);
+                let size = if width == FWidth::D { 8 } else { 4 };
+                let operand = self.mem_operand(rs1, offset, size);
                 self.accesses.push((self.a.pos(), pc, self.retired, false));
                 match (width, FHOST_REG[rd as usize]) {
-                    (FWidth::D, Some(h)) => self.a.ldr_fp_reg(Fp::D, h, MEMBASE, ADDR),
+                    (FWidth::D, Some(h)) => match operand {
+                        Some(off) => assert!(self.a.ldr_fp_imm(Fp::D, h, ADDR, off)),
+                        None => self.a.ldr_fp_reg(Fp::D, h, MEMBASE, ADDR),
+                    },
                     (FWidth::D, None) => {
-                        self.a.ldr_reg(Mem::U64, DST, MEMBASE, ADDR);
+                        self.load_int(Mem::U64, DST, operand);
                         self.a.str_off(DST, CTX, f_offset(rd));
                     }
                     (FWidth::S, _) => {
-                        self.a.ldr_reg(Mem::U32, DST, MEMBASE, ADDR);
+                        self.load_int(Mem::U32, DST, operand);
                         self.a.orr_imm(DST, DST, NAN_BOX).unwrap();
                         self.fraw_store(rd, DST);
                     }
@@ -336,19 +387,26 @@ impl Tx {
             }
             Inst::FStore { width, rs1, rs2, offset } => {
                 let size = fp(width);
+                let bytes = if width == FWidth::D { 8 } else { 4 };
                 match FHOST_REG[rs2 as usize] {
                     Some(h) => {
-                        self.address(rs1, offset);
+                        let operand = self.mem_operand(rs1, offset, bytes);
                         self.accesses.push((self.a.pos(), pc, self.retired, true));
                         // A single store writes the low 32 bits, boxed or not.
-                        self.a.str_fp_reg(size, h, MEMBASE, ADDR);
+                        match operand {
+                            Some(off) => assert!(self.a.str_fp_imm(size, h, ADDR, off)),
+                            None => self.a.str_fp_reg(size, h, MEMBASE, ADDR),
+                        }
                     }
                     None => {
                         self.a.ldr_off(SRC1, CTX, f_offset(rs2));
-                        self.address(rs1, offset);
+                        let operand = self.mem_operand(rs1, offset, bytes);
                         self.accesses.push((self.a.pos(), pc, self.retired, true));
                         let mem = if width == FWidth::D { Mem::U64 } else { Mem::U32 };
-                        self.a.str_reg(mem, SRC1, MEMBASE, ADDR);
+                        match operand {
+                            Some(off) => assert!(self.a.str_imm(mem, SRC1, ADDR, off)),
+                            None => self.a.str_reg(mem, SRC1, MEMBASE, ADDR),
+                        }
                     }
                 }
             }
@@ -887,6 +945,67 @@ impl Tx {
     }
 }
 
+/// Base register of a load or store (the accesses that go through [`Tx::mem_operand`]).
+fn mem_base(inst: Inst) -> Option<u8> {
+    match inst {
+        Inst::Load { rs1, .. }
+        | Inst::Store { rs1, .. }
+        | Inst::FLoad { rs1, .. }
+        | Inst::FStore { rs1, .. } => Some(rs1),
+        _ => None,
+    }
+}
+
+/// Whether translating `inst` leaves `ADDR` alone, apart from [`Tx::mem_operand`], so the
+/// base-register cache survives it (unless it writes the base register, see [`int_dest`]).
+fn keeps_addr(inst: Inst) -> bool {
+    use AluOp::{Div, Divu, Mulhsu, Rem, Remu};
+    match inst {
+        Inst::Lui { .. } | Inst::Auipc { .. } | Inst::OpImm { .. } | Inst::OpImm32 { .. } => true,
+        Inst::Op { op, .. } => !matches!(op, Mulhsu | Div | Divu | Rem | Remu),
+        Inst::Op32 { op, .. } => {
+            !matches!(op, AluOp32::Div | AluOp32::Divu | AluOp32::Rem | AluOp32::Remu)
+        }
+        _ => mem_base(inst).is_some(),
+    }
+}
+
+/// The integer register written by an instruction that [`keeps_addr`].
+fn int_dest(inst: Inst) -> Option<u8> {
+    match inst {
+        Inst::Lui { rd, .. }
+        | Inst::Auipc { rd, .. }
+        | Inst::OpImm { rd, .. }
+        | Inst::OpImm32 { rd, .. }
+        | Inst::Op { rd, .. }
+        | Inst::Op32 { rd, .. }
+        | Inst::Load { rd, .. } => Some(rd),
+        _ => None,
+    }
+}
+
+/// For each instruction of `block`: whether it is an access whose base register a later
+/// access reuses, with nothing in between that drops the cached base.
+fn base_reuse(block: &[(Inst, u8)]) -> Vec<bool> {
+    let mut reused = vec![false; block.len()];
+    for (i, &(inst, _)) in block.iter().enumerate() {
+        let Some(base) = mem_base(inst) else { continue };
+        if int_dest(inst) == Some(base) {
+            continue;
+        }
+        for &(later, _) in &block[i + 1..] {
+            if mem_base(later) == Some(base) {
+                reused[i] = true;
+                break;
+            }
+            if !keeps_addr(later) || int_dest(later) == Some(base) || mem_base(later).is_some() {
+                break;
+            }
+        }
+    }
+    reused
+}
+
 /// Translate `block` (as decoded at `pc`) into code that will live at word index
 /// `block_word` of the code buffer, whose exit stub is at word index `stub_word`. Returns
 /// `None` if not even the first instruction can be translated. Indirect jumps probe the
@@ -905,6 +1024,8 @@ pub fn translate(
         accesses: Vec::new(),
         retired: 0,
         jump_cache,
+        addr_base: None,
+        base_reused: false,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
@@ -917,7 +1038,9 @@ pub fn translate(
     let mut ended = false;
     // The register the previous instruction set to a constant (`lui`, `auipc`), and its value.
     let mut known: Option<(u8, u64)> = None;
-    for &(inst, len) in block {
+    let reused = base_reuse(block);
+    for (i, &(inst, len)) in block.iter().enumerate() {
+        tx.base_reused = reused[i];
         let len = len as u64;
         let next = at + len;
         match inst {
@@ -1007,6 +1130,9 @@ pub fn translate(
             }
         }
         tx.retired = retired;
+        if !keeps_addr(inst) || int_dest(inst).is_some_and(|rd| Some(rd) == tx.addr_base) {
+            tx.addr_base = None;
+        }
         known = match inst {
             Inst::Lui { rd, imm } if rd != 0 => Some((rd, sext(imm))),
             Inst::Auipc { rd, imm } if rd != 0 => Some((rd, at.wrapping_add(sext(imm)))),

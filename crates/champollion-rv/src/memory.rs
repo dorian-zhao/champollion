@@ -11,7 +11,7 @@ use std::cell::Cell;
 mod guest;
 mod tlb;
 
-pub use guest::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Prot};
+pub use guest::{GUARD_SIZE, GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Prot};
 pub use tlb::{Tlb, TlbMemory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

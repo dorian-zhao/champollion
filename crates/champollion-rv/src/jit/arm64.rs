@@ -122,6 +122,18 @@ pub enum Mem {
     S32,
 }
 
+impl Mem {
+    /// Access size in bytes.
+    pub fn size(self) -> u32 {
+        match self {
+            Mem::U8 | Mem::S8 => 1,
+            Mem::U16 | Mem::S16 => 2,
+            Mem::U32 | Mem::S32 => 4,
+            Mem::U64 => 8,
+        }
+    }
+}
+
 /// Encode a logical (bitmask) immediate for a 64-bit (`width` = 64) or 32-bit operation as
 /// `(N, immr, imms)`, or `None` if `value` is not representable.
 pub fn logical_imm(value: u64, width: u32) -> Option<(u32, u32, u32)> {
@@ -452,6 +464,88 @@ impl Asm {
             _ => panic!("stores have no signedness"),
         };
         self.r3(base, rt, rn, rm);
+    }
+
+    /// Whether a `size`-byte access at `[rn, #offset]` is encodable by [`Asm::ldr_imm`] and
+    /// friends: a scaled unsigned offset (a multiple of `size`, below `4096 * size`) or an
+    /// unscaled 9-bit signed one.
+    pub fn imm_offset_fits(size: u32, offset: i32) -> bool {
+        Self::scaled_offset(size, offset).is_some() || (-256..256).contains(&offset)
+    }
+
+    /// The scaled unsigned immediate for `offset`, if it has one.
+    fn scaled_offset(size: u32, offset: i32) -> Option<u32> {
+        let offset = u32::try_from(offset).ok()?;
+        (offset.is_multiple_of(size) && offset / size < 4096).then_some(offset / size)
+    }
+
+    /// Emit a load or store with an immediate offset, scaled (`scaled` opcode) when possible,
+    /// else unscaled (`unscaled`, i.e. `ldur`/`stur`). False if neither form fits.
+    fn mem_imm(
+        &mut self,
+        scaled: u32,
+        unscaled: u32,
+        size: u32,
+        rt: Reg,
+        rn: Reg,
+        offset: i32,
+    ) -> bool {
+        let regs = (rn as u32) << 5 | rt as u32;
+        if let Some(imm) = Self::scaled_offset(size, offset) {
+            self.emit(scaled | imm << 10 | regs);
+        } else if (-256..256).contains(&offset) {
+            self.emit(unscaled | (offset as u32 & 0x1ff) << 12 | regs);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// Load `rt` from `[rn, #offset]` (see [`Asm::imm_offset_fits`]); false if not encodable.
+    #[must_use]
+    pub fn ldr_imm(&mut self, mem: Mem, rt: Reg, rn: Reg, offset: i32) -> bool {
+        let (scaled, unscaled, size) = match mem {
+            Mem::U8 => (0x3940_0000, 0x3840_0000, 1),
+            Mem::U16 => (0x7940_0000, 0x7840_0000, 2),
+            Mem::U32 => (0xb940_0000, 0xb840_0000, 4),
+            Mem::U64 => (0xf940_0000, 0xf840_0000, 8),
+            Mem::S8 => (0x3980_0000, 0x3880_0000, 1),
+            Mem::S16 => (0x7980_0000, 0x7880_0000, 2),
+            Mem::S32 => (0xb980_0000, 0xb880_0000, 4),
+        };
+        self.mem_imm(scaled, unscaled, size, rt, rn, offset)
+    }
+
+    /// Store `rt` to `[rn, #offset]`; `mem` must be unsigned (the size). False if not
+    /// encodable.
+    #[must_use]
+    pub fn str_imm(&mut self, mem: Mem, rt: Reg, rn: Reg, offset: i32) -> bool {
+        let (scaled, unscaled, size) = match mem {
+            Mem::U8 => (0x3900_0000, 0x3800_0000, 1),
+            Mem::U16 => (0x7900_0000, 0x7800_0000, 2),
+            Mem::U32 => (0xb900_0000, 0xb800_0000, 4),
+            Mem::U64 => (0xf900_0000, 0xf800_0000, 8),
+            _ => panic!("stores have no signedness"),
+        };
+        self.mem_imm(scaled, unscaled, size, rt, rn, offset)
+    }
+
+    /// Load FP register `rt` from `[rn, #offset]`; false if not encodable.
+    #[must_use]
+    pub fn ldr_fp_imm(&mut self, size: Fp, rt: Reg, rn: Reg, offset: i32) -> bool {
+        match size {
+            Fp::S => self.mem_imm(0xbd40_0000, 0xbc40_0000, 4, rt, rn, offset),
+            Fp::D => self.mem_imm(0xfd40_0000, 0xfc40_0000, 8, rt, rn, offset),
+        }
+    }
+
+    /// Store FP register `rt` to `[rn, #offset]`; false if not encodable.
+    #[must_use]
+    pub fn str_fp_imm(&mut self, size: Fp, rt: Reg, rn: Reg, offset: i32) -> bool {
+        match size {
+            Fp::S => self.mem_imm(0xbd00_0000, 0xbc00_0000, 4, rt, rn, offset),
+            Fp::D => self.mem_imm(0xfd00_0000, 0xfc00_0000, 8, rt, rn, offset),
+        }
     }
 
     /// `ldr xt, [xn, #offset]` with a scaled unsigned offset (multiple of 8, < 32 KiB).

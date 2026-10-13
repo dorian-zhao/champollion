@@ -2,7 +2,9 @@
 //!
 //! Guest address `g` lives at host address `base + g` for every `g < GUEST_SIZE`. The whole
 //! range is reserved `PROT_NONE` up front, which costs no physical memory; pages are
-//! committed as the guest maps them.
+//! committed as the guest maps them. [`GUARD_SIZE`] bytes on either side stay `PROT_NONE`
+//! forever, so the JIT may add a small offset to an in-range address without masking the
+//! sum: the access either lands in the guest space or faults.
 //!
 //! Guest pages are 4 KiB (what Linux on RISC-V reports in `AT_PAGESZ`), but macOS on arm64
 //! uses 16 KiB host pages, so host protections cannot represent guest permissions exactly.
@@ -24,6 +26,8 @@ use super::{MemFault, Memory};
 /// Size of the guest address space: 2^38 bytes (256 GiB), the user half of RISC-V Sv39.
 pub const GUEST_SIZE: u64 = 1 << 38;
 pub const GUEST_PAGE_SIZE: u64 = 4096;
+/// Inaccessible host memory reserved below and above the guest space.
+pub const GUARD_SIZE: u64 = 64 << 10;
 
 /// Guest page permissions, with Linux `PROT_*` bit values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -161,24 +165,25 @@ unsafe impl Sync for GuestMemory {}
 impl GuestMemory {
     pub fn new() -> std::io::Result<Self> {
         // SAFETY: anonymous PROT_NONE reservation; no existing memory is affected.
-        let base = unsafe {
+        let start = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                GUEST_SIZE as usize,
+                (GUEST_SIZE + 2 * GUARD_SIZE) as usize,
                 libc::PROT_NONE,
                 libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
         };
-        if base == libc::MAP_FAILED {
+        if start == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
+        let base = start.cast::<u8>().wrapping_add(GUARD_SIZE as usize);
         // SAFETY: sysconf has no preconditions.
         let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         assert!(host_page.is_power_of_two() && host_page >= GUEST_PAGE_SIZE);
         Ok(Self {
-            base: base.cast(),
+            base,
             host_page,
             maps: RwLock::default(),
             generation: AtomicU64::new(0),
@@ -528,7 +533,10 @@ pub(super) unsafe fn atomic_copy_in(dst: *mut u8, buf: &[u8]) {
 impl Drop for GuestMemory {
     fn drop(&mut self) {
         // SAFETY: unmapping exactly the reservation created in `new`.
-        unsafe { libc::munmap(self.base.cast(), GUEST_SIZE as usize) };
+        unsafe {
+            let start = self.base.wrapping_sub(GUARD_SIZE as usize);
+            libc::munmap(start.cast(), (GUEST_SIZE + 2 * GUARD_SIZE) as usize)
+        };
     }
 }
 

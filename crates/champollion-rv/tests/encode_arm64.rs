@@ -145,6 +145,50 @@ fn matches_assembler() {
     a.fabs_d(5, 6);
     a.stp_pre_d(8, 9, SP, -16);
     a.ldp_post_d(14, 15, SP, 16);
+    for (mem, rt, offset) in [
+        (Mem::U8, 0, 4095),
+        (Mem::U16, 1, 8190),
+        (Mem::U32, 2, 16380),
+        (Mem::U64, 3, 32760),
+        (Mem::S8, 4, 1),
+        (Mem::S16, 5, 2),
+        (Mem::S32, 6, 4),
+        (Mem::U8, 7, -256),
+        (Mem::U16, 8, -2),
+        (Mem::U32, 9, -4),
+        (Mem::U64, 10, -8),
+        (Mem::S8, 11, -1),
+        (Mem::S16, 12, -3),
+        (Mem::S32, 13, 255),
+        (Mem::U64, 19, 7),
+    ] {
+        assert!(a.ldr_imm(mem, rt, 17, offset));
+    }
+    for (mem, rt, offset) in [
+        (Mem::U8, 20, 4095),
+        (Mem::U16, 21, 2),
+        (Mem::U32, 22, 4),
+        (Mem::U64, 23, 8),
+        (Mem::U8, 24, -1),
+        (Mem::U16, 25, -2),
+        (Mem::U32, 26, -4),
+        (Mem::U64, 0, -256),
+    ] {
+        assert!(a.str_imm(mem, rt, 17, offset));
+    }
+    assert!(a.ldr_fp_imm(Fp::S, 1, 17, 4));
+    assert!(a.ldr_fp_imm(Fp::D, 2, 17, 8));
+    assert!(a.ldr_fp_imm(Fp::S, 3, 17, -4));
+    assert!(a.ldr_fp_imm(Fp::D, 4, 17, -8));
+    assert!(a.str_fp_imm(Fp::S, 5, 17, 16380));
+    assert!(a.str_fp_imm(Fp::D, 6, 17, 32760));
+    assert!(a.str_fp_imm(Fp::S, 7, 17, -4));
+    assert!(a.str_fp_imm(Fp::D, 8, 17, 3));
+    let len = a.code.len();
+    assert!(!a.ldr_imm(Mem::U64, 0, 17, 32768));
+    assert!(!a.str_imm(Mem::U8, 0, 17, -257));
+    assert!(!a.ldr_fp_imm(Fp::D, 0, 17, 4100));
+    assert_eq!(a.code.len(), len, "unencodable offsets emit nothing");
 
     let source = include_str!("../../../tests/fixtures/arm64.s");
     let lines: Vec<&str> = source
