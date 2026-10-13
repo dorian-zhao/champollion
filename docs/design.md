@@ -181,6 +181,7 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 - Crate name is `champollion-rv` (crates.io: no existing crate as of Oct 13, 2026); CLI is `rvrun`.
 - Introduce an IR from the start, or lift directly to ARM64 until M4?
+- **M6 foundation:** build route A on [apple/containerization](https://github.com/apple/containerization) (the package behind [apple/container](https://github.com/apple/container))? It already provides per-container VMs on `Virtualization.framework`, a fast-booting kernel config, the `vminitd` init, ext4 and OCI image handling, and runs linux/amd64 images through Rosetta, which is structurally what we need for riscv64. Unverified: whether a custom binfmt\_misc handler can be registered without forking it. Requires macOS 26+.
 
 ## Decision Log
 
