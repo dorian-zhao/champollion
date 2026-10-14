@@ -1,7 +1,9 @@
 //! `rvrun`: run a riscv64 Linux executable on macOS.
 //!
-//! Usage: `rvrun [-g PORT] [-L SYSROOT] <riscv64-linux-elf> [args...]`
+//! Usage: `rvrun [-g PORT] [-L SYSROOT] [-0 ARGV0] <riscv64-linux-elf or #! script> [args...]`
 //!
+//! - `-0 ARGV0` passes ARGV0 as the guest's `argv[0]` instead of the path (used when a guest
+//!   `execve` starts a new rvrun).
 //! - `-L SYSROOT` looks up the guest's absolute paths (its dynamic loader, libraries,
 //!   `/etc` files) under SYSROOT first, like `qemu-riscv64 -L`; also `RVRUN_SYSROOT`.
 //! - `-g PORT` waits for a GDB remote connection on 127.0.0.1:PORT before running, with the
@@ -26,11 +28,13 @@ use champollion_rv::gdb::{self, Session};
 use champollion_rv::host::darwin::DarwinHost;
 use champollion_rv::process::Process;
 
-const USAGE: &str = "usage: rvrun [-g PORT] [-L SYSROOT] <riscv64-linux-elf> [args...]";
+const USAGE: &str =
+    "usage: rvrun [-g PORT] [-L SYSROOT] [-0 ARGV0] <riscv64-linux-elf or script> [args...]";
 
 fn main() -> ExitCode {
     let mut args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut gdb_port = None;
+    let mut argv0 = None;
     let mut sysroot = std::env::var_os("RVRUN_SYSROOT").map(std::path::PathBuf::from);
     loop {
         match args.first().and_then(|a| a.to_str()) {
@@ -41,6 +45,13 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 };
                 gdb_port = Some(port);
+            }
+            Some("-0") => {
+                let Some(name) = args.get(1) else {
+                    eprintln!("rvrun: -0 needs an argument\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                argv0 = Some(name.clone());
             }
             Some("-L") => {
                 let Some(dir) = args.get(1) else {
@@ -53,19 +64,50 @@ fn main() -> ExitCode {
         }
         args.drain(..2);
     }
-    let Some(path) = args.first() else {
+    if args.is_empty() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
-    };
-    let file = match std::fs::read(path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("rvrun: {}: {e}", path.to_string_lossy());
-            return ExitCode::from(127);
+    }
+    if let Some(name) = argv0 {
+        args.insert(0, name); // argv[0], then the path to load
+    } else {
+        args.insert(0, args[0].clone());
+    }
+    // A script runs its `#!` interpreter (a guest path), with the script as an argument,
+    // as Linux's binfmt_script does; scripts may name scripts, up to a few levels.
+    let mut path = std::path::PathBuf::from(args.remove(1));
+    let mut file;
+    let mut depth = 0;
+    loop {
+        file = match std::fs::read(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("rvrun: {}: {e}", path.display());
+                return ExitCode::from(127);
+            }
+        };
+        let Some((interp, arg)) = shebang(&file) else { break };
+        depth += 1;
+        if depth > 4 {
+            eprintln!("rvrun: {}: too many levels of #! interpreters", path.display());
+            return ExitCode::from(126);
         }
-    };
+        // As on Linux: the interpreter, its optional argument, the script (as given), then
+        // the script's arguments; the original argv[0] is dropped.
+        let mut new_args = vec![interp.clone()];
+        new_args.extend(arg);
+        new_args.push(path.clone().into_os_string());
+        new_args.extend(args.drain(1..));
+        args = new_args;
+        path = champollion_rv::process::resolve(
+            sysroot.as_deref(),
+            std::path::Path::new(&interp),
+            true,
+        );
+    }
+    let path = path.into_os_string();
 
-    // The guest sees its own path as argv[0], and inherits our environment.
+    // The guest gets `args` (argv[0] first) and inherits our environment.
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
     let envp: Vec<Vec<u8>> =
         std::env::vars_os().map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat()).collect();
@@ -76,7 +118,7 @@ fn main() -> ExitCode {
         &envp,
         path.as_bytes(),
         Arc::new(DarwinHost::default()),
-        sysroot,
+        sysroot.clone(),
     ) {
         Ok(p) => p,
         Err(champollion_rv::process::SpawnError::Interp(interp, e)) => {
@@ -93,6 +135,7 @@ fn main() -> ExitCode {
             return ExitCode::from(126);
         }
     };
+    proc.set_exec(Box::new(move |req| exec(req, sysroot.as_deref())));
     let strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
     proc.log.strace.store(strace, std::sync::atomic::Ordering::Relaxed);
     let cache = CodeCache::new(&file);
@@ -249,4 +292,55 @@ fn evict(dir: &std::path::Path, limit: u64) {
             total -= len;
         }
     }
+}
+
+/// The interpreter and optional argument of a `#!` line, if `file` starts with one.
+fn shebang(file: &[u8]) -> Option<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+    use std::os::unix::ffi::OsStringExt;
+    let line = file.strip_prefix(b"#!")?;
+    let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
+    let line = line.trim_ascii();
+    let (interp, arg) = match line.iter().position(u8::is_ascii_whitespace) {
+        Some(i) => (&line[..i], Some(line[i..].trim_ascii())),
+        None => (line, None),
+    };
+    if interp.is_empty() {
+        return None;
+    }
+    let arg = arg.filter(|a| !a.is_empty()).map(|a| std::ffi::OsString::from_vec(a.to_vec()));
+    Some((std::ffi::OsString::from_vec(interp.to_vec()), arg))
+}
+
+/// A guest `execve`: replace this process with a new rvrun running `req` (with the same
+/// sysroot, and our RVRUN_* settings unless the guest's environment sets them). Returns a
+/// Linux errno if the exec fails.
+fn exec(req: &champollion_rv::process::Exec, sysroot: Option<&std::path::Path>) -> i32 {
+    use std::ffi::OsStr;
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return 2 };
+    let mut cmd = std::process::Command::new(&exe);
+    let argv0 = req.argv.first().map_or(req.path.as_os_str(), |a| OsStr::from_bytes(a));
+    cmd.arg("-0").arg(argv0);
+    if let Some(root) = sysroot {
+        cmd.arg("-L").arg(root);
+    }
+    cmd.arg(&req.path).args(req.argv.iter().skip(1).map(|a| OsStr::from_bytes(a)));
+    cmd.env_clear();
+    let mut keys = Vec::new();
+    for var in &req.envp {
+        let (k, v) = match var.iter().position(|&b| b == b'=') {
+            Some(i) => (&var[..i], &var[i + 1..]),
+            None => (&var[..], &[][..]),
+        };
+        cmd.env(OsStr::from_bytes(k), OsStr::from_bytes(v));
+        keys.push(k);
+    }
+    for (k, v) in std::env::vars_os() {
+        if k.as_bytes().starts_with(b"RVRUN_") && !keys.contains(&k.as_bytes()) {
+            cmd.env(k, v);
+        }
+    }
+    let err = cmd.exec(); // only returns on failure
+    // The common errno values agree with Linux.
+    err.raw_os_error().unwrap_or(5)
 }

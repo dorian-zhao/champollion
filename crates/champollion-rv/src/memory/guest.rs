@@ -97,6 +97,9 @@ pub struct GuestBuf {
     pub len: usize,
 }
 
+/// See [`GuestMemory::lock_for_fork`].
+pub struct ForkGuard<'a>(#[allow(dead_code)] RwLockWriteGuard<'a, Maps>);
+
 /// Non-overlapping guest mappings, keyed by start address. Adjacent mappings are not
 /// merged; nothing depends on that and it keeps splitting simple.
 #[derive(Default)]
@@ -272,6 +275,12 @@ impl GuestMemory {
 
     fn maps_mut(&self) -> RwLockWriteGuard<'_, Maps> {
         self.maps.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Hold the mapping table still across a host `fork`, so the child (which keeps only
+    /// the forking thread) never inherits it locked by a thread that no longer exists.
+    pub fn lock_for_fork(&self) -> ForkGuard<'_> {
+        ForkGuard(self.maps_mut())
     }
 
     fn check_range(addr: u64, len: u64) -> Result<Range<u64>, MapError> {

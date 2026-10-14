@@ -50,6 +50,23 @@ fn threads() {
 }
 
 #[test]
+fn processes() {
+    let out = rvrun(&[fixture("processes").as_os_str()], b"");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fork: exited 42\n\
+         fork: killed by 15\n\
+         pipe: through a pipe, getppid ok 1\n\
+         child argv0=renamed args=4 last=y env=inherited\n\
+         execve: exited 0\n\
+         child argv0=spawned args=3 last=z env=inherited\n\
+         posix_spawn: exited 0\n\
+         execve missing: -1\n"
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
 fn signals() {
     let out = rvrun(&[fixture("signals").as_os_str()], b"");
     assert_eq!(

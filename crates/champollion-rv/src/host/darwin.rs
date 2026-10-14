@@ -62,6 +62,11 @@ fn darwin_signal(sig: i32) -> Option<i32> {
     })
 }
 
+/// Darwin signal number -> Linux.
+fn linux_signal(sig: i32) -> i32 {
+    (1..=31).find(|&l| darwin_signal(l) == Some(sig)).unwrap_or(sig)
+}
+
 /// Linux `RLIMIT_*` -> Darwin, or `None` for limits Darwin does not have.
 fn darwin_rlimit(resource: u32) -> Option<libc::c_int> {
     Some(match resource {
@@ -269,6 +274,35 @@ impl HostOs for DarwinHost {
 
     fn getdents64(&self, fd: i32, max: usize) -> Result<Vec<u8>, i32> {
         self.dirs.getdents64(fd, max)
+    }
+
+    fn wait4(&self, pid: i32, options: i32) -> Result<(u64, i32), i32> {
+        const WNOHANG: i32 = 1;
+        const WUNTRACED: i32 = 2;
+        const WCONTINUED: i32 = 8;
+        let mut flags = 0;
+        for (linux, darwin) in
+            [(WNOHANG, libc::WNOHANG), (WUNTRACED, libc::WUNTRACED), (WCONTINUED, libc::WCONTINUED)]
+        {
+            if options & linux != 0 {
+                flags |= darwin;
+            }
+        }
+        let mut status = 0;
+        // SAFETY: wait4 into a local status; no rusage.
+        let got =
+            check(unsafe { libc::wait4(pid, &mut status, flags, std::ptr::null_mut()) } as isize)?;
+        // The encoding agrees (exit status << 8, or the signal in the low 7 bits, 0x7f for a
+        // stop); only signal numbers differ.
+        let sig = status & 0x7f;
+        let status = if libc::WIFSIGNALED(status) {
+            (status & !0x7f) | linux_signal(sig)
+        } else if libc::WIFSTOPPED(status) {
+            (linux_signal((status >> 8) & 0xff) << 8) | 0x7f
+        } else {
+            status
+        };
+        Ok((got, status))
     }
 
     fn socket(&self, domain: i32, ty: i32, protocol: i32) -> SysResult {

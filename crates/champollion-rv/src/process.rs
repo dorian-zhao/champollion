@@ -177,6 +177,24 @@ pub struct Process {
     pub exe: Vec<u8>,
     /// Where the guest's absolute paths are looked up first (see [`Process::host_path`]).
     pub sysroot: Option<std::path::PathBuf>,
+    /// tid of the thread that ends the process by returning from [`Process::run`].
+    main_tid: std::sync::atomic::AtomicU32,
+    /// Set in a child forked from another thread: there is no main thread to wait for the
+    /// others, so the last thread to exit ends the process itself.
+    orphaned: AtomicBool,
+    /// How to start a new program for `execve` (the embedder knows how to launch itself).
+    exec: std::sync::OnceLock<ExecFn>,
+}
+
+/// What `execve` asks the embedder to run: a guest executable (a host path) with its
+/// arguments (including `argv[0]`) and environment. Returns only on failure, with a Linux
+/// errno.
+pub type ExecFn = Box<dyn Fn(&Exec) -> i32 + Send + Sync>;
+
+pub struct Exec {
+    pub path: std::path::PathBuf,
+    pub argv: Vec<Vec<u8>>,
+    pub envp: Vec<Vec<u8>>,
 }
 
 struct Threads {
@@ -222,18 +240,72 @@ pub struct Thread {
     pub jit: Option<Jit>,
 }
 
-/// `path` under `sysroot` if it is absolute and exists there (without following a final
-/// symlink out of it), else `path` itself.
-fn resolve(sysroot: Option<&std::path::Path>, path: &std::path::Path) -> std::path::PathBuf {
-    if let Some(root) = sysroot
-        && let Ok(rel) = path.strip_prefix("/")
-    {
-        let candidate = root.join(rel);
-        if std::fs::symlink_metadata(&candidate).is_ok() {
-            return candidate;
+/// `path` under `sysroot` if it is absolute and exists there, else `path` itself. Paths
+/// are resolved as in a chroot: symlinks (with absolute targets inside the sysroot, as
+/// distributions make them) and `..` never leave it. The final component is followed if
+/// it is a symlink only with `follow`.
+pub fn resolve(
+    sysroot: Option<&std::path::Path>,
+    path: &std::path::Path,
+    follow: bool,
+) -> std::path::PathBuf {
+    match sysroot {
+        Some(root) if path.is_absolute() => {
+            resolve_in(root, path, follow).unwrap_or_else(|| path.to_path_buf())
         }
+        _ => path.to_path_buf(),
     }
-    path.to_path_buf()
+}
+
+fn resolve_in(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    follow: bool,
+) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    // Components still to walk, last first; `cur` is the host path reached so far.
+    let mut todo: Vec<std::ffi::OsString> = Vec::new();
+    let push_path = |todo: &mut Vec<std::ffi::OsString>, p: &std::path::Path| {
+        for c in p.components().rev() {
+            match c {
+                Component::Normal(n) => todo.push(n.to_os_string()),
+                Component::ParentDir => todo.push("..".into()),
+                _ => {}
+            }
+        }
+    };
+    push_path(&mut todo, path);
+    let mut cur = root.to_path_buf();
+    let mut depth = 0; // within the sysroot
+    let mut links = 0;
+    while let Some(name) = todo.pop() {
+        if name == ".." {
+            if depth > 0 {
+                cur.pop();
+                depth -= 1;
+            }
+            continue;
+        }
+        let next = cur.join(&name);
+        let meta = std::fs::symlink_metadata(&next).ok()?;
+        let last = todo.is_empty();
+        if meta.file_type().is_symlink() && (follow || !last) {
+            links += 1;
+            if links > 40 {
+                return None; // ELOOP: let the host report it
+            }
+            let target = std::fs::read_link(&next).ok()?;
+            if target.is_absolute() {
+                cur = root.to_path_buf();
+                depth = 0;
+            }
+            push_path(&mut todo, &target);
+            continue;
+        }
+        cur = next;
+        depth += 1;
+    }
+    Some(cur)
 }
 
 fn page_up(a: u64) -> Option<u64> {
@@ -275,7 +347,7 @@ impl Process {
             None => (elf.entry, 0),
             Some(path) => {
                 let path = std::ffi::OsStr::from_bytes(path);
-                let host_path = resolve(sysroot.as_deref(), std::path::Path::new(path));
+                let host_path = resolve(sysroot.as_deref(), std::path::Path::new(path), true);
                 let bytes = std::fs::read(&host_path)
                     .map_err(|e| SpawnError::Interp(host_path.clone(), e))?;
                 let mut interp = loader::parse(&bytes).map_err(SpawnError::Load)?;
@@ -349,6 +421,9 @@ impl Process {
             log: SyscallLog::default(),
             exe,
             sysroot,
+            main_tid: std::sync::atomic::AtomicU32::new(id.pid),
+            orphaned: AtomicBool::new(false),
+            exec: std::sync::OnceLock::new(),
         });
         Ok((
             process,
@@ -464,6 +539,9 @@ impl Process {
         threads.live -= 1;
         threads.last_status = status;
         if threads.live == 0 {
+            if self.orphaned.load(Ordering::Relaxed) {
+                std::process::exit(status);
+            }
             self.all_exited.notify_all();
         }
     }
@@ -498,16 +576,72 @@ impl Process {
     }
 
     /// The host path for guest path `path`: under the sysroot if it is absolute and exists
-    /// there (as QEMU's `-L` does), else unchanged.
-    pub fn host_path<'a>(&self, path: &'a std::ffi::CStr) -> std::borrow::Cow<'a, std::ffi::CStr> {
+    /// there (as QEMU's `-L` does), else unchanged; see [`resolve`] for `follow`.
+    pub fn host_path<'a>(
+        &self,
+        path: &'a std::ffi::CStr,
+        follow: bool,
+    ) -> std::borrow::Cow<'a, std::ffi::CStr> {
         use std::os::unix::ffi::OsStrExt;
         let Some(root) = &self.sysroot else { return path.into() };
         let guest = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
-        let host = resolve(Some(root), guest);
+        let host = resolve(Some(root), guest, follow);
         if host.as_path() == guest {
             return path.into();
         }
         std::ffi::CString::new(host.into_os_string().into_vec()).map_or(path.into(), Into::into)
+    }
+
+    /// Set how `execve` starts a new program (once).
+    pub fn set_exec(&self, exec: ExecFn) {
+        let _ = self.exec.set(exec);
+    }
+
+    /// `execve`: replace this program. Returns only on failure, with a Linux errno.
+    pub fn exec(&self, request: &Exec) -> i32 {
+        match self.exec.get() {
+            Some(exec) => exec(request),
+            None => crate::syscall::errno::ENOSYS,
+        }
+    }
+
+    /// A guest `fork` (or `vfork`, which may copy): fork the host process. Returns the
+    /// child's pid in the parent and 0 in the child, where `thread` is the only thread left,
+    /// as on Linux. The locks other threads could hold are held across the fork, so the
+    /// child never inherits them locked by a thread it does not have.
+    pub fn fork(&self, thread: &mut Thread) -> Result<u32, i32> {
+        let brk = lock(&self.brk);
+        let mut threads = lock(&self.threads);
+        let mut registry = lock(&self.thread_signals);
+        let mut slots = lock(&self.slots);
+        let mut pending = lock(&self.pending);
+        let mut own_pending = lock(&thread.signals.pending);
+        let maps = self.mem.lock_for_fork();
+        // SAFETY: plain fork; the child continues on this thread only, holding the locks.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(crate::syscall::errno::EAGAIN);
+        }
+        if pid > 0 {
+            return Ok(pid as u32);
+        }
+        let new = self.host.identity().pid;
+        if thread.tid != self.main_tid.load(Ordering::Relaxed) {
+            self.orphaned.store(true, Ordering::Relaxed);
+        }
+        self.main_tid.store(new, Ordering::Relaxed);
+        threads.live = 1;
+        let mine = registry.remove(&thread.tid).expect("a running thread is registered");
+        registry.clear();
+        slots.fill(false);
+        slots[mine.slot] = true;
+        registry.insert(new, mine);
+        // A child starts with no pending signals.
+        *pending = Pending::default();
+        *own_pending = Pending::default();
+        thread.tid = new;
+        drop((brk, threads, registry, slots, pending, own_pending, maps));
+        Ok(0)
     }
 
     /// The disposition of `sig` (1..=64).

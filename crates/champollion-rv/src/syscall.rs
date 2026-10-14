@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::ffi::CStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
 use crate::futex;
@@ -19,6 +20,9 @@ use crate::signal;
 /// Linux errno values (asm-generic), which differ from Darwin's past 34 (and at 11).
 pub mod errno {
     pub const EPERM: i32 = 1;
+    pub const E2BIG: i32 = 7;
+    pub const ENOEXEC: i32 = 8;
+    pub const EACCES: i32 = 13;
     pub const ENOENT: i32 = 2;
     pub const EIO: i32 = 5;
     pub const EBADF: i32 = 9;
@@ -263,6 +267,10 @@ pub trait HostOs: Send + Sync {
     }
     /// `linux_dirent64` records for the next entries of directory `fd`, at most `max` bytes.
     fn getdents64(&self, fd: i32, max: usize) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    /// `wait4`: the child's pid and its wait status, Linux-encoded.
+    fn wait4(&self, pid: i32, options: i32) -> Result<(u64, i32), i32> {
         Err(errno::ENOSYS)
     }
 
@@ -610,8 +618,30 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
     const CLONE_CHILD_SETTID: u64 = 0x100_0000;
     let [flags, newsp, parent_tid, tls, child_tid, _] = a;
     let thread = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+    if flags & CLONE_THREAD == 0 {
+        // A new process: fork, or vfork (CLONE_VM | CLONE_VFORK), which may copy memory
+        // instead of sharing it, since its child only runs until execve or _exit.
+        let pid = p.fork(t)?;
+        if pid == 0 {
+            if flags & CLONE_VM != 0 && newsp != 0 {
+                t.cpu.x[2] = newsp;
+            }
+            if flags & CLONE_SETTLS != 0 {
+                t.cpu.x[4] = tls;
+            }
+            if flags & CLONE_CHILD_SETTID != 0 {
+                put(p, child_tid, &t.tid.to_le_bytes())?;
+            }
+            if flags & CLONE_CHILD_CLEARTID != 0 {
+                t.clear_child_tid = child_tid;
+            }
+        } else if flags & CLONE_PARENT_SETTID != 0 {
+            put(p, parent_tid, &pid.to_le_bytes())?;
+        }
+        return Ok(pid as u64);
+    }
     if flags & thread != thread {
-        return Err(errno::ENOSYS); // fork and vfork: new processes come later
+        return Err(errno::EINVAL);
     }
     let tid = p.new_tid();
     let mut cpu = t.cpu.clone();
@@ -640,6 +670,55 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
         return Err(e);
     }
     Ok(tid as u64)
+}
+
+/// A NULL-terminated array of C strings in guest memory (`argv`, `envp`).
+fn read_cstr_array(p: &Process, mut addr: u64) -> Result<Vec<Vec<u8>>, i32> {
+    const MAX: usize = 1 << 16;
+    let mut out = Vec::new();
+    if addr == 0 {
+        return Ok(out);
+    }
+    loop {
+        let mut b = [0u8; 8];
+        p.mem.read(addr, &mut b).map_err(efault)?;
+        let s = u64::from_le_bytes(b);
+        if s == 0 {
+            return Ok(out);
+        }
+        if out.len() == MAX {
+            return Err(errno::E2BIG);
+        }
+        out.push(p.mem.read_cstr(s, 1 << 17).map_err(efault)?.into_bytes());
+        addr += 8;
+    }
+}
+
+/// `execve(path, argv, envp)`: the embedder starts the new program (see
+/// [`Process::exec`]); this only returns on failure.
+fn execve(p: &Process, a: [u64; 6]) -> SysResult {
+    let path = p.mem.read_cstr(a[0], PATH_MAX).map_err(efault)?;
+    let argv = read_cstr_array(p, a[1])?;
+    let envp = read_cstr_array(p, a[2])?;
+    let host =
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(p.host_path(&path, true).to_bytes()));
+    // Refuse what cannot run here before giving up this process: only riscv64 ELF files
+    // and scripts (the embedder handles `#!`).
+    let mut head = [0u8; 20];
+    let n = std::fs::File::open(&host)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => errno::ENOENT,
+            std::io::ErrorKind::PermissionDenied => errno::EACCES,
+            _ => errno::EIO,
+        })?;
+    const EM_RISCV: u16 = 243;
+    let elf =
+        n >= 20 && head[..4] == *b"\x7fELF" && u16::from_le_bytes([head[18], head[19]]) == EM_RISCV;
+    if !elf && !head.starts_with(b"#!") {
+        return Err(errno::ENOEXEC);
+    }
+    Err(p.exec(&crate::process::Exec { path: host, argv, envp }))
 }
 
 /// `futex(uaddr, op, val, timeout or val2, uaddr2, val3)`: the wait, wake, and requeue
@@ -769,7 +848,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::PREAD64 => host.pread(fd, buf(a[1], a[2], Prot::WRITE)?, a[3] as i64),
         nr::OPENAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
-            host.openat(fd, &p.host_path(&path), a[2] as i32, a[3] as u32)
+            host.openat(fd, &p.host_path(&path, true), a[2] as i32, a[3] as u32)
         }
         nr::CLOSE => host.close(fd),
         nr::FCNTL => match a[1] as i32 {
@@ -790,7 +869,9 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         }
         nr::NEWFSTATAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
-            let st = host.fstatat(fd, &p.host_path(&path), a[3] as i32)?;
+            const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+            let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
+            let st = host.fstatat(fd, &p.host_path(&path, follow), a[3] as i32)?;
             write_stat(p, a[2], &st)
         }
         nr::IOCTL => match a[1] {
@@ -822,6 +903,17 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(8)
         }
         nr::CLONE => clone(p, t, a),
+        nr::EXECVE => execve(p, a),
+        nr::WAIT4 => {
+            let (pid, status) = host.wait4(a[0] as i32, a[2] as i32)?;
+            if a[1] != 0 {
+                put(p, a[1], &status.to_le_bytes())?;
+            }
+            if a[3] != 0 {
+                put(p, a[3], &[0; 144])?; // struct rusage: not tracked per child
+            }
+            Ok(pid)
+        }
         nr::FUTEX => futex(p, a),
         // Robust futex lists only matter when a thread dies holding a lock, which ends the
         // whole process here anyway.
@@ -1104,8 +1196,10 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::RENAMEAT => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, 0),
         nr::RENAMEAT2 => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, a[4] as u32),
         nr::MKDIRAT => host.mkdirat(fd, &cstr(a[1])?, a[2] as u32),
-        nr::FACCESSAT => host.faccessat(fd, &p.host_path(&cstr(a[1])?), a[2] as i32, 0),
-        nr::FACCESSAT2 => host.faccessat(fd, &p.host_path(&cstr(a[1])?), a[2] as i32, a[3] as i32),
+        nr::FACCESSAT => host.faccessat(fd, &p.host_path(&cstr(a[1])?, true), a[2] as i32, 0),
+        nr::FACCESSAT2 => {
+            host.faccessat(fd, &p.host_path(&cstr(a[1])?, true), a[2] as i32, a[3] as i32)
+        }
         nr::READLINKAT => {
             let path = cstr(a[1])?;
             // There is no /proc on macOS; answer the one entry nearly every program asks.
@@ -1114,7 +1208,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 put(p, a[2], &p.exe[..n])?;
                 return Ok(n as u64);
             }
-            host.readlinkat(fd, &p.host_path(&path), buf(a[2], a[3], Prot::WRITE)?)
+            host.readlinkat(fd, &p.host_path(&path, false), buf(a[2], a[3], Prot::WRITE)?)
         }
         nr::GETCWD => {
             // Linux returns the length including the terminating NUL.

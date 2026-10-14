@@ -57,6 +57,10 @@ fn alpine_busybox() {
     assert_eq!(out.stderr, b"", "no unsupported syscalls");
     let out = run(&["sh", "-c", "for i in 1 2 3; do echo $((i * i)); done"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n4\n9\n");
+    // Subshells and pipelines fork and exec; /usr/bin/wc is an absolute symlink to
+    // /bin/busybox, resolved inside the sysroot.
+    let out = run(&["sh", "-c", "x=$(echo sub); echo $x $(echo a b c | wc -w)"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sub 3\n");
     // /etc comes from the sysroot.
     let out = run(&["cat", "/etc/alpine-release"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.24.2");
