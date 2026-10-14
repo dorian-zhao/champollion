@@ -36,33 +36,38 @@ fn main() -> ExitCode {
     let mut gdb_port = None;
     let mut argv0 = None;
     let mut sysroot = std::env::var_os("RVRUN_SYSROOT").map(std::path::PathBuf::from);
-    loop {
-        match args.first().and_then(|a| a.to_str()) {
-            Some("-g") => {
-                let port = args.get(1).and_then(|p| p.to_str()?.parse::<u16>().ok());
-                let Some(port) = port else {
-                    eprintln!("rvrun: -g needs a port number\n{USAGE}");
-                    return ExitCode::from(2);
-                };
-                gdb_port = Some(port);
+    if preserved_argv0() && args.len() >= 2 {
+        // Started by binfmt_misc for a guest program: `<path> <argv[0]> [args...]`, no options.
+        argv0 = Some(args.remove(1));
+    } else {
+        loop {
+            match args.first().and_then(|a| a.to_str()) {
+                Some("-g") => {
+                    let port = args.get(1).and_then(|p| p.to_str()?.parse::<u16>().ok());
+                    let Some(port) = port else {
+                        eprintln!("rvrun: -g needs a port number\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    gdb_port = Some(port);
+                }
+                Some("-0") => {
+                    let Some(name) = args.get(1) else {
+                        eprintln!("rvrun: -0 needs an argument\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    argv0 = Some(name.clone());
+                }
+                Some("-L") => {
+                    let Some(dir) = args.get(1) else {
+                        eprintln!("rvrun: -L needs a directory\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    sysroot = Some(dir.into());
+                }
+                _ => break,
             }
-            Some("-0") => {
-                let Some(name) = args.get(1) else {
-                    eprintln!("rvrun: -0 needs an argument\n{USAGE}");
-                    return ExitCode::from(2);
-                };
-                argv0 = Some(name.clone());
-            }
-            Some("-L") => {
-                let Some(dir) = args.get(1) else {
-                    eprintln!("rvrun: -L needs a directory\n{USAGE}");
-                    return ExitCode::from(2);
-                };
-                sysroot = Some(dir.into());
-            }
-            _ => break,
+            args.drain(..2);
         }
-        args.drain(..2);
     }
     if args.is_empty() {
         eprintln!("{USAGE}");
@@ -141,7 +146,11 @@ fn main() -> ExitCode {
             return ExitCode::from(126);
         }
     };
-    proc.set_exec(Box::new(move |req| exec(req, sysroot.as_deref())));
+    // Started by binfmt_misc (route A), the kernel itself knows how to run guest programs.
+    let native_exec = preserved_argv0() && sysroot.is_none();
+    proc.set_exec(Box::new(move |req| {
+        if native_exec { exec_native(req) } else { exec(req, sysroot.as_deref()) }
+    }));
     for sig in (1..=champollion_rv::signal::NSIG).filter(|&s| ignored & (1 << (s - 1)) != 0) {
         let ignore = champollion_rv::signal::Action {
             handler: champollion_rv::signal::SIG_IGN,
@@ -226,6 +235,22 @@ struct CodeCache {
     path: std::path::PathBuf,
     /// Identifies the executable and this build of rvrun, which together determine the code.
     key: u64,
+}
+
+/// Whether binfmt_misc started us for a guest program with the `P` (preserve-argv0) flag,
+/// passing the program's path and then its original `argv[0]` (Linux 5.12+ says so in
+/// `AT_FLAGS`).
+#[cfg(target_os = "linux")]
+fn preserved_argv0() -> bool {
+    const AT_FLAGS_PRESERVE_ARGV0: u64 = 1;
+    // SAFETY: getauxval has no preconditions.
+    let flags = unsafe { libc::getauxval(libc::AT_FLAGS) };
+    flags & AT_FLAGS_PRESERVE_ARGV0 != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preserved_argv0() -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -376,4 +401,39 @@ fn exec(req: &champollion_rv::process::Exec, sysroot: Option<&std::path::Path>) 
     let err = cmd.exec(); // only returns on failure
     // The common errno values agree with Linux.
     err.raw_os_error().unwrap_or(5)
+}
+
+/// A guest `execve` under binfmt_misc: hand it to the kernel as it is. It runs rvrun again
+/// for riscv64 programs and `#!` interpreters, also inside a container or chroot where our
+/// own path is not visible. Signal state goes along as in [`exec`]. Returns a Linux errno
+/// if the exec fails.
+#[cfg(target_os = "linux")]
+fn exec_native(req: &champollion_rv::process::Exec) -> i32 {
+    use std::ffi::CString;
+    let cstr = |b: &[u8]| CString::new(b).ok();
+    let mut envp: Vec<Vec<u8>> = req
+        .envp
+        .iter()
+        .filter(|v| !v.starts_with(b"RVRUN_SIGIGN=") && !v.starts_with(b"RVRUN_SIGMASK="))
+        .cloned()
+        .collect();
+    envp.push(format!("RVRUN_SIGIGN={:x}", req.ignored).into_bytes());
+    envp.push(format!("RVRUN_SIGMASK={:x}", req.mask).into_bytes());
+    let (Some(path), Some(argv), Some(envp)) = (
+        cstr(req.path.as_os_str().as_bytes()),
+        req.argv.iter().map(|a| cstr(a)).collect::<Option<Vec<_>>>(),
+        envp.iter().map(|v| cstr(v)).collect::<Option<Vec<_>>>(),
+    ) else {
+        return 22; // EINVAL: a NUL inside an argument
+    };
+    let ptrs =
+        |v: &[CString]| v.iter().map(|c| c.as_ptr()).chain([std::ptr::null()]).collect::<Vec<_>>();
+    // SAFETY: NUL-terminated strings in NULL-terminated arrays; returns only on failure.
+    unsafe { libc::execve(path.as_ptr(), ptrs(&argv).as_ptr(), ptrs(&envp).as_ptr()) };
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(5)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exec_native(_: &champollion_rv::process::Exec) -> i32 {
+    unreachable!("binfmt_misc exists only on Linux")
 }

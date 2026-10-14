@@ -115,6 +115,7 @@ name = "rvrun"
 version = "0.1.0"
 dependencies = [
  "champollion-rv",
+ "libc",
 ]
 
 [[package]]
