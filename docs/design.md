@@ -190,7 +190,10 @@ Real program (Lua 5.4 running a fib + table sort + concat script, 1.94 G guest i
 | + FP arithmetic on the host FPU, FP registers pinned | 1.55× slower | 1.52× slower | 2.7× slower | 2.9× slower |
 | + `instret` in x30, t0–t2 pinned | 1.53× slower | 1.43× slower | 2.6× slower | 2.2× slower |
 | + direct `auipc`/`lui` + `jalr`, probe inlined | 1.49× slower | 1.39× slower | 2.3× slower | 2.1× slower |
-| + base-register address cache | **1.48× slower** | **1.36× slower** | **2.2× slower** | **1.98× slower** |
+| + base-register address cache | 1.48× slower | 1.36× slower | 2.2× slower | 1.98× slower |
+| + blocks continue past conditional branches | **1.52× slower** | **1.37× slower** | **2.0× slower** | **1.87× slower** |
+
+(The last row is against native runs from the same session: 29.4, 69.8, 94.3, and 182 ms.)
 
 JIT statistics (`RVRUN_STATS=1`) drove the steps up to FP: they showed Lua flushing the JIT on each data `mmap`, then 8.3M instructions bouncing through the interpreter. The sampling profiler (`RVRUN_PROF`) drove the rest:
 
@@ -199,7 +202,13 @@ JIT statistics (`RVRUN_STATS=1`) drove the steps up to FP: they showed Lua flush
 - Far calls (`auipc` + `jalr`) went through the jump cache although their target is a constant.
 - Prologues and epilogues are runs of stack accesses, each paying add, mask, and a register-offset access.
 
-Lua and SQLite now run at a higher IPC than native (5.6 vs. 4.5–4.9 instructions per cycle) but execute 2.5× the instructions: 1.2× from RISC-V needing more instructions than arm64, the rest our expansion. Instructions off the critical path are nearly free on these wide cores (a leaner jump-cache probe and canonical `mov`s measured no change); what still costs is per-block overhead (exits, branch tails) and latency chains. Masking each new base register costs Lua 5% and SQLite 3% on pointer chasing.
+Lua and SQLite now run at a higher IPC than native (5.6 vs. 4.5–4.9 instructions per cycle) but execute 2.5× the instructions: 1.2× from RISC-V needing more instructions than arm64, the rest our expansion. Instructions off the critical path are nearly free on these wide cores (a leaner jump-cache probe and canonical `mov`s measured no change); what still costs is per-block overhead (exits, branch tails) and latency chains. Masking each new base register costs Lua 5% and SQLite 3% on pointer chasing. Ending blocks at conditional branches was such per-block overhead: the not-taken path paid a taken `b` and the next block's `instret` update. Blocks now run on past them and leave through side exits (Lua -10%, SQLite -5%, and 35% fewer translations).
+
+Short programs are dominated by translation instead. A Rust test binary (`cargo test` through rvrun) runs only 1.7M instructions but translates 2.3k blocks, at about 2 µs each. Batching instruction-cache maintenance and W^X switches, finding bitmask immediates without a loop, and fetching through a TLB took it from 10.0 to 8.4 ms; the persistent code cache (below) takes a repeated run to 5.5 ms (hello alone takes 2.9 ms, native 1.9 ms).
+
+#### Persistent code cache
+
+Rosetta 2 translates ahead of time and caches the result. We cache after the fact: at exit, rvrun saves the code buffer and its tables (blocks, exits waiting to be chained, fault sites) in `~/Library/Caches/champollion`, keyed by the executable's contents and the rvrun build, and the next run of the same executable loads them at the same offsets. That needs position-independent code; the only host address generated code held was the jump cache's, which now sits in a data area at the end of the code buffer's mapping and is reached with `adrp` (macOS refuses `MAP_FIXED` for `MAP_JIT`, so it cannot be a separate mapping at a fixed distance). A snapshot is valid because our loader places an executable deterministically; only translations of that startup image are saved, so a run that changes executable mappings or executes `fence.i` saves nothing. With dynamic linking (M5) the key will have to cover the mapped libraries too.
 
 The per-access lock and B-tree lookup cost the reference interpreter 3.6×, mostly on instruction fetch. The engine (below) recovers that and more without giving up thread safety. Closing the remaining gap is the JIT's job (M4), as it is for QEMU's TCG.
 
@@ -255,7 +264,7 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 1. **Compliance tests:** `riscv-tests` and `riscv-arch-test`, run as each extension lands.
 2. **Differential tests:** Python generates random instruction sequences; compare register and memory state between this project's interpreter and Spike.
-3. **JIT vs. interpreter:** in debug mode, compare both sides' state after every block to find the first diverging block.
+3. **JIT vs. interpreter:** riscv-tests run on the interpreter, the engine, and the JIT, which must end in identical `CpuState`. `jit::tests::fuzz` generates random looping programs (integer, M, A, and F/D instructions, accesses through moving base registers, branches, direct and indirect jumps) and compares traps, the whole CPU state, and memory between the interpreter, the JIT, and the JIT running restored translations; `FUZZ_CASES` and `FUZZ_SEED` run longer campaigns. Its first run found a wrong `divuw` by x0.
 4. **Real programs:** static builds of busybox, lua, and sqlite, with output compared against QEMU.
 
 ## Open Questions
@@ -266,6 +275,7 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 ## Decision Log
 
+- **Oct 14, 2026 — Code cache as snapshots of the code buffer, not ahead-of-time translation.** Translating a whole executable up front would translate cold and data-in-text bytes and needs a separate code layout; saving what a run actually translated reuses the JIT unchanged and only required removing the one host address from generated code. See [Persistent code cache](#persistent-code-cache).
 - **Oct 14, 2026 — Generated code keeps masking guest addresses.** The mask keeps a guest from reaching host memory outside its reservation, as a sandbox would (QEMU linux-user does not mask). It costs Lua 5% and SQLite 3%, on pointer chasing; isolation is worth more than that.
 - **Oct 14, 2026 — `instret` stays exact.** Counted per block in x30, it costs under 1% (removing it entirely measured 0.6–0.8%), so there is no case for a cheaper approximate mode.
 - **Oct 14, 2026 — No return-address prediction for guest returns.** We translated guest calls to `bl` into a call stub with a landing pad, and returns to `ret` through the jump cache, as Rosetta 2 does. The first version made recursive code 2× slower: overlapping blocks each had their own landing pad for the same call, so the `bl` pushed one pad while the jump cache held another and every return mispredicted. With one shared stub per call the mispredicts were gone (no profile samples on landing pads), but Lua, SQLite, and Rust tests ended within ±3% of plain `br`: Apple's indirect predictor already predicts our returns well, and the stubs cost a host register (t2 went back to memory). Dropped; revisit for call-heavy C++ code with many callers per function.
