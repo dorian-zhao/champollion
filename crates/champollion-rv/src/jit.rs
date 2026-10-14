@@ -71,6 +71,8 @@ pub struct Jit {
     unchained: HashMap<u64, Vec<usize>, BuildHasherDefault<PcHasher>>,
     /// Slot of the interrupt flag generated code checks.
     interrupt_slot: u32,
+    /// Whether the translations are for guest memory in the identity layout.
+    identity: bool,
     /// Whether translations were never dropped since the JIT started (or restored), so all of
     /// them come from the startup image and may be saved (see [`persist`]).
     pristine: bool,
@@ -162,6 +164,7 @@ impl Jit {
             chaining: true,
             pristine: true,
             interrupt_slot: 0,
+            identity: false,
             stats: Stats::default(),
             profiler: None,
         };
@@ -213,7 +216,9 @@ impl Jit {
             let cache = self.code.data_offset() as i64;
             let stub = self.stub_word as i64;
             let slot = self.interrupt_slot;
-            let Some(t) = translate::translate(&block, pc, word, stub, cache, slot) else {
+            let identity = self.identity;
+            let Some(t) = translate::translate(&block, pc, word, stub, cache, slot, identity)
+            else {
                 return Ok(None);
             };
             match self.code.append(&t.code) {
@@ -310,9 +315,10 @@ impl Jit {
                 return None;
             }
             let generation = mem.code_generation();
-            if generation != self.generation {
+            if generation != self.generation || mem.is_identity() != self.identity {
                 self.reset();
                 self.generation = generation;
+                self.identity = mem.is_identity();
             }
             let at = match self.lookup(cpu.pc, mem) {
                 Ok(Some(at)) => {
@@ -345,7 +351,9 @@ impl Jit {
             self.code.commit();
             let code = {
                 let _active = fault::Active::enter(&self.faults);
-                unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at), fpcr) }
+                let membase =
+                    if self.identity { mem.control_area().cast() } else { mem.host_base() };
+                unsafe { (self.enter)(cpu, membase, self.code.ptr(at), fpcr) }
             };
             self.stats.exits[code.min(6) as usize] += 1;
             if code == exit::NEXT && self.blocks.contains_key(&cpu.pc) {
@@ -367,7 +375,8 @@ impl Jit {
                 exit::FENCE_I => self.reset(),
                 exit::INTERRUPT => return None,
                 exit::FAULT_LOAD | exit::FAULT_STORE => {
-                    let fault = MemFault { addr: self.faults.fault_addr.get() };
+                    let host = self.faults.fault_addr.get();
+                    let fault = MemFault { addr: host.wrapping_sub(mem.host_base() as u64) };
                     let pc = cpu.pc;
                     return Some(if code == exit::FAULT_LOAD {
                         Trap::LoadFault { pc, fault }
@@ -392,11 +401,16 @@ mod tests {
 
     fn setup(prog: &[u32]) -> GuestMemory {
         let mem = GuestMemory::new().unwrap();
+        load_program(&mem, prog);
+        mem
+    }
+
+    /// Map code (holding `prog`) and data pages.
+    fn load_program(mem: &GuestMemory, prog: &[u32]) {
         mem.map(CODE, 0x1000, Prot::READ | Prot::EXEC).unwrap();
         mem.map(DATA, 0x1000, Prot::RW).unwrap();
         let bytes: Vec<u8> = prog.iter().flat_map(|w| w.to_le_bytes()).collect();
         mem.write_privileged(CODE, &bytes).unwrap();
-        mem
     }
 
     /// Run `prog` on the interpreter and on the JIT until a trap; both must agree exactly.
@@ -990,19 +1004,27 @@ mod tests {
             Restored,
         }
 
+        /// Runs `prog` with guest memory in the identity layout if `identity`, or returns
+        /// `None` if that layout is not available (macOS, or another test has it).
         fn run(
             prog: &[u32],
             init: &CpuState,
             data: &[u8],
             mode: Mode,
-        ) -> (Trap, CpuState, Vec<u8>) {
+            identity: bool,
+        ) -> Option<(Trap, CpuState, Vec<u8>)> {
             let memory = || {
-                let mem = setup(prog);
+                let mem = if identity {
+                    GuestMemory::new_identity()?
+                } else {
+                    GuestMemory::new().ok()?
+                };
+                load_program(&mem, prog);
                 mem.map(DATA + 0x1000, DATA_SIZE - 0x1000, Prot::RW).unwrap();
                 mem.write_privileged(DATA, data).unwrap();
-                mem
+                Some(mem)
             };
-            let mut mem = memory();
+            let mut mem = memory()?;
             let mut cpu = init.clone();
             let trap = if mode != Mode::Interpreter {
                 let mut jit = Jit::new().unwrap();
@@ -1010,7 +1032,8 @@ mod tests {
                 // (Nothing to save if the program ended before a block was translated.)
                 if let (Mode::Restored, Some(saved)) = (mode, jit.save(1)) {
                     let mut jit = Jit::new().unwrap();
-                    mem = memory();
+                    drop(mem); // (it holds the identity layout's range)
+                    mem = memory()?;
                     cpu = init.clone();
                     jit.restore(&saved, 1, &mem).unwrap();
                     jit.run(&mut cpu, &mem)
@@ -1029,7 +1052,7 @@ mod tests {
             };
             let mut out = vec![0; data.len()];
             mem.read_privileged(DATA, &mut out).unwrap();
-            (trap, cpu, out)
+            Some((trap, cpu, out))
         }
 
         #[test]
@@ -1045,6 +1068,7 @@ mod tests {
                     .unwrap_or(default)
             };
             let mut rng = Rng(env("FUZZ_SEED", 0x9e37_79b9_7f4a_7c15));
+            let mut identity_runs = 0;
             for case in 0..env("FUZZ_CASES", 1000) {
                 // Each case: a seed that reproduces it alone (set `rng.0` to it).
                 let seed = rng.0;
@@ -1077,14 +1101,29 @@ mod tests {
                 init.x[COUNTER as usize] = 1 + rng.below(3);
                 init.fcsr = (rng.below(5) as u32) << 5;
                 let data: Vec<u8> = (0..DATA_SIZE).map(|_| rng.next() as u8).collect();
-                let want = run(&prog, &init, &data, Mode::Interpreter);
-                for mode in [Mode::Jit, Mode::Restored] {
-                    let got = run(&prog, &init, &data, mode);
-                    let which = if mode == Mode::Jit { "jit" } else { "restored" };
+                let want = run(&prog, &init, &data, Mode::Interpreter, false).unwrap();
+                for (mode, identity) in [
+                    (Mode::Jit, false),
+                    (Mode::Restored, false),
+                    (Mode::Jit, true),
+                    (Mode::Restored, true),
+                ] {
+                    let Some(got) = run(&prog, &init, &data, mode, identity) else { continue };
+                    identity_runs += u32::from(identity);
+                    let which = match (mode, identity) {
+                        (Mode::Jit, false) => "jit",
+                        (Mode::Restored, false) => "restored",
+                        (Mode::Jit, true) => "jit (identity layout)",
+                        _ => "restored (identity layout)",
+                    };
                     assert_eq!(got.0, want.0, "case {case} (seed {seed:#x}): {which} trap");
                     assert_eq!(got.1, want.1, "case {case} (seed {seed:#x}): {which} state");
                     assert!(got.2 == want.2, "case {case} (seed {seed:#x}): {which} memory");
                 }
+            }
+            // Other tests may hold the identity layout's range for a while, but not always.
+            if cfg!(target_os = "linux") {
+                assert!(identity_runs > 0, "the identity layout was never available");
             }
         }
     }

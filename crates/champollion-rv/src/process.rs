@@ -397,7 +397,11 @@ impl Process {
         if elf.span().is_none_or(|(_, hi)| hi > MMAP_TOP) {
             return Err(SpawnError::BadLayout);
         }
-        let mem = GuestMemory::new().map_err(SpawnError::Reserve)?;
+        // The identity layout lets system calls pass guest pointers through.
+        let mem = match GuestMemory::new_identity() {
+            Some(mem) => mem,
+            None => GuestMemory::new().map_err(SpawnError::Reserve)?,
+        };
         let brk = loader::map_elf(&mem, &elf).map_err(SpawnError::Map)?;
         mem.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::RW).map_err(SpawnError::Map)?;
         mem.map(SIGRETURN_TRAMPOLINE, GUEST_PAGE_SIZE, Prot::READ | Prot::EXEC)

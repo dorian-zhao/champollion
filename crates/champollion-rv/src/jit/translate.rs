@@ -39,6 +39,10 @@ use crate::memory::{CONTROL_OFFSET, GUARD_SIZE, GUEST_SIZE};
 const _: () = assert!(CONTROL_OFFSET.is_multiple_of(4096) && CONTROL_OFFSET >> 12 < 4096);
 
 pub const CTX: Reg = 28;
+/// Host address of guest address 0 (`GuestMemory::host_base`) in the offset layout. In the
+/// identity layout, guest addresses are host addresses and this holds the control area
+/// (`GuestMemory::control_area`) instead, which the interrupt check then reaches in one
+/// load.
 pub const MEMBASE: Reg = 27;
 const SRC0: Reg = 14;
 const SRC1: Reg = 15;
@@ -144,7 +148,8 @@ fn f_offset(r: u8) -> u32 {
 /// host memory outside the reservation, whatever address the guest computes.
 ///
 /// Accesses through a base register mask the base, not the sum: `ADDR` gets the host
-/// address `MEMBASE + (rs1 & ADDR_MASK)`, and the access adds its offset as an immediate.
+/// address `MEMBASE + (rs1 & ADDR_MASK)` (just the masked address in the identity layout),
+/// and the access adds its offset as an immediate.
 /// The offset (under 32 KiB, or down to -256) can then step just past either end of the
 /// guest space, into the guard region that [`GUARD_SIZE`] reserves there, and fault. While
 /// the base register is not written, later accesses through it reuse `ADDR`: a run of
@@ -217,6 +222,8 @@ struct Tx {
     base_reused: bool,
     /// The interrupt flag this thread's code checks (see [`Tx::interrupt_check`]).
     interrupt_slot: u32,
+    /// Whether guest memory uses the identity layout (see [`MEMBASE`]).
+    identity: bool,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -228,6 +235,23 @@ fn sext(imm: i32) -> u64 {
 }
 
 impl Tx {
+    /// Turn the masked guest address in `ADDR` into a host address.
+    fn host_address(&mut self) {
+        if !self.identity {
+            self.a.add(ADDR, MEMBASE, ADDR);
+        }
+    }
+
+    /// Base and index registers of a register-offset access to the masked guest address in
+    /// `ADDR`: `[MEMBASE, ADDR]`, or `[ADDR, xzr]` in the identity layout.
+    fn base_reg(&self) -> Reg {
+        if self.identity { ADDR } else { MEMBASE }
+    }
+
+    fn index_reg(&self) -> Reg {
+        if self.identity { XZR } else { ADDR }
+    }
+
     /// Host register holding guest `r`'s value, loading it into `scratch` if unpinned.
     fn src(&mut self, r: u8, scratch: Reg) -> Reg {
         match (r, HOST_REG[r as usize]) {
@@ -283,7 +307,7 @@ impl Tx {
 
     /// Prepare a `size`-byte access to `rs1 + imm`. Returns the immediate offset to use from
     /// `ADDR` (which holds the base register's host address, see [`ADDR_MASK`]), or `None`
-    /// to use `[MEMBASE, ADDR]` with the masked guest address in `ADDR`.
+    /// to use a register-offset access to the masked guest address in `ADDR`.
     fn mem_operand(&mut self, rs1: u8, imm: i32, size: u32) -> Option<i32> {
         let cached = self.addr_base == Some(rs1);
         // With a zero offset and no reuse, the masked address alone is one instruction
@@ -292,7 +316,7 @@ impl Tx {
             if !cached {
                 let base = self.src(rs1, SRC0);
                 self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
-                self.a.add(ADDR, MEMBASE, ADDR);
+                self.host_address();
                 self.addr_base = Some(rs1);
             }
             return Some(imm);
@@ -306,7 +330,7 @@ impl Tx {
     fn load_int(&mut self, mem: Mem, d: Reg, operand: Option<i32>) {
         match operand {
             Some(off) => assert!(self.a.ldr_imm(mem, d, ADDR, off)),
-            None => self.a.ldr_reg(mem, d, MEMBASE, ADDR),
+            None => self.a.ldr_reg(mem, d, self.base_reg(), self.index_reg()),
         }
     }
 
@@ -345,8 +369,12 @@ impl Tx {
     /// or an indirect one. So every loop passes a check, even a tight one, while forward
     /// edges and returns stay free.
     fn interrupt_check(&mut self, target: Option<u64>) {
-        self.a.sub_imm_lsl12(DST, MEMBASE, (CONTROL_OFFSET >> 12) as u32);
-        self.a.ldr_off_w(DST, DST, self.interrupt_slot * 4);
+        if self.identity {
+            self.a.ldr_off_w(DST, MEMBASE, self.interrupt_slot * 4);
+        } else {
+            self.a.sub_imm_lsl12(DST, MEMBASE, (CONTROL_OFFSET >> 12) as u32);
+            self.a.ldr_off_w(DST, DST, self.interrupt_slot * 4);
+        }
         let check = self.a.pos();
         self.a.cbnz(DST, check); // patched once the tail exists
         let tail = match target {
@@ -381,7 +409,7 @@ impl Tx {
                 self.accesses.push((self.a.pos(), pc, self.retired, false));
                 match operand {
                     Some(off) => assert!(self.a.ldr_imm(mem, d, ADDR, off)),
-                    None => self.a.ldr_reg(mem, d, MEMBASE, ADDR),
+                    None => self.a.ldr_reg(mem, d, self.base_reg(), self.index_reg()),
                 }
                 self.commit(rd, d);
             }
@@ -397,7 +425,7 @@ impl Tx {
                 self.accesses.push((self.a.pos(), pc, self.retired, true));
                 match operand {
                     Some(off) => assert!(self.a.str_imm(mem, v, ADDR, off)),
-                    None => self.a.str_reg(mem, v, MEMBASE, ADDR),
+                    None => self.a.str_reg(mem, v, self.base_reg(), self.index_reg()),
                 }
             }
             // Conservatively a full barrier; mapping pred/succ to dmb variants comes later.
@@ -411,7 +439,7 @@ impl Tx {
                 match (width, FHOST_REG[rd as usize]) {
                     (FWidth::D, Some(h)) => match operand {
                         Some(off) => assert!(self.a.ldr_fp_imm(Fp::D, h, ADDR, off)),
-                        None => self.a.ldr_fp_reg(Fp::D, h, MEMBASE, ADDR),
+                        None => self.a.ldr_fp_reg(Fp::D, h, self.base_reg(), self.index_reg()),
                     },
                     (FWidth::D, None) => {
                         self.load_int(Mem::U64, DST, operand);
@@ -434,7 +462,7 @@ impl Tx {
                         // A single store writes the low 32 bits, boxed or not.
                         match operand {
                             Some(off) => assert!(self.a.str_fp_imm(size, h, ADDR, off)),
-                            None => self.a.str_fp_reg(size, h, MEMBASE, ADDR),
+                            None => self.a.str_fp_reg(size, h, self.base_reg(), self.index_reg()),
                         }
                     }
                     None => {
@@ -444,7 +472,7 @@ impl Tx {
                         let mem = if width == FWidth::D { Mem::U64 } else { Mem::U32 };
                         match operand {
                             Some(off) => assert!(self.a.str_imm(mem, SRC1, ADDR, off)),
-                            None => self.a.str_reg(mem, SRC1, MEMBASE, ADDR),
+                            None => self.a.str_reg(mem, SRC1, self.base_reg(), self.index_reg()),
                         }
                     }
                 }
@@ -508,7 +536,7 @@ impl Tx {
                 let d = self.dst(rd);
                 self.accesses.push((self.a.pos(), pc, self.retired, false));
                 let mem = if width == AmoWidth::D { Mem::U64 } else { Mem::S32 };
-                self.a.ldr_reg(mem, d, MEMBASE, ADDR);
+                self.a.ldr_reg(mem, d, self.base_reg(), self.index_reg());
                 self.a.str_off(SRC1, CTX, RESERVED_ADDR);
                 self.a.str_off(d, CTX, RESERVED_VALUE);
                 self.commit(rd, d);
@@ -627,7 +655,7 @@ impl Tx {
                 let base = self.src(rs1, SRC0);
                 self.require_aligned(base, width, pc);
                 self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
-                self.a.add(ADDR, MEMBASE, ADDR);
+                self.host_address();
                 let mut v = self.src(rs2, SRC1);
                 let lse = match op {
                     AmoOp::Swap => AtomicOp::Swp,
@@ -743,7 +771,7 @@ impl Tx {
         let to_fail = self.a.pos();
         self.a.b_cond(Cond::Ne, to_fail); // patched below
         self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
-        self.a.add(ADDR, MEMBASE, ADDR);
+        self.host_address();
         let v = self.src(rs2, SRC1);
         self.a.ldr_off(DST, CTX, RESERVED_VALUE);
         self.a.mov(SRC0, DST);
@@ -1084,6 +1112,7 @@ pub fn translate(
     stub_word: i64,
     jump_cache: i64,
     interrupt_slot: u32,
+    identity: bool,
 ) -> Option<Translation> {
     let mut tx = Tx {
         a: Asm::new(),
@@ -1097,6 +1126,7 @@ pub fn translate(
         addr_base: None,
         base_reused: false,
         interrupt_slot,
+        identity,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.

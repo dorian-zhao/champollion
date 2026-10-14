@@ -19,7 +19,7 @@ use super::fault::Site;
 use super::{Jit, translate};
 use crate::memory::GuestMemory;
 
-const MAGIC: &[u8; 8] = b"CHMPJIT1";
+const MAGIC: &[u8; 8] = b"CHMPJIT2";
 
 impl Jit {
     /// Whether the translations so far can be saved (see the module docs).
@@ -37,6 +37,7 @@ impl Jit {
         w.0.extend_from_slice(MAGIC);
         w.u64(key);
         w.u64(self.stub_word as u64);
+        w.u64(u64::from(self.identity));
         w.u64(self.code.used() as u64);
         w.0.extend_from_slice(self.code.code());
         w.u64(self.blocks.len() as u64);
@@ -66,6 +67,7 @@ impl Jit {
     /// on error the JIT is left empty.
     pub fn restore(&mut self, bytes: &[u8], key: u64, mem: &GuestMemory) -> Result<usize, String> {
         self.reset();
+        self.identity = mem.is_identity();
         let result = self.load(bytes, key);
         if result.is_err() {
             self.reset();
@@ -85,6 +87,9 @@ impl Jit {
         }
         if r.u64()? != self.stub_word as u64 {
             return Err("made by another build".into());
+        }
+        if r.u64()? != u64::from(self.identity) {
+            return Err("made for another memory layout".into());
         }
         let used = r.u64()? as usize;
         if used > self.code.capacity() || !used.is_multiple_of(4) {

@@ -15,7 +15,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use super::translate::{CTX, EXIT_CODE, INSTRET_REG, MEMBASE, exit};
+use super::translate::{CTX, EXIT_CODE, INSTRET_REG, exit};
 use crate::cpu::CpuState;
 
 /// What generated code was doing at a recorded host instruction.
@@ -33,7 +33,7 @@ pub struct Table {
     pub code_len: usize,
     pub stub: usize,
     pub sites: HashMap<usize, Site>,
-    /// Guest address of the last fault, set by the handler.
+    /// Host address of the last fault, set by the handler.
     pub fault_addr: Cell<u64>,
 }
 
@@ -127,7 +127,7 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
         const _: () = assert!(INSTRET_REG == 30);
         (*mc).__ss.__lr -= site.instret_undo as u64;
         let far = (*mc).__es.__far;
-        t.fault_addr.set(far.wrapping_sub(regs[MEMBASE as usize]));
+        t.fault_addr.set(far);
         regs[EXIT_CODE as usize] = if site.store { exit::FAULT_STORE } else { exit::FAULT_LOAD };
         (*mc).__ss.__pc = t.stub as u64;
     }
@@ -151,7 +151,7 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
         let cpu = mc.regs[CTX as usize] as *mut CpuState;
         (*cpu).pc = site.guest_pc;
         mc.regs[INSTRET_REG as usize] -= site.instret_undo as u64;
-        t.fault_addr.set(mc.fault_address.wrapping_sub(mc.regs[MEMBASE as usize]));
+        t.fault_addr.set(mc.fault_address);
         mc.regs[EXIT_CODE as usize] = if site.store { exit::FAULT_STORE } else { exit::FAULT_LOAD };
         mc.pc = t.stub as u64;
     }

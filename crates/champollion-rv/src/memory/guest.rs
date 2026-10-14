@@ -4,9 +4,12 @@
 //! range is reserved `PROT_NONE` up front, which costs no physical memory; pages are
 //! committed as the guest maps them. [`GUARD_SIZE`] bytes on either side stay `PROT_NONE`
 //! forever, so the JIT may add a small offset to an in-range address without masking the
-//! sum: the access either lands in the guest space or faults. Below the lower guard lies a
-//! read/write control area for the runtime: one interrupt flag per thread slot, which
-//! generated code checks at block entry (see [`GuestMemory::interrupt_flag`]).
+//! sum: the access either lands in the guest space or faults. A read/write control area
+//! holds one interrupt flag per thread slot for the runtime, which generated code checks
+//! (see [`GuestMemory::interrupt_flag`]).
+//!
+//! There are two layouts. The offset layout (macOS, and the fallback) puts the guest space
+//! anywhere and the control area just below its lower guard:
 //!
 //! ```text
 //! base - CONTROL_OFFSET   interrupt flags (INTERRUPT_SLOTS x u32)
@@ -14,6 +17,13 @@
 //! base                    guest address 0
 //! base + GUEST_SIZE       guard
 //! ```
+//!
+//! The identity layout (Linux, route A) puts guest address `g` at host address `g`
+//! (`base` is 0), so guest pointers are host pointers and system calls can pass them to the
+//! kernel as they are. The guest space then starts at the lowest address the host lets a
+//! process map ([`GuestMemory::lowest`]), what lies below acts as the lower guard, and the
+//! control area is a separate mapping. macOS reserves the low 4 GiB of every process, so
+//! it always uses the offset layout.
 //!
 //! Guest pages are 4 KiB (what Linux on RISC-V reports in `AT_PAGESZ`), but macOS on arm64
 //! uses 16 KiB host pages, so host protections cannot represent guest permissions exactly.
@@ -157,21 +167,33 @@ impl Maps {
     }
 
     /// The highest free range of `len` bytes that ends at or below `limit`.
-    fn find_free(&self, len: u64, limit: u64) -> Result<u64, MapError> {
-        self.find_free_aligned(len, limit, GUEST_PAGE_SIZE)
+    fn find_free(&self, len: u64, limit: u64, floor: u64) -> Result<u64, MapError> {
+        self.find_free_aligned(len, limit, GUEST_PAGE_SIZE, floor)
     }
 
-    /// Like `find_free`, for a range starting at a multiple of `align`.
-    fn find_free_aligned(&self, len: u64, limit: u64, align: u64) -> Result<u64, MapError> {
+    /// Like `find_free`, for a range starting at a multiple of `align`. Nothing below
+    /// `floor` is free.
+    fn find_free_aligned(
+        &self,
+        len: u64,
+        limit: u64,
+        align: u64,
+        floor: u64,
+    ) -> Result<u64, MapError> {
         let mut hi = limit.min(GUEST_SIZE) & !(GUEST_PAGE_SIZE - 1);
         // Walk mappings from the top down, looking for a gap of `len` below `hi`.
         for (&start, m) in self.0.range(..hi).rev() {
-            if m.end <= hi && hi - m.end >= len && ((hi - len) & !(align - 1)) >= m.end {
+            let bottom = m.end.max(floor);
+            if hi >= bottom && hi - bottom >= len && ((hi - len) & !(align - 1)) >= bottom {
                 return Ok((hi - len) & !(align - 1));
             }
             hi = hi.min(start);
         }
-        if hi >= len { Ok((hi - len) & !(align - 1)) } else { Err(MapError::NoSpace) }
+        if hi >= floor + len && ((hi - len) & !(align - 1)) >= floor {
+            Ok((hi - len) & !(align - 1))
+        } else {
+            Err(MapError::NoSpace)
+        }
     }
 }
 
@@ -192,7 +214,15 @@ impl Maps {
 /// threads (M5), `munmap` must additionally wait until every running thread has observed
 /// the new generation before decommitting host pages.
 pub struct GuestMemory {
+    /// Host address of guest address 0, with the provenance of the reservation (in the
+    /// identity layout, an address of 0 derived from it).
     base: *mut u8,
+    /// The lowest guest address that can be mapped.
+    lowest: u64,
+    /// The interrupt flags (see [`GuestMemory::interrupt_flag`]).
+    control: *mut u32,
+    /// What `drop` unmaps: the reservation, and in the identity layout the control area.
+    owned: [(*mut libc::c_void, usize); 2],
     host_page: u64,
     maps: RwLock<Maps>,
     generation: AtomicU64,
@@ -246,6 +276,102 @@ unsafe impl Send for GuestMemory {}
 unsafe impl Sync for GuestMemory {}
 
 impl GuestMemory {
+    /// A guest address space in the identity layout (see the module docs), or `None` if the
+    /// host has none (macOS) or the guest range is not free: another `GuestMemory` has it,
+    /// or the host program was linked into it (see `.cargo/config.toml`).
+    #[cfg(not(target_os = "linux"))]
+    pub fn new_identity() -> Option<Self> {
+        None
+    }
+
+    /// See the other `new_identity`.
+    #[cfg(target_os = "linux")]
+    pub fn new_identity() -> Option<Self> {
+        let host_page = Self::host_page_size();
+        let min = std::fs::read_to_string("/proc/sys/vm/mmap_min_addr")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(65536);
+        let lowest = min.max(GUEST_PAGE_SIZE).next_multiple_of(host_page);
+        let len = (GUEST_SIZE + GUARD_SIZE - lowest) as usize;
+        // SAFETY: a PROT_NONE reservation that refuses to replace existing mappings.
+        let start = unsafe {
+            libc::mmap(
+                lowest as *mut libc::c_void,
+                len,
+                libc::PROT_NONE,
+                libc::MAP_ANONYMOUS
+                    | libc::MAP_PRIVATE
+                    | libc::MAP_NORESERVE
+                    | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        if start == libc::MAP_FAILED {
+            return None;
+        }
+        if start as u64 != lowest {
+            // A kernel older than MAP_FIXED_NOREPLACE (4.17) took it as a hint.
+            // SAFETY: unmapping what we just mapped.
+            unsafe { libc::munmap(start, len) };
+            return None;
+        }
+        // SAFETY: a fresh anonymous read/write mapping.
+        let control = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                CONTROL_SIZE as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if control == libc::MAP_FAILED {
+            // SAFETY: unmapping our reservation.
+            unsafe { libc::munmap(start, len) };
+            return None;
+        }
+        Some(Self::with_layout(
+            start.cast::<u8>().wrapping_sub(lowest as usize),
+            lowest,
+            control.cast(),
+            [(start, len), (control, CONTROL_SIZE as usize)],
+            host_page,
+        ))
+    }
+
+    fn host_page_size() -> u64 {
+        // SAFETY: sysconf has no preconditions.
+        let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        assert!(host_page.is_power_of_two() && host_page >= GUEST_PAGE_SIZE);
+        host_page
+    }
+
+    fn with_layout(
+        base: *mut u8,
+        lowest: u64,
+        control: *mut u32,
+        owned: [(*mut libc::c_void, usize); 2],
+        host_page: u64,
+    ) -> Self {
+        Self {
+            readers: Mutex::default(),
+            pending: Mutex::default(),
+            base,
+            lowest,
+            control,
+            owned,
+            host_page,
+            maps: RwLock::default(),
+            generation: AtomicU64::new(0),
+            code_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// A guest address space in the offset layout (see the module docs). Any number of them
+    /// can exist at once.
     pub fn new() -> std::io::Result<Self> {
         // SAFETY: anonymous PROT_NONE reservation; no existing memory is affected.
         let start = unsafe {
@@ -269,23 +395,36 @@ impl GuestMemory {
             return Err(std::io::Error::last_os_error());
         }
         let base = start.cast::<u8>().wrapping_add(CONTROL_OFFSET as usize);
-        // SAFETY: sysconf has no preconditions.
-        let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        assert!(host_page.is_power_of_two() && host_page >= GUEST_PAGE_SIZE);
-        Ok(Self {
-            readers: Mutex::default(),
-            pending: Mutex::default(),
-            base,
-            host_page,
-            maps: RwLock::default(),
-            generation: AtomicU64::new(0),
-            code_generation: AtomicU64::new(0),
-        })
+        let len = (CONTROL_OFFSET + GUEST_SIZE + GUARD_SIZE) as usize;
+        let none = (std::ptr::null_mut(), 0);
+        Ok(Self::with_layout(base, 0, start.cast(), [(start, len), none], Self::host_page_size()))
     }
 
-    /// Host address of guest address 0. Guest address `g` is at `host_base() + g`.
+    /// Host address of guest address 0. Guest address `g` is at `host_base() + g`. Null in
+    /// the identity layout.
     pub fn host_base(&self) -> *mut u8 {
         self.base
+    }
+
+    /// Whether guest addresses are host addresses (the identity layout).
+    pub fn is_identity(&self) -> bool {
+        self.base.is_null()
+    }
+
+    /// The lowest guest address that can be mapped (0 in the offset layout).
+    pub fn lowest(&self) -> u64 {
+        self.lowest
+    }
+
+    /// Start of the control area: the interrupt flags, slot by slot.
+    pub fn control_area(&self) -> *mut u32 {
+        self.control
+    }
+
+    /// Host pointer to guest address `g` (which must be below `GUEST_SIZE + GUARD_SIZE`).
+    fn host(&self, g: u64) -> *mut u8 {
+        // Wrapping: in the identity layout `base` itself lies outside the reservation.
+        self.base.wrapping_add(g as usize)
     }
 
     /// Counter bumped by every mapping change; see the type-level docs.
@@ -300,9 +439,7 @@ impl GuestMemory {
         assert!(slot < INTERRUPT_SLOTS);
         // SAFETY: the control area is mapped read/write for the reservation's lifetime and
         // only ever accessed atomically; slots are 4-byte aligned.
-        unsafe {
-            AtomicU32::from_ptr(self.base.sub(CONTROL_OFFSET as usize).cast::<u32>().add(slot))
-        }
+        unsafe { AtomicU32::from_ptr(self.control.add(slot)) }
     }
 
     /// Counter bumped by mapping changes that involve executable pages (before or after the
@@ -350,13 +487,7 @@ impl GuestMemory {
             while page < r.end {
                 if !maps.is_any_mapped(page..page + hp) {
                     // SAFETY: an unmapped host page of our reservation; no TLB points at it.
-                    unsafe {
-                        libc::mprotect(
-                            self.base.add(page as usize).cast(),
-                            hp as usize,
-                            libc::PROT_NONE,
-                        )
-                    };
+                    unsafe { libc::mprotect(self.host(page).cast(), hp as usize, libc::PROT_NONE) };
                 }
                 page += hp;
             }
@@ -404,11 +535,12 @@ impl GuestMemory {
         }
     }
 
-    fn check_range(addr: u64, len: u64) -> Result<Range<u64>, MapError> {
+    fn check_range(&self, addr: u64, len: u64) -> Result<Range<u64>, MapError> {
         let end = addr.checked_add(len).ok_or(MapError::Invalid)?;
         if len == 0
             || !addr.is_multiple_of(GUEST_PAGE_SIZE)
             || !len.is_multiple_of(GUEST_PAGE_SIZE)
+            || addr < self.lowest
             || end > GUEST_SIZE
         {
             return Err(MapError::Invalid);
@@ -419,7 +551,7 @@ impl GuestMemory {
     /// Map `[addr, addr + len)` with `prot`, zero-filled, replacing anything already mapped
     /// there (like `MAP_FIXED`). `addr` and `len` must be 4 KiB aligned.
     pub fn map(&self, addr: u64, len: u64, prot: Prot) -> Result<(), MapError> {
-        let r = Self::check_range(addr, len)?;
+        let r = self.check_range(addr, len)?;
         let mut maps = self.maps_mut();
         self.unmap_locked(&mut maps, r.clone());
         self.insert_locked(&mut maps, r, prot);
@@ -431,7 +563,7 @@ impl GuestMemory {
     /// Map `[addr, addr + len)` only if no page of it is mapped yet. Returns whether it
     /// did. Check and map happen atomically with respect to other threads.
     pub fn map_if_free(&self, addr: u64, len: u64, prot: Prot) -> Result<bool, MapError> {
-        let r = Self::check_range(addr, len)?;
+        let r = self.check_range(addr, len)?;
         let mut maps = self.maps_mut();
         if maps.is_any_mapped(r.clone()) {
             return Ok(false);
@@ -447,14 +579,14 @@ impl GuestMemory {
             return Err(MapError::Invalid);
         }
         let mut maps = self.maps_mut();
-        let addr = maps.find_free(len, limit)?;
+        let addr = maps.find_free(len, limit, self.lowest)?;
         self.insert_locked(&mut maps, addr..addr + len, prot);
         Ok(addr)
     }
 
     /// Unmap `[addr, addr + len)`. Unmapped pages in the range are ignored.
     pub fn unmap(&self, addr: u64, len: u64) -> Result<(), MapError> {
-        let r = Self::check_range(addr, len)?;
+        let r = self.check_range(addr, len)?;
         self.unmap_locked(&mut self.maps_mut(), r);
         self.settle();
         Ok(())
@@ -462,7 +594,7 @@ impl GuestMemory {
 
     /// Change the permissions of `[addr, addr + len)`, which must be fully mapped.
     pub fn protect(&self, addr: u64, len: u64, prot: Prot) -> Result<(), MapError> {
-        let r = Self::check_range(addr, len)?;
+        let r = self.check_range(addr, len)?;
         let mut maps = self.maps_mut();
         if maps.covering(r.start, len, Prot::NONE).is_err() {
             return Err(MapError::NotMapped);
@@ -483,7 +615,7 @@ impl GuestMemory {
         if len == 0 || !len.is_multiple_of(GUEST_PAGE_SIZE) {
             return Err(MapError::Invalid);
         }
-        self.maps().find_free(len, limit)
+        self.maps().find_free(len, limit, self.lowest)
     }
 
     /// Whether any page of `r` is mapped (a snapshot).
@@ -527,14 +659,14 @@ impl GuestMemory {
         let mut maps = self.maps_mut();
         let addr = match addr {
             Some(a) => {
-                let r = Self::check_range(a, len)?;
+                let r = self.check_range(a, len)?;
                 if !a.is_multiple_of(hp) {
                     return Err(MapError::Invalid);
                 }
                 self.unmap_locked(&mut maps, r);
                 a
             }
-            None => maps.find_free_aligned(len, limit, hp)?,
+            None => maps.find_free_aligned(len, limit, hp, self.lowest)?,
         };
         let (flags, fd, offset) = match file {
             Some((fd, offset)) => (libc::MAP_SHARED, fd, offset as libc::off_t),
@@ -544,7 +676,7 @@ impl GuestMemory {
         // uses (they are free, or were just unmapped).
         let rc = unsafe {
             libc::mmap(
-                self.base.add(addr as usize).cast(),
+                self.host(addr).cast(),
                 len as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
                 flags | libc::MAP_FIXED,
@@ -589,7 +721,7 @@ impl GuestMemory {
         // read/write again is a no-op for their contents.
         let rc = unsafe {
             libc::mprotect(
-                self.base.add(hr.start as usize).cast(),
+                self.host(hr.start).cast(),
                 (hr.end - hr.start) as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
             )
@@ -617,20 +749,14 @@ impl GuestMemory {
                 let z = p.start.max(r.start)..p.end.min(r.end);
                 // SAFETY: committed (a mapping shares this host page), inside the
                 // reservation, and no access is in flight under the write lock.
-                unsafe {
-                    std::ptr::write_bytes(
-                        self.base.add(z.start as usize),
-                        0,
-                        (z.end - z.start) as usize,
-                    )
-                };
+                unsafe { std::ptr::write_bytes(self.host(z.start), 0, (z.end - z.start) as usize) };
             } else {
                 // SAFETY: replaces the page with a fresh zero one inside our own reservation,
                 // discarding its contents. It stays accessible for a TLB that may still
                 // point at it, and becomes PROT_NONE in `settle`.
                 let rc = unsafe {
                     libc::mmap(
-                        self.base.add(p.start as usize).cast(),
+                        self.host(p.start).cast(),
                         hp as usize,
                         libc::PROT_READ | libc::PROT_WRITE,
                         libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE | libc::MAP_FIXED,
@@ -652,7 +778,7 @@ impl GuestMemory {
         }
         // SAFETY: for len > 0 the range is inside the reservation; for len == 0 the
         // pointer is never dereferenced, and wrapping_add avoids out-of-bounds UB.
-        Ok(GuestBuf { ptr: self.base.wrapping_add(addr as usize), len: len as usize })
+        Ok(GuestBuf { ptr: self.host(addr), len: len as usize })
     }
 
     /// Copy guest memory into `buf` after checking `need`; atomic per aligned access.
@@ -661,7 +787,7 @@ impl GuestMemory {
         maps.covering(addr, buf.len() as u64, need)?;
         // SAFETY: the range is mapped (committed read/write) and stays so while we hold
         // the read lock; accesses are atomic, so racing guest stores are not UB.
-        unsafe { atomic_copy_out(self.base.add(addr as usize), buf) };
+        unsafe { atomic_copy_out(self.host(addr), buf) };
         Ok(())
     }
 
@@ -669,7 +795,7 @@ impl GuestMemory {
         let maps = self.maps();
         maps.covering(addr, buf.len() as u64, need)?;
         // SAFETY: as in `load`.
-        unsafe { atomic_copy_in(self.base.add(addr as usize), buf) };
+        unsafe { atomic_copy_in(self.host(addr), buf) };
         Ok(())
     }
 
@@ -681,9 +807,7 @@ impl GuestMemory {
         maps.covering(dst, len, Prot::NONE)?;
         // SAFETY: both ranges are mapped (committed) and the write lock excludes every
         // other access; `copy` allows overlap.
-        unsafe {
-            std::ptr::copy(self.base.add(src as usize), self.base.add(dst as usize), len as usize)
-        };
+        unsafe { std::ptr::copy(self.host(src), self.host(dst), len as usize) };
         Ok(())
     }
 
@@ -692,7 +816,7 @@ impl GuestMemory {
         let maps = self.maps_mut();
         maps.covering(addr, len, Prot::NONE)?;
         // SAFETY: mapped, and the write lock excludes every other access.
-        unsafe { std::ptr::write_bytes(self.base.add(addr as usize), 0, len as usize) };
+        unsafe { std::ptr::write_bytes(self.host(addr), 0, len as usize) };
         Ok(())
     }
 
@@ -777,11 +901,12 @@ pub(super) unsafe fn atomic_copy_in(dst: *mut u8, buf: &[u8]) {
 
 impl Drop for GuestMemory {
     fn drop(&mut self) {
-        // SAFETY: unmapping exactly the reservation created in `new`.
-        unsafe {
-            let start = self.base.wrapping_sub(CONTROL_OFFSET as usize);
-            libc::munmap(start.cast(), (CONTROL_OFFSET + GUEST_SIZE + GUARD_SIZE) as usize)
-        };
+        for (start, len) in self.owned {
+            if len > 0 {
+                // SAFETY: unmapping exactly what `new` mapped.
+                unsafe { libc::munmap(start, len) };
+            }
+        }
     }
 }
 
@@ -806,7 +931,7 @@ impl Memory for GuestMemory {
     ) -> Result<u64, MemFault> {
         let maps = self.maps();
         maps.covering(addr, size as u64, Prot::RW)?;
-        let p = self.base.wrapping_add(addr as usize);
+        let p = self.host(addr);
         assert!(addr.is_multiple_of(size as u64), "atomics must be naturally aligned");
         // SAFETY: mapped and aligned; the read lock keeps it mapped.
         let old = unsafe {
@@ -832,7 +957,7 @@ impl Memory for GuestMemory {
     ) -> Result<bool, MemFault> {
         let maps = self.maps();
         maps.covering(addr, size as u64, Prot::RW)?;
-        let p = self.base.wrapping_add(addr as usize);
+        let p = self.host(addr);
         assert!(addr.is_multiple_of(size as u64), "atomics must be naturally aligned");
         // SAFETY: mapped and aligned; the read lock keeps it mapped.
         let ok = unsafe {
