@@ -699,6 +699,22 @@ pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
         }
         _ => call(p, t, nr, a),
     };
+    // Writing to a pipe or socket with no reader raises SIGPIPE (whose default action
+    // kills), unless a send asked for MSG_NOSIGNAL. The host only returns EPIPE.
+    const EPIPE: i32 = 32;
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    if result == Err(EPIPE) {
+        let quiet = match nr {
+            nr::SENDTO => a[3] & MSG_NOSIGNAL != 0,
+            nr::SENDMSG => a[2] & MSG_NOSIGNAL != 0,
+            _ => false,
+        };
+        if !quiet {
+            let id = p.host.identity();
+            let info = signal::Info::Sent { code: signal::SI_USER, pid: id.pid, uid: id.uid };
+            p.send_to_thread(t.tid, signal::SIGPIPE, info);
+        }
+    }
 
     if p.log.strace.load(std::sync::atomic::Ordering::Relaxed) {
         let ret = match result {

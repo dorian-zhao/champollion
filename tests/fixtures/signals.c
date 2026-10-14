@@ -4,6 +4,7 @@
 //   signals        -> prints a line per check (one thread spins without syscalls)
 //   signals term   -> raise(SIGTERM) with the default action: killed (status 143)
 //   signals abort  -> abort(): killed by SIGABRT (status 134)
+//   signals pipe   -> write to a pipe with no reader: killed by SIGPIPE
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
@@ -96,6 +97,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (argc > 1 && strcmp(argv[1], "abort") == 0) abort();
+    if (argc > 1 && strcmp(argv[1], "pipe") == 0) {
+        int fds[2];
+        pipe(fds);
+        close(fds[0]);
+        write(fds[1], "x", 1);
+        return 1;
+    }
 
     handle(SIGUSR1, on_usr1, 0);
     raise(SIGUSR1);

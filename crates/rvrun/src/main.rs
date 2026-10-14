@@ -115,7 +115,7 @@ fn main() -> ExitCode {
             eprintln!("[rvrun] {}", jit.stats.report());
         }
     }
-    ExitCode::from(exit.report(&main_thread.cpu))
+    exit.terminate(&main_thread.cpu)
 }
 
 /// Wait for one debugger connection on 127.0.0.1:`port` and serve it.

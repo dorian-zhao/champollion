@@ -87,6 +87,26 @@ pub enum Exit {
 }
 
 impl Exit {
+    /// End the host process the way the guest ended. A guest killed by a signal that only
+    /// terminates (and has the same number on the host) kills rvrun with that signal, so
+    /// the parent sees exactly what Linux would show it; for the others (faults, signals
+    /// that dump core, which would make macOS file a crash report for rvrun) this reports
+    /// what happened and exits with 128 + the signal, as [`Exit::report`] does.
+    pub fn terminate(self, cpu: &CpuState) -> ! {
+        if let Exit::Signal(sig @ (1 | 2 | 9 | 13 | 14 | 15)) = self {
+            // SAFETY: restoring the default action and raising it ends the process.
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, sig);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                libc::raise(sig);
+            }
+        }
+        std::process::exit(self.report(cpu).into())
+    }
+
     /// Tell the user how the guest died (nothing for a normal exit), and return the exit
     /// code a shell would see: the status, or 128 + the signal that killed it.
     pub fn report(self, cpu: &CpuState) -> u8 {
@@ -353,7 +373,7 @@ impl Process {
                 };
                 match this.run_thread(&mut thread) {
                     End::Thread(status) => this.thread_exited(&thread, status),
-                    End::Process(exit) => std::process::exit(exit.report(&thread.cpu).into()),
+                    End::Process(exit) => exit.terminate(&thread.cpu),
                 }
             },
         )?;

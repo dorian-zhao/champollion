@@ -67,9 +67,13 @@ fn signals() {
          signal to spinning thread delivered\n"
     );
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
-    // Default actions: SIGTERM and abort()'s SIGABRT kill the process.
+    // Default actions: SIGTERM and abort()'s SIGABRT kill the process (SIGABRT is reported
+    // as status 134 instead, so macOS files no crash report for rvrun).
+    // rvrun dies by SIGTERM itself, as the guest would on Linux.
     let out = rvrun(&[fixture("signals").as_os_str(), "term".as_ref()], b"");
-    assert_eq!(out.status.code(), Some(128 + 15));
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&out.status), Some(15));
+    let out = rvrun(&[fixture("signals").as_os_str(), "pipe".as_ref()], b"");
+    assert_eq!(std::os::unix::process::ExitStatusExt::signal(&out.status), Some(13));
     let out = rvrun(&[fixture("signals").as_os_str(), "abort".as_ref()], b"");
     assert_eq!(out.status.code(), Some(128 + 6));
 }
