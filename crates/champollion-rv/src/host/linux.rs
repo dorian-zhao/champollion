@@ -485,6 +485,32 @@ impl HostOs for LinuxHost {
         sys!(SYS_kill, pid, sig)
     }
 
+    fn fadvise(&self, fd: i32, offset: i64, len: i64, advice: i32) -> SysResult {
+        sys!(SYS_fadvise64, fd, offset, len, advice)
+    }
+
+    fn sysinfo(&self) -> Result<Vec<u8>, i32> {
+        let mut raw = [0u64; 14];
+        sys!(SYS_sysinfo, raw.as_mut_ptr())?;
+        Ok(raw.iter().flat_map(|w| w.to_le_bytes()).collect())
+    }
+
+    fn setpgid(&self, pid: i32, pgid: i32) -> SysResult {
+        sys!(SYS_setpgid, pid, pgid)
+    }
+
+    fn getpgid(&self, pid: i32) -> SysResult {
+        sys!(SYS_getpgid, pid)
+    }
+
+    fn getsid(&self, pid: i32) -> SysResult {
+        sys!(SYS_getsid, pid)
+    }
+
+    fn setsid(&self) -> SysResult {
+        sys!(SYS_setsid)
+    }
+
     fn identity(&self) -> Identity {
         // SAFETY: these calls have no preconditions and cannot fail.
         unsafe {

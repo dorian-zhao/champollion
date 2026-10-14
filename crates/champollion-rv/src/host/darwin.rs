@@ -125,6 +125,25 @@ unsafe extern "C" {
     -> libc::c_int;
 }
 
+/// A fixed-size `sysctl` value by name.
+fn sysctl<T: Copy>(name: &str) -> Option<T> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: the kernel writes at most `len` bytes into `value`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // SAFETY: fully written when the call succeeds with the size we asked for.
+    (rc == 0 && len == std::mem::size_of::<T>()).then(|| unsafe { value.assume_init() })
+}
+
 /// Linux `RLIMIT_*` -> Darwin, or `None` for limits Darwin does not have.
 fn darwin_rlimit(resource: u32) -> Option<libc::c_int> {
     Some(match resource {
@@ -903,6 +922,69 @@ impl HostOs for DarwinHost {
         let sig = darwin_signal(sig).ok_or(errno::EINVAL)?;
         // SAFETY: no pointers.
         check(unsafe { libc::kill(pid, sig) } as isize)
+    }
+
+    fn fadvise(&self, fd: i32, _offset: i64, _len: i64, advice: i32) -> SysResult {
+        // Only a hint, with nothing like it on Darwin; check what Linux would.
+        if !(0..=5).contains(&advice) {
+            return Err(errno::EINVAL);
+        }
+        // SAFETY: no pointers.
+        check(unsafe { libc::fcntl(fd, libc::F_GETFD) } as isize).map(|_| 0)
+    }
+
+    fn sysinfo(&self) -> Result<Vec<u8>, i32> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let boot: libc::timeval =
+            sysctl("kern.boottime").unwrap_or(libc::timeval { tv_sec: now, tv_usec: 0 });
+        let mut loads = [0f64; 3];
+        // SAFETY: room for three samples.
+        unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
+        let page = sysctl::<u64>("hw.pagesize").unwrap_or(16384);
+        let free = sysctl::<u32>("vm.page_free_count").unwrap_or(0) as u64 * page;
+        let swap: libc::xsw_usage = sysctl("vm.swapusage").unwrap_or(libc::xsw_usage {
+            xsu_total: 0,
+            xsu_avail: 0,
+            xsu_used: 0,
+            xsu_pagesize: 0,
+            xsu_encrypted: 0,
+        });
+        let mut b = Vec::with_capacity(112);
+        b.extend((now - boot.tv_sec).to_le_bytes()); // uptime
+        for l in loads {
+            b.extend(((l * 65536.0) as u64).to_le_bytes()); // SI_LOAD_SHIFT 16
+        }
+        let total = sysctl::<u64>("hw.memsize").unwrap_or(0);
+        for v in [total, free, 0, 0, swap.xsu_total, swap.xsu_avail] {
+            b.extend(v.to_le_bytes()); // ram, free, shared, buffers, swap, free swap
+        }
+        b.extend([0u8; 8]); // procs, padding
+        b.extend([0u8; 16]); // totalhigh, freehigh
+        b.extend(1u32.to_le_bytes()); // mem_unit
+        b.resize(112, 0);
+        Ok(b)
+    }
+
+    fn setpgid(&self, pid: i32, pgid: i32) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::setpgid(pid, pgid) } as isize)
+    }
+
+    fn getpgid(&self, pid: i32) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::getpgid(pid) } as isize)
+    }
+
+    fn getsid(&self, pid: i32) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::getsid(pid) } as isize)
+    }
+
+    fn setsid(&self) -> SysResult {
+        // SAFETY: no pointers.
+        check(unsafe { libc::setsid() } as isize)
     }
 
     fn identity(&self) -> Identity {

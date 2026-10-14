@@ -1,5 +1,6 @@
 // Self-checking syscall exercise for rvrun. Prints one line per check; the test
 // harness compares stdout exactly. argv[1] is a scratch directory.
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -8,6 +9,8 @@
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -81,6 +84,20 @@ int main(int argc, char **argv) {
     CHECK("uname", uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0 &&
                        strcmp(u.machine, "riscv64") == 0);
     CHECK("getpid", getpid() > 0);
+    CHECK("process group", getpgid(0) == getpgrp() && getpgrp() > 0 && getsid(0) > 0);
+
+    struct statx stx;
+    CHECK("statx", statx(AT_FDCWD, path, 0, STATX_BASIC_STATS, &stx) == 0 &&
+                       stx.stx_size == 11 && S_ISREG(stx.stx_mode) &&
+                       (stx.stx_mask & STATX_SIZE) && stat(path, &st) == 0 &&
+                       makedev(stx.stx_dev_major, stx.stx_dev_minor) == st.st_dev);
+    fd = open(path, O_RDONLY);
+    // Zig's libc returns -1 for errors here, where POSIX says the error number.
+    CHECK("fadvise", posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL) == 0 &&
+                         posix_fadvise(-1, 0, 0, POSIX_FADV_NORMAL) != 0);
+    close(fd);
+    struct sysinfo si;
+    CHECK("sysinfo", sysinfo(&si) == 0 && si.totalram > 0 && si.mem_unit > 0 && si.uptime > 0);
 
     // stdin: the harness pipes in a line.
     CHECK("stdin", fgets(buf, sizeof buf, stdin) && strcmp(buf, "from stdin\n") == 0);

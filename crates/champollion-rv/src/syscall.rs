@@ -139,6 +139,11 @@ syscalls! {
     UMASK = 166 "umask",
     PRCTL = 167 "prctl",
     GETPID = 172 "getpid",
+    SYSINFO = 179 "sysinfo",
+    SETPGID = 154 "setpgid",
+    GETPGID = 155 "getpgid",
+    GETSID = 156 "getsid",
+    SETSID = 157 "setsid",
     GETPPID = 173 "getppid",
     GETUID = 174 "getuid",
     GETEUID = 175 "geteuid",
@@ -174,7 +179,9 @@ syscalls! {
     RISCV_FLUSH_ICACHE = 259 "riscv_flush_icache",
     PRLIMIT64 = 261 "prlimit64",
     RENAMEAT2 = 276 "renameat2",
+    FADVISE64 = 223 "fadvise64",
     GETRANDOM = 278 "getrandom",
+    STATX = 291 "statx",
     RSEQ = 293 "rseq",
     PIDFD_OPEN = 434 "pidfd_open",
     MEMBARRIER = 283 "membarrier",
@@ -498,6 +505,27 @@ pub trait HostOs: Send + Sync {
     }
     /// Send a Linux signal number to another host process.
     fn kill(&self, pid: i32, sig: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `posix_fadvise`: a hint about how `fd` will be read.
+    fn fadvise(&self, fd: i32, offset: i64, len: i64, advice: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Linux `struct sysinfo` (112 bytes).
+    fn sysinfo(&self) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    /// Process groups and sessions, by host pid (guest pids are host pids).
+    fn setpgid(&self, pid: i32, pgid: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn getpgid(&self, pid: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn getsid(&self, pid: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn setsid(&self) -> SysResult {
         Err(errno::ENOSYS)
     }
     fn identity(&self) -> Identity {
@@ -974,6 +1002,23 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             let st = host.fstatat(fd, &p.host_path(&path, follow), a[3] as i32)?;
             write_stat(p, a[2], &st)
         }
+        nr::STATX => {
+            let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
+            const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+            // Only the flags fstatat knows; the AT_STATX_SYNC_* bits are hints.
+            const FSTATAT_FLAGS: u64 = 0x100 | 0x800 | 0x1000;
+            let follow = a[2] & AT_SYMLINK_NOFOLLOW == 0;
+            let flags = (a[2] & FSTATAT_FLAGS) as i32;
+            let st = host.fstatat(fd, &p.host_path(&path, follow), flags)?;
+            put(p, a[4], &statx_bytes(&st))?;
+            Ok(0)
+        }
+        nr::FADVISE64 => host.fadvise(fd, a[1] as i64, a[2] as i64, a[3] as i32),
+        nr::SYSINFO => {
+            let info = host.sysinfo()?;
+            put(p, a[0], &info)?;
+            Ok(0)
+        }
         nr::IOCTL => match a[1] {
             TIOCGWINSZ => {
                 let ws = host.winsize(fd)?;
@@ -1118,6 +1163,12 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::GETTID => Ok(t.tid as u64),
         nr::GETPID => Ok(host.identity().pid as u64),
         nr::GETPPID => Ok(host.identity().ppid as u64),
+        nr::SETPGID => host.setpgid(a[0] as i32, a[1] as i32),
+        nr::GETPGID => host.getpgid(a[0] as i32),
+        nr::GETSID => host.getsid(a[0] as i32),
+        nr::SETSID => host.setsid(),
+        // Restartable sequences are an optimization libc probes for and does without.
+        nr::RSEQ => Err(errno::ENOSYS),
         nr::GETUID => Ok(host.identity().uid as u64),
         nr::GETEUID => Ok(host.identity().euid as u64),
         nr::GETGID => Ok(host.identity().gid as u64),
@@ -1634,6 +1685,38 @@ fn write_stat(p: &Process, addr: u64, st: &Stat) -> SysResult {
     debug_assert_eq!(b.len(), 128);
     put(p, addr, &b)?;
     Ok(0)
+}
+
+/// `st` as a Linux `struct statx` (256 bytes) with the basic fields (`STATX_BASIC_STATS`).
+fn statx_bytes(st: &Stat) -> [u8; 256] {
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    let mut b = [0u8; 256];
+    let mut at = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    at(0, &STATX_BASIC_STATS.to_le_bytes());
+    at(4, &st.blksize.to_le_bytes());
+    at(16, &st.nlink.to_le_bytes());
+    at(20, &st.uid.to_le_bytes());
+    at(24, &st.gid.to_le_bytes());
+    at(28, &(st.mode as u16).to_le_bytes());
+    at(32, &st.ino.to_le_bytes());
+    at(40, &st.size.to_le_bytes());
+    at(48, &st.blocks.to_le_bytes());
+    for (off, (sec, nsec)) in [(64, st.atime), (96, st.ctime), (112, st.mtime)] {
+        at(off, &sec.to_le_bytes());
+        at(off + 8, &(nsec as u32).to_le_bytes());
+    }
+    // Split device numbers as Linux encodes them in `st_dev`, so both calls agree.
+    let split = |dev: u64| {
+        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+        (major as u32, minor as u32)
+    };
+    let (rmaj, rmin) = split(st.rdev);
+    let (dmaj, dmin) = split(st.dev);
+    for (off, v) in [(128, rmaj), (132, rmin), (136, dmaj), (140, dmin)] {
+        at(off, &v.to_le_bytes());
+    }
+    b
 }
 
 fn errno_name(e: i32) -> &'static str {
