@@ -51,9 +51,14 @@ fn code_cache_reuses_translations() {
         assert_matches_native(&out, "programs/basics.lua.expected");
         let stats = String::from_utf8_lossy(&out.stderr);
         if run == "warm" {
-            // The same run again: everything comes from the cache.
-            assert!(stats.contains(" 0 translations,"), "{stats}");
-            assert!(!stats.contains(" 0 restored,"), "{stats}");
+            // The same run again: nearly everything comes from the cache. (Lua seeds its
+            // string hashes from the clock, so a few paths can differ from the cold run.)
+            let count = |what: &str| -> u64 {
+                let before = stats.split(&format!(" {what},")).next().unwrap();
+                before.rsplit(' ').next().unwrap().parse().unwrap()
+            };
+            let (translated, restored) = (count("translations"), count("restored"));
+            assert!(restored > 0 && translated * 10 < restored, "{stats}");
         }
         let out = rvrun_with(&[sqlite.as_os_str()], &sql, &env);
         assert_matches_native(&out, "programs/basics.sql.expected");
