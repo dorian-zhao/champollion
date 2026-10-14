@@ -17,8 +17,9 @@
 //! - `RVRUN_PROF=FILE` samples generated code and writes a report of the hottest blocks to
 //!   FILE (render it with `tools/jitprof.py FILE`).
 //! - `RVRUN_CACHE=0` disables the persistent code cache: by default, translations are saved
-//!   per executable in `~/Library/Caches/champollion` (or `$RVRUN_CACHE_DIR`) and reused by
-//!   the next run of the same executable.
+//!   per executable in `~/Library/Caches/champollion` (on Linux `$XDG_CACHE_HOME/champollion`
+//!   or `~/.cache/champollion`; or `$RVRUN_CACHE_DIR`) and reused by the next run of the same
+//!   executable.
 
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
@@ -227,6 +228,20 @@ struct CodeCache {
     key: u64,
 }
 
+#[cfg(target_os = "macos")]
+fn default_cache_dir() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches/champollion"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_cache_dir() -> Option<std::path::PathBuf> {
+    let base = match std::env::var_os("XDG_CACHE_HOME").filter(|d| !d.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache"),
+    };
+    Some(base.join("champollion"))
+}
+
 impl CodeCache {
     fn new(file: &[u8]) -> Option<Self> {
         use std::hash::{Hash, Hasher};
@@ -235,8 +250,7 @@ impl CodeCache {
         }
         let dir = match std::env::var_os("RVRUN_CACHE_DIR") {
             Some(dir) => std::path::PathBuf::from(dir),
-            None => std::path::PathBuf::from(std::env::var_os("HOME")?)
-                .join("Library/Caches/champollion"),
+            None => default_cache_dir()?,
         };
         // SipHash with fixed keys: stable for a given build of rvrun, which is all a key
         // must be (the build is part of it).
