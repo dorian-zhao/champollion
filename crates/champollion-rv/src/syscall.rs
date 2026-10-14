@@ -206,6 +206,7 @@ pub struct Stat {
 }
 
 /// `struct pollfd`, identical on Linux and Darwin; event bits are Linux values.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PollFd {
     pub fd: i32,

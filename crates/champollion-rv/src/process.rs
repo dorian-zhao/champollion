@@ -653,8 +653,8 @@ impl Process {
         }
     }
 
-    /// The host path for guest path `path`: `/dev/shm` (POSIX shared memory and named
-    /// semaphores) is a per-user directory under the host's temporary directory; others
+    /// The host path for guest path `path`: on macOS, `/dev/shm` (POSIX shared memory and
+    /// named semaphores) is a per-user directory under the host's temporary directory; others
     /// are under the sysroot if they are absolute and exist there (as QEMU's `-L` does),
     /// else unchanged. See [`resolve`] for `follow`.
     pub fn host_path<'a>(
@@ -663,6 +663,7 @@ impl Process {
         follow: bool,
     ) -> std::borrow::Cow<'a, std::ffi::CStr> {
         use std::os::unix::ffi::OsStrExt;
+        #[cfg(target_os = "macos")]
         if let Some(rest) = path.to_bytes().strip_prefix(b"/dev/shm")
             && (rest.is_empty() || rest[0] == b'/')
         {
