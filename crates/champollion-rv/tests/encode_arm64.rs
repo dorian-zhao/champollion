@@ -78,6 +78,9 @@ fn matches_assembler() {
     a.str_off_w(10, 11, 16380);
     a.stp_pre(29, LR, SP, -16);
     a.ldp_post(29, LR, SP, 16);
+    a.adrp(14, 1);
+    a.adrp(0, -2);
+    a.adrp(17, 0x4000);
     a.br(16);
     a.blr(17);
     a.ret();

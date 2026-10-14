@@ -48,6 +48,9 @@ impl Hasher for PcHasher {
 type EnterFn = unsafe extern "C" fn(*mut CpuState, *mut u8, *const u8, u64) -> u64;
 
 pub struct Jit {
+    /// Generated code, then (in the data area) the indirect-jump cache probed inline by
+    /// generated code: `(guest pc, host address)` per slot, with guest pc 1 (never a valid
+    /// pc) marking an empty slot.
     code: CodeBuffer,
     enter: EnterFn,
     /// Word index of the exit stub in the code buffer.
@@ -65,9 +68,6 @@ pub struct Jit {
     unchained: HashMap<u64, Vec<usize>, BuildHasherDefault<PcHasher>>,
     /// Set to disable chaining (every block returns to the dispatcher), for comparison.
     pub chaining: bool,
-    /// Indirect-jump cache probed inline by generated code; `(guest pc, host address)`
-    /// per slot, with guest pc 1 (never a valid pc) marking an empty slot.
-    jump_cache: Box<[[u64; 2]; translate::JUMP_CACHE_ENTRIES]>,
     pub stats: Stats,
     /// Sampling profiler, if enabled with [`Jit::start_profiling`].
     pub profiler: Option<profile::Profiler>,
@@ -125,7 +125,7 @@ fn kind(inst: &crate::decoder::Inst) -> &'static str {
 
 impl Jit {
     pub fn new() -> std::io::Result<Self> {
-        let code = CodeBuffer::new(CODE_SIZE)?;
+        let code = CodeBuffer::new(CODE_SIZE, translate::JUMP_CACHE_ENTRIES * 16)?;
         // SAFETY: placeholder, replaced by `reset` before any use.
         let enter: EnterFn = unsafe { std::mem::transmute::<*const u8, EnterFn>(code.base()) };
         fault::install();
@@ -147,7 +147,6 @@ impl Jit {
             faults,
             unchained: HashMap::default(),
             chaining: true,
-            jump_cache: Box::new([[1, 0]; translate::JUMP_CACHE_ENTRIES]),
             stats: Stats::default(),
             profiler: None,
         };
@@ -164,7 +163,7 @@ impl Jit {
         }
         self.blocks.clear();
         self.unchained.clear();
-        self.jump_cache.fill([1, 0]);
+        self.jump_cache().fill([1, 0]);
         let (words, stub) = translate::trampoline();
         let at = self.code.append(&words).expect("trampoline fits");
         // SAFETY: the trampoline is a C-ABI function with this signature.
@@ -190,7 +189,7 @@ impl Jit {
         let block = decode_block(&TlbMemory { mem, tlb: &self.tlb }, pc, false)?;
         for attempt in 0..2 {
             let word = (self.code.used() / 4) as i64;
-            let cache = self.jump_cache.as_ptr() as u64;
+            let cache = self.code.data_offset() as i64;
             let Some(t) = translate::translate(&block, pc, word, self.stub_word as i64, cache)
             else {
                 return Ok(None);
@@ -220,6 +219,16 @@ impl Jit {
             }
         }
         unreachable!()
+    }
+
+    /// The jump cache, at the start of the code buffer's data area (see the field docs).
+    fn jump_cache(&mut self) -> &mut [[u64; 2]] {
+        let data = self.code.data_mut();
+        assert!(data.len() >= translate::JUMP_CACHE_ENTRIES * 16);
+        // SAFETY: the data area is page-aligned and large enough; any bits are valid u64s.
+        unsafe {
+            std::slice::from_raw_parts_mut(data.as_mut_ptr().cast(), translate::JUMP_CACHE_ENTRIES)
+        }
     }
 
     /// Start sampling generated code (see [`profile`]); report with `profiler.report()`.
@@ -261,7 +270,7 @@ impl Jit {
             let at = match self.lookup(cpu.pc, mem) {
                 Ok(Some(at)) => {
                     // Let generated indirect jumps find this block without us next time.
-                    self.jump_cache[translate::jump_cache_index(cpu.pc)] =
+                    self.jump_cache()[translate::jump_cache_index(cpu.pc)] =
                         [cpu.pc, self.code.ptr(at) as u64];
                     at
                 }

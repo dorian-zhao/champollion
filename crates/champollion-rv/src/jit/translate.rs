@@ -200,8 +200,10 @@ struct Tx {
     accesses: Vec<(usize, u64, u32, bool)>,
     /// Instructions of this block retired so far (while translating).
     retired: u32,
-    /// Host address of the jump cache.
-    jump_cache: u64,
+    /// Byte offset of the jump cache from the start of the code buffer.
+    jump_cache: i64,
+    /// Word index of this block in the code buffer.
+    block_word: i64,
     /// Chainable exits inside tails (side exits): instruction index and target pc.
     tail_exits: Vec<(usize, Option<u64>)>,
     /// Guest register whose host address (see [`ADDR_MASK`]) is in `ADDR`, if any.
@@ -312,7 +314,9 @@ impl Tx {
     /// cached host code; on a miss, exit to the dispatcher (which fills the slot).
     fn indirect(&mut self) {
         self.a.ubfm(DST, ADDR, 1, JUMP_CACHE_BITS); // index = pc[16:1]
-        self.a.mov_imm(SRC0, self.jump_cache);
+        // The jump cache is page-aligned in the code buffer's data area.
+        let here = (self.block_word + self.a.pos() as i64) * 4;
+        self.a.adrp(SRC0, ((self.jump_cache >> 12) - (here >> 12)) as i32);
         self.a.add_lsl(DST, SRC0, DST, 4);
         self.a.ldr_off(SRC0, DST, 0);
         self.a.ldr_off(SRC1, DST, 8);
@@ -1034,13 +1038,13 @@ fn base_reuse(block: &[(Inst, u8)]) -> Vec<bool> {
 /// Translate `block` (as decoded at `pc`) into code that will live at word index
 /// `block_word` of the code buffer, whose exit stub is at word index `stub_word`. Returns
 /// `None` if not even the first instruction can be translated. Indirect jumps probe the
-/// jump cache at host address `jump_cache`.
+/// jump cache at byte offset `jump_cache` in the code buffer.
 pub fn translate(
     block: &[(Inst, u8)],
     pc: u64,
     block_word: i64,
     stub_word: i64,
-    jump_cache: u64,
+    jump_cache: i64,
 ) -> Option<Translation> {
     let mut tx = Tx {
         a: Asm::new(),
@@ -1049,6 +1053,7 @@ pub fn translate(
         accesses: Vec::new(),
         retired: 0,
         jump_cache,
+        block_word,
         tail_exits: Vec::new(),
         addr_base: None,
         base_reused: false,

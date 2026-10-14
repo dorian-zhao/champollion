@@ -625,6 +625,12 @@ impl Asm {
     pub fn ret(&mut self) {
         self.emit(0xd65f_03c0);
     }
+    /// `adrp rd, #pages`: the address of the 4 KiB page `pages` pages from this one (±4 GiB).
+    pub fn adrp(&mut self, rd: Reg, pages: i32) {
+        assert!((-(1 << 20)..1 << 20).contains(&pages), "adrp out of range: {pages}");
+        let imm = pages as u32;
+        self.emit(0x9000_0000 | (imm & 3) << 29 | ((imm >> 2) & 0x7ffff) << 5 | rd as u32);
+    }
     /// `adr rd, target` (instruction index; within ±1 MiB).
     pub fn adr(&mut self, rd: Reg, target: usize) {
         let off = (Self::rel(self.pos(), target) * 4) as u32;

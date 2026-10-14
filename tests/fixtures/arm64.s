@@ -70,6 +70,9 @@ ldr w8, [x9, #4]
 str w10, [x11, #16380]
 stp x29, x30, [sp, #-16]!
 ldp x29, x30, [sp], #16
+adrp x14, #4096
+adrp x0, #-8192
+adrp x17, #0x4000000
 br x16
 blr x17
 ret
