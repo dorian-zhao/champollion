@@ -2,7 +2,7 @@
 
 Run RISC-V (RV64GC) Linux programs on Apple silicon.
 
-Champollion is a user-mode binary translator from riscv64 Linux to arm64. It started as a learning project, which aims at what Rosetta 2 does for x86 programs: no emulated machine, no guest kernel, just the program translated to native code and running at close to native speed. Champollion accomplishs this in two ways:
+Champollion is a user-mode binary translator from riscv64 Linux to arm64. It started as a learning project, which aims at what Rosetta 2 does for x86 programs: no emulated machine, no guest kernel, just the program translated to native code and running at close to native speed. Champollion accomplishes this in two ways:
 
 - **Route B, on macOS:** `rvrun ./program` runs a riscv64 Linux executable directly as a Mac process and Linux system calls are translated to Darwin ones.
 - **Route A, in a Linux VM:** `rvcontainer run debian:trixie` runs riscv64 container images. Each runs in a lightweight arm64 Linux VM, with rvrun registered as the kernel's handler for riscv64 programs and system calls going to a real Linux kernel.
