@@ -122,6 +122,23 @@ fn syscalls() {
     assert_eq!(out.status.code(), Some(7));
 }
 
+/// Calls rvrun does not emulate reach the host kernel on Linux, where guest memory is in the
+/// identity layout (on macOS they fail with ENOSYS).
+#[cfg(target_os = "linux")]
+#[test]
+fn unemulated_calls_pass_through() {
+    let dir = std::env::temp_dir().join(format!("champollion-pass-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = rvrun(&[fixture("passthrough").as_os_str(), dir.as_os_str()], b"");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let source = include_str!("../../../tests/fixtures/passthrough.c");
+    let checks = source.lines().filter(|l| l.trim_start().starts_with("CHECK(\"")).count();
+    assert_eq!(stdout.lines().filter(|l| l.starts_with("ok ")).count(), checks, "{stdout}");
+    assert_eq!(out.stderr, b"", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
 #[test]
 fn segfault_exits_like_sigsegv() {
     let out = rvrun(&[fixture("segfault").as_os_str()], b"");

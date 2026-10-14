@@ -495,6 +495,15 @@ impl HostOs for LinuxHost {
         Ok(raw.iter().flat_map(|w| w.to_le_bytes()).collect())
     }
 
+    fn raw(&self, nr: u64, a: [u64; 6]) -> Option<SysResult> {
+        // SAFETY: the caller only passes calls whose pointer arguments are host pointers
+        // (guest memory in the identity layout); the kernel validates them.
+        Some(check(
+            unsafe { libc::syscall(nr as libc::c_long, a[0], a[1], a[2], a[3], a[4], a[5]) }
+                as isize,
+        ))
+    }
+
     fn setpgid(&self, pid: i32, pgid: i32) -> SysResult {
         sys!(SYS_setpgid, pid, pgid)
     }

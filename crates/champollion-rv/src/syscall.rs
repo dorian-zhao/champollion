@@ -184,6 +184,7 @@ syscalls! {
     STATX = 291 "statx",
     RSEQ = 293 "rseq",
     PIDFD_OPEN = 434 "pidfd_open",
+    CLONE3 = 435 "clone3",
     MEMBARRIER = 283 "membarrier",
     FACCESSAT2 = 439 "faccessat2",
 }
@@ -514,6 +515,12 @@ pub trait HostOs: Send + Sync {
     /// Linux `struct sysinfo` (112 bytes).
     fn sysinfo(&self) -> Result<Vec<u8>, i32> {
         Err(errno::ENOSYS)
+    }
+    /// System call `nr` with `args`, made as they are, or `None` if this host cannot (only a
+    /// Linux host can). Only for guest memory in the identity layout, where guest pointers
+    /// are host pointers; see `passthrough` in this module.
+    fn raw(&self, nr: u64, args: [u64; 6]) -> Option<SysResult> {
+        None
     }
     /// Process groups and sessions, by host pid (guest pids are host pids).
     fn setpgid(&self, pid: i32, pgid: i32) -> SysResult {
@@ -957,7 +964,92 @@ pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
     Flow::Continue
 }
 
+/// A call we do not emulate, passed to the host kernel as it is, if it can be: on a Linux
+/// host with guest memory in the identity layout, guest pointers are host pointers, and
+/// riscv64 and arm64 share syscall numbers and structure layouts. Not with a sysroot,
+/// whose paths need resolving. `None` if not.
+fn passthrough(p: &Process, nr: u64, a: [u64; 6]) -> Option<SysResult> {
+    if !p.mem.is_identity() || p.sysroot.is_some() || !passes_through(nr) {
+        return None;
+    }
+    p.host.raw(nr, a)
+}
+
+/// Whether a call may go to the host kernel as it is ([`passthrough`]). Not those that would
+/// undercut what we emulate: creating threads or replacing the program behind our back,
+/// signals (which we deliver ourselves, and timers that send them), host memory
+/// protections (which we track), restricting or tracing rvrun's own system calls, and the
+/// architecture-specific range, where numbers mean different things on the two.
+fn passes_through(nr: u64) -> bool {
+    const EXECVEAT: u64 = 281;
+    const SIGNALFD4: u64 = 74;
+    const TIMERS: std::ops::RangeInclusive<u64> = 107..=111; // timer_create .. timer_delete
+    const SIGNALS: std::ops::RangeInclusive<u64> = 129..=139; // kill .. rt_sigreturn
+    const RT_TGSIGQUEUEINFO: u64 = 240;
+    const PIDFD_SEND_SIGNAL: u64 = 424;
+    const PTRACE: u64 = 117;
+    const SECCOMP: u64 = 277;
+    const PERSONALITY: u64 = 92;
+    const REMAP_FILE_PAGES: u64 = 234;
+    const PKEYS: std::ops::RangeInclusive<u64> = 288..=290;
+    const MAP_SHADOW_STACK: u64 = 453;
+    const MSEAL: u64 = 462;
+    const ARCH_SPECIFIC: std::ops::RangeInclusive<u64> = 244..=259;
+    !(matches!(
+        nr,
+        nr::CLONE3
+            | EXECVEAT
+            | SIGNALFD4
+            | RT_TGSIGQUEUEINFO
+            | PIDFD_SEND_SIGNAL
+            | PTRACE
+            | SECCOMP
+            | PERSONALITY
+            | REMAP_FILE_PAGES
+            | MAP_SHADOW_STACK
+            | MSEAL
+    ) || TIMERS.contains(&nr)
+        || SIGNALS.contains(&nr)
+        || PKEYS.contains(&nr)
+        || ARCH_SPECIFIC.contains(&nr))
+}
+
+/// `prctl` options that may go to the host kernel: they concern the process as a whole
+/// and nothing we emulate or rvrun itself depends on.
+fn prctl_passes_through(option: u64) -> bool {
+    matches!(
+        option,
+        1 | 2 // PR_SET/GET_PDEATHSIG
+            | 3 | 4 // PR_GET/SET_DUMPABLE
+            | 7 | 8 // PR_GET/SET_KEEPCAPS
+            | 23 | 24 // PR_CAPBSET_READ/DROP
+            | 27 | 28 // PR_GET/SET_SECUREBITS
+            | 29 | 30 // PR_GET/SET_TIMERSLACK
+            | 36 | 37 // PR_SET/GET_CHILD_SUBREAPER
+            | 38 | 39 // PR_SET/GET_NO_NEW_PRIVS
+            | 41 | 42 // PR_SET/GET_THP_DISABLE
+            | 47 // PR_CAP_AMBIENT
+    )
+}
+
 fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
+    // Credentials are real in route A; what follows for them is route B's emulation.
+    if matches!(
+        nr,
+        nr::SETUID
+            | nr::SETGID
+            | nr::SETREUID
+            | nr::SETREGID
+            | nr::SETRESUID
+            | nr::SETRESGID
+            | nr::GETRESUID
+            | nr::GETRESGID
+            | nr::GETGROUPS
+            | nr::SETGROUPS
+    ) && let Some(r) = passthrough(p, nr, a)
+    {
+        return r;
+    }
     let host = &*p.host;
     let fd = a[0] as i32;
     let buf = |addr, len, need| p.mem.host_buf(addr, len, need).map_err(efault);
@@ -988,7 +1080,9 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 }
                 Ok(r)
             }
-            cmd => host.fcntl(fd, cmd, a[2]),
+            // F_GETFL/F_SETFL carry open flags, which the backend translates.
+            cmd @ (3 | 4) => host.fcntl(fd, cmd, a[2]),
+            cmd => passthrough(p, nr, a).unwrap_or_else(|| host.fcntl(fd, cmd, a[2])),
         },
         nr::LSEEK => host.lseek(fd, a[1] as i64, a[2] as i32),
         nr::FSTAT => {
@@ -1047,7 +1141,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 put(p, a[2], &(n as i32).to_le_bytes())?;
                 Ok(0)
             }
-            _ => Err(errno::ENOTTY),
+            _ => passthrough(p, nr, a).unwrap_or(Err(errno::ENOTTY)),
         },
         nr::CLOCK_GETTIME => {
             let (sec, nsec) = host.clock_gettime(a[0] as i32)?;
@@ -1167,8 +1261,9 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::GETPGID => host.getpgid(a[0] as i32),
         nr::GETSID => host.getsid(a[0] as i32),
         nr::SETSID => host.setsid(),
-        // Restartable sequences are an optimization libc probes for and does without.
-        nr::RSEQ => Err(errno::ENOSYS),
+        // Restartable sequences are an optimization libc probes for and does without, and
+        // glibc falls back to `clone` without `clone3`.
+        nr::RSEQ | nr::CLONE3 => Err(errno::ENOSYS),
         nr::GETUID => Ok(host.identity().uid as u64),
         nr::GETEUID => Ok(host.identity().euid as u64),
         nr::GETGID => Ok(host.identity().gid as u64),
@@ -1569,6 +1664,9 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                     Ok(0)
                 }
                 PR_GET_NAME => put(p, a[1], &t.name).map(|()| 0),
+                option if prctl_passes_through(option) => {
+                    passthrough(p, nr, a).unwrap_or(Err(errno::EINVAL))
+                }
                 _ => Err(errno::EINVAL),
             }
         }
@@ -1608,12 +1706,12 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::MMAP => p.mmap(host, a[0], a[1], a[2] as u32, a[3] as u32, a[4] as i32, a[5]),
         nr::MUNMAP => p.munmap(a[0], a[1]),
         nr::MPROTECT => p.mprotect(a[0], a[1], a[2] as u32),
-        _ => {
+        _ => passthrough(p, nr, a).unwrap_or_else(|| {
             if p.log.warned.lock().unwrap_or_else(|e| e.into_inner()).insert(nr) {
                 eprintln!("rvrun: unsupported syscall {nr} ({})", name(nr).unwrap_or("unknown"));
             }
             Err(errno::ENOSYS)
-        }
+        }),
     }
 }
 
