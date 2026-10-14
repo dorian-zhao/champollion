@@ -73,3 +73,23 @@ fn alpine_busybox() {
     let out = run(&["cat", "/etc/alpine-release"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.24.2");
 }
+
+#[test]
+fn alpine_python() {
+    // Alpine's CPython (installed by `tests/sysroot/build.sh python`): extension modules
+    // over shared libraries, subprocess, threads, signals, sockets, asyncio, and
+    // multiprocessing; the output must match a native run of the same script.
+    let Some(root) = sysroot() else { return };
+    let python = root.join("usr/bin/python3");
+    if !python.exists() {
+        eprintln!("skipped: no python3 in the sysroot (run tests/sysroot/build.sh python)");
+        return;
+    }
+    let script = tests_dir().join("programs/python-tests.py");
+    let out = rvrun(&["-L".as_ref(), root.as_os_str(), python.as_os_str(), script.as_os_str()]);
+    let expected =
+        std::fs::read_to_string(tests_dir().join("programs/python-tests.py.expected")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "", "no unsupported syscalls");
+    assert_eq!(out.status.code(), Some(0));
+}

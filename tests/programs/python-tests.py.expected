@@ -1,0 +1,17 @@
+version True posix
+json+re {"k": [1, 2]} a<1>b<2>
+decimal 0.1428571428571428571428571429
+sqlite3 4950
+hashlib ba7816bf8f01cfea
+compress True
+ctypes 42 8
+counter [('i', 4), ('s', 4)]
+subprocess from a child 3
+pipeline a
+threads 8 6999860000
+signal True
+alarm interrupted sleep
+socket OVER TCP
+asyncio ASYNCIO 10
+files ['f0', 'f1', 'f2'] 6
+multiprocessing [1, 2, 3]
