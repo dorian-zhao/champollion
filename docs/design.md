@@ -223,7 +223,11 @@ Profile of the engine (`sample`): ~63% instruction dispatch in `execute`, ~15% b
 
 ## Concurrency Model
 
-Threads arrive in M5, but the runtime is shaped for them from M2 so that adding `clone` does not mean redesigning memory, atomics, or the syscall layer.
+The runtime was shaped for threads from M2, so adding `clone` in M5 did not mean redesigning memory, atomics, or the syscall layer.
+
+- **One host thread per guest thread.** Thread-style `clone` starts a host thread with its own `CpuState`, engine, and JIT (translations are per thread; only the main thread's are cached on disk). As on Linux, `exit` ends a thread and clears and wakes its `clear_child_tid` word, the process ends with its last thread, and `exit_group` or a fatal fault in any thread ends it at once (from a thread other than the main one, by exiting the host process directly, since the main thread may be blocked).
+- **Futexes are a parking lot in the process.** Guest processes never share memory, so there is no need for a host facility: waiters queue per address under a bucket lock, which makes the value check and the sleep atomic with respect to wakes.
+- **Signals are delivered by the recipient's run loop.** Dispositions belong to the process; masks, pending sets, and the alternate stack to threads. A thread takes deliverable signals after each syscall and when guest code traps; a sender also sets the recipient's interrupt flag, which translated code checks before backward and indirect jumps (not returns), so even a spinning thread stops at the next loop iteration. Delivery builds the riscv64 `rt_sigframe`; handlers return through a trampoline page standing in for the vDSO. The checks cost about 2%; checking at every block entry cost 4–7%.
 
 - **Process vs. thread.** `Process` (shared, `Sync`, used only through `&Process`) owns the address space, the program break, and syscall logging. `Thread` owns `CpuState` (including the `lr` reservation), its tid, and `clear_child_tid`. Each guest thread will run on its own host thread. `exit` ends a thread; `exit_group` ends the process.
 - **Guest memory is shared, never borrowed.** All `Memory` methods take `&self`. Data accesses use relaxed host atomics, which compile to plain `ldr`/`str` on arm64 when aligned, so racing guest threads are the guest's business and never undefined behavior on the host side.
@@ -255,7 +259,7 @@ Each step uses the previous step's interpreter as its correctness baseline. M1�
 | M2 | M, A, C extensions + guest address space + ELF loader (auxv, initial stack) + core syscalls | A static `hello` built with `zig cc` prints on the Mac | CS162 |
 | M3 | F, D, Zicsr, Zifencei + remaining syscalls + gdbstub + test-runner integration | Runs a static `lua` or `sqlite`; `cargo test` for a riscv64 target runs through `rvrun` | CS61C |
 | M4 | Basic-block JIT, block chaining, indirect-jump optimization, AOT cache | Zero differences in differential tests against the interpreter; clear benchmark speedup | Extracurricular |
-| M5 | Multithreading, `futex`, signals, dynamic linking (with a riscv64 sysroot) | Runs multithreaded programs and Go binaries | CS162 |
+| M5 | Multithreading, `futex`, signals, sockets, epoll, dynamic linking (with a riscv64 sysroot), fork/exec | Runs multithreaded programs, Go binaries, and dynamically linked programs (e.g. Python) | CS162 |
 | M6 | Route A: arm64 Linux VM via `Virtualization.framework`, translator as binfmt\_misc handler, Linux syscall passthrough | A riscv64 Docker image runs on the Mac | CS162 |
 
 ## Testing Strategy
@@ -275,6 +279,8 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 ## Decision Log
 
+- **Oct 14, 2026 — epoll and eventfd are emulated on kqueue in the Darwin backend.** Go's netpoller needs them even for programs without networking. An epoll instance is a kqueue whose filters carry the guest's `epoll_data` in `udata`; regular files are refused with `EPERM` as on Linux. An eventfd is a counter kept by the backend plus a socketpair end that holds a byte while the counter is nonzero. Route A will pass both through.
+- **Oct 14, 2026 — M5 grows fork/exec and sockets; Python is a target.** Dynamically linked programs like Python need `subprocess`, which needs `fork` and `execve`. In route B the whole guest lives in one host process, so `fork` can be the host's (copy-on-write duplicates guest memory and translations alike) and `execve` a fresh rvrun.
 - **Oct 14, 2026 — Code cache as snapshots of the code buffer, not ahead-of-time translation.** Translating a whole executable up front would translate cold and data-in-text bytes and needs a separate code layout; saving what a run actually translated reuses the JIT unchanged and only required removing the one host address from generated code. See [Persistent code cache](#persistent-code-cache).
 - **Oct 14, 2026 — Generated code keeps masking guest addresses.** The mask keeps a guest from reaching host memory outside its reservation, as a sandbox would (QEMU linux-user does not mask). It costs Lua 5% and SQLite 3%, on pointer chasing; isolation is worth more than that.
 - **Oct 14, 2026 — `instret` stays exact.** Counted per block in x30, it costs under 1% (removing it entirely measured 0.6–0.8%), so there is no case for a cheaper approximate mode.
@@ -284,7 +290,7 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 - **Oct 14, 2026 — Route B first, then route A as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. B covers the daily build → test → debug loop best (instant, no VM, Mac file system); A (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux; see [Goals and Positioning](#goals-and-positioning).
 - **Oct 14, 2026 — M3 done; gdbstub runs on the reference interpreter.** `rvrun -g PORT` serves the GDB remote protocol through the `gdbstub` crate. While attached, the guest single-steps on the oracle interpreter, so breakpoints (kept on our side, code is never patched), stepping, and Ctrl-C are exact; detaching hands the guest back to the engine. Only x0–x31 and pc are exposed for now (the stock RISC-V target description); FP registers need a custom description.
 - **Oct 14, 2026 — Static-PIE moves into M3.** Rust's musl targets link static-PIE by default, so `cargo test` needs it; images load at `PIE_BASE` (2/3 up, like Linux) and relocate themselves.
-- **Oct 14, 2026 — `cargo test` works before threads.** libtest falls back to the main thread when `clone` fails, so the M3 criterion holds without M5; parallel test execution waits for M5.
+- **Oct 14, 2026 — `cargo test` works before threads.** libtest falls back to the main thread when `clone` fails, so the M3 criterion holds without M5; parallel test execution waits for M5 (and works since).
 - **Oct 14, 2026 — FP reference is Berkeley SoftFloat (RISC-V specialization), vendored.** Same code as Spike; used to fuzz the host-FPU path and as the RMM fallback. Existing crates either fail to build with current CMake or are LGPL.
 - **Oct 14, 2026 — Performance target: ≤ 2× native, stretch Rosetta 2 class (70–80% of native).** See [Target](#target). Consequence for M3: F/D runs on the host FPU, with the interpreter using the same `FPCR`/`FPSR` mapping the JIT will use, so the hardware-mapping claims are validated before M4.
 - **Oct 14, 2026 — Fast interpreter before M3.** A decoded-block cache with chaining plus a software TLB takes the CPU benchmark from 41 to ~270 MIPS (6.6×), and is the cache structure the JIT will reuse; see [What we borrow from Rosetta 2](#what-we-borrow-from-rosetta-2).
