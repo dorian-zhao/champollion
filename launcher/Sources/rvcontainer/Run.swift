@@ -117,6 +117,13 @@ struct Run: AsyncParsableCommand {
             throw ValidationError("the image has no command; give one")
         }
         config.process.environmentVariables += environment
+        // Docker sets HOME when the image does not; programs (and rvrun's code cache) expect it.
+        let user = imageConfig?.user ?? ""
+        if !config.process.environmentVariables.contains(where: { $0.hasPrefix("HOME=") })
+            && (user.isEmpty || user == "root" || user == "0" || user.hasPrefix("0:") || user.hasPrefix("root:"))
+        {
+            config.process.environmentVariables.append("HOME=/root")
+        }
         if let workdir {
             config.process.workingDirectory = workdir
         }
