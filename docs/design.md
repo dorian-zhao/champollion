@@ -275,7 +275,9 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 
 ## Known Gaps
 
-Things route B does not do yet, roughly by how likely a program is to notice.
+Things that do not work yet, roughly by how likely a program is to notice.
+
+### Route B
 
 - **Dynamically linked programs get no persistent code cache.** Mapping libraries changes executable mappings, which drops translations and disables saving; CPython pays its startup translation on every run (about 0.2 s for `python3 -c pass`). The cache key would have to cover every mapped library.
 - **Realtime signals do not queue.** Each signal has at most one pending instance, as standard signals do; `sigqueue` payloads are not delivered.
@@ -284,14 +286,19 @@ Things route B does not do yet, roughly by how likely a program is to notice.
 - **Linux builds linked by GNU ld run SQLite about 12% slower than zig-linked ones** (37.9 vs. 33.5 ms in OrbStack's VM, same code and memory layout); the cause is not known yet.
 - **Memory protection is coarser in generated code** (16 KiB host pages, aliasing above 2^38); see [Performance boundary](#performance-boundary).
 
+### Route A
+
+- **Every `run` unpacks the image again** into a fresh ext4 file (a second or two for Debian); there are no persistent containers, no `exec` into a running one, and no published ports yet.
+- **The Kata kernel is 6.12**, while Containerization tests from 6.14.9.
+
 ## Open Questions
 
 - Crate name is `champollion-rv` (crates.io: no existing crate as of Oct 13, 2026); CLI is `rvrun`.
 - Introduce an IR from the start, or lift directly to ARM64 until M4?
-- **M6 foundation:** build route A on [apple/containerization](https://github.com/apple/containerization) (the package behind [apple/container](https://github.com/apple/container))? It already provides per-container VMs on `Virtualization.framework`, a fast-booting kernel config, the `vminitd` init, ext4 and OCI image handling, and runs linux/amd64 images through Rosetta, which is structurally what we need for riscv64. Unverified: whether a custom binfmt\_misc handler can be registered without forking it. Requires macOS 26+.
 
 ## Decision Log
 
+- **Oct 14, 2026 — Route A's launcher is rvcontainer, built on apple/containerization.** A Swift command (`launcher/`) pulls an image's linux/riscv64 variant, unpacks it to ext4, and runs it in an arm64 Linux VM booted from Apple's published vminit image and Kata's kernel, with vmnet networking. rvrun's Linux build is shared into the VM over virtiofs and registered with binfmt\_misc through vminitd's public `SetupEmulator` call, exactly as Containerization registers Rosetta, so no fork is needed (this was the open question). Flags `POCF`: setuid programs run with their owner's credentials, and rvrun reads the program from `AT_EXECFD`. Alpine and Debian images run interactively or not and install packages; a warm run of a small command takes 0.8 s, and Lua runs as fast as in OrbStack's VM.
 - **Oct 14, 2026 — On Linux, guest addresses are host addresses, and calls we do not emulate go to the kernel.** Guest memory on Linux uses an identity layout: guest address `g` is host address `g`, reserved from `mmap_min_addr` up to 2^38 plus the guard, with the control area in a separate mapping (macOS keeps the offset layout, since it reserves the low 4 GiB of every process). Guest pointers are then host pointers, and since riscv64 and arm64 share syscall numbers and structure layouts, any call the dispatcher does not handle can be passed through as it is, pointers inside structures included, which a table of pointer arguments (QEMU's way) could not do without per-call code. Excluded are calls that would undercut the emulation: thread creation and `execveat`, signals and signal-sending timers, host memory protections, seccomp, ptrace, the architecture-specific range, and everything when a sysroot is set. Generated code also gets simpler: no base addition, and the interrupt check is one load through the register that held the base. Static musl binaries must then be linked above the guest space (`.cargo/config.toml`), which zig's linker cannot do, so Linux builds use GNU ld via `tools/linux.sh`. With this, Debian trixie's riscv64 root runs `apt-get update` and installs packages.
 - **Oct 14, 2026 — In route A, rvrun is the binfmt\_misc handler and `execve` goes to the kernel.** Registered for riscv64 ELF files with the `F` (open at registration, so it works in containers and chroots) and `P` (preserve `argv[0]`, announced in `AT_FLAGS`) flags, rvrun starts guest programs like native ones; a guest `execve` is the kernel's again, which finds rvrun for riscv64 programs and `#!` interpreters by itself. Tested in a private binfmt\_misc instance (a user namespace, so the VM's global registrations stay untouched) with Alpine's and Debian trixie's riscv64 roots: busybox, bash, coreutils, dpkg, apt, perl, and CPython run. In the same OrbStack VM, rvrun runs Lua 4.8× and SQLite 4.2× faster than the `qemu-riscv64` registered there (93 vs. 446 ms, 35 vs. 146 ms).
 - **Oct 14, 2026 — Route A starts as route B on a Linux backend.** The first M6 step keeps `Process` (guest memory, threads, signals, futexes) as it is and swaps only the `HostOs` backend: `host::linux` passes syscalls to the host kernel, translating just the four `open` flags whose arm64 bits differ from asm-generic. The whole suite, including Alpine's busybox and CPython, passes on arm64 Linux with no other change, and Lua runs within about 10% of its macOS time inside OrbStack's VM. Passing through what `Process` does itself (`clone`, signals, `execve` through binfmt\_misc) is the next decision, once programs need it.
