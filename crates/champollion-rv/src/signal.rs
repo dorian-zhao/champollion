@@ -173,13 +173,27 @@ impl Pending {
 
 /// A thread's signal state that other threads touch: its mask (to pick a recipient for
 /// process-directed signals) and its pending thread-directed signals.
-#[derive(Debug, Default)]
+/// Interrupts a thread's current blocking wait (see [`ThreadSignals::waker`]).
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
 pub struct ThreadSignals {
     pub mask: AtomicU64,
     pub pending: Mutex<Pending>,
     /// The thread's interrupt flag slot in guest memory's control area: senders set the
     /// flag to make the thread leave generated code and take the signal.
     pub slot: usize,
+    /// The host thread running it (a `pthread_t`; 0 before it starts): senders interrupt
+    /// a blocking host syscall there with an internal host signal.
+    pub host_thread: std::sync::atomic::AtomicUsize,
+    /// While the thread blocks in a wait of ours (a futex, `rt_sigsuspend`), how to end it.
+    pub waker: Mutex<Option<Waker>>,
+}
+
+impl std::fmt::Debug for ThreadSignals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadSignals").field("mask", &self.mask).field("slot", &self.slot).finish()
+    }
 }
 
 impl ThreadSignals {

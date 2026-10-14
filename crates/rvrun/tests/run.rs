@@ -81,7 +81,10 @@ fn signals() {
          alternate stack used\n\
          resumed after illegal instruction with 42\n\
          signal to thread delivered\n\
-         signal to spinning thread delivered\n"
+         signal to spinning thread delivered\n\
+         sigsuspend woke for SIGCHLD\n\
+         nanosleep: EINTR, time left reported\n\
+         read: restarted\n"
     );
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     // Default actions: SIGTERM and abort()'s SIGABRT kill the process (SIGABRT is reported

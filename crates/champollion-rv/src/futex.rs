@@ -19,6 +19,13 @@ const BUCKETS: usize = 64;
 /// Wake every waiter regardless of its bitset (`FUTEX_BITSET_MATCH_ANY`).
 pub const MATCH_ANY: u32 = u32::MAX;
 
+/// A waiting thread that signals can interrupt: `arm` installs (or with `None` removes) a
+/// callback that ends the wait, and `interrupted` says whether a signal is waiting for it.
+pub trait Interruptible {
+    fn arm(&self, waker: Option<crate::signal::Waker>);
+    fn interrupted(&self) -> bool;
+}
+
 pub struct Futexes {
     buckets: [Mutex<HashMap<u64, Vec<Arc<Waiter>>>>; BUCKETS],
 }
@@ -31,7 +38,9 @@ impl Default for Futexes {
 
 struct Waiter {
     bitset: u32,
+    /// Woken by a futex wake (true), or interrupted by a signal (see `interrupted`).
     woken: Mutex<bool>,
+    interrupted: std::sync::atomic::AtomicBool,
     cv: Condvar,
 }
 
@@ -56,7 +65,8 @@ impl Futexes {
     }
 
     /// `FUTEX_WAIT(_BITSET)`: if the 32-bit word at `addr` still holds `expected`, sleep
-    /// until woken (0) or until `deadline` (`ETIMEDOUT`); otherwise `EAGAIN`.
+    /// until woken (0), until `deadline` (`ETIMEDOUT`), or until a signal interrupts `who`
+    /// (`EINTR`); otherwise `EAGAIN`.
     pub fn wait(
         &self,
         mem: &impl Memory,
@@ -64,11 +74,45 @@ impl Futexes {
         expected: u32,
         deadline: Option<Instant>,
         bitset: u32,
+        who: Option<&dyn Interruptible>,
     ) -> Result<u64, i32> {
         if !addr.is_multiple_of(4) || bitset == 0 {
             return Err(errno::EINVAL);
         }
-        let waiter = Arc::new(Waiter { bitset, woken: Mutex::new(false), cv: Condvar::new() });
+        let waiter = Arc::new(Waiter {
+            bitset,
+            woken: Mutex::new(false),
+            interrupted: std::sync::atomic::AtomicBool::new(false),
+            cv: Condvar::new(),
+        });
+        let result = self.wait_queued(mem, addr, expected, deadline, &waiter, who);
+        if let Some(who) = who {
+            who.arm(None);
+        }
+        result
+    }
+
+    fn wait_queued(
+        &self,
+        mem: &impl Memory,
+        addr: u64,
+        expected: u32,
+        deadline: Option<Instant>,
+        waiter: &Arc<Waiter>,
+        who: Option<&dyn Interruptible>,
+    ) -> Result<u64, i32> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Some(who) = who {
+            let w = waiter.clone();
+            who.arm(Some(Arc::new(move || {
+                w.interrupted.store(true, SeqCst);
+                let _held = lock(&w.woken);
+                w.cv.notify_one();
+            })));
+            if who.interrupted() {
+                return Err(errno::EINTR);
+            }
+        }
         {
             let mut bucket = self.bucket(addr);
             if read_u32(mem, addr)? != expected {
@@ -77,7 +121,7 @@ impl Futexes {
             bucket.entry(addr).or_default().push(waiter.clone());
         }
         let mut woken = lock(&waiter.woken);
-        while !*woken {
+        while !*woken && !waiter.interrupted.load(SeqCst) {
             match deadline {
                 None => woken = waiter.cv.wait(woken).unwrap_or_else(|e| e.into_inner()),
                 Some(deadline) => {
@@ -97,18 +141,18 @@ impl Futexes {
             return Ok(0);
         }
         drop(woken);
-        // Timed out: leave the queue, unless a wake got to us first.
+        // Timed out or interrupted: leave the queue, unless a wake got to us first.
         let mut bucket = self.bucket(addr);
         if *lock(&waiter.woken) {
             return Ok(0);
         }
         if let Some(queue) = bucket.get_mut(&addr) {
-            queue.retain(|w| !Arc::ptr_eq(w, &waiter));
+            queue.retain(|w| !Arc::ptr_eq(w, waiter));
             if queue.is_empty() {
                 bucket.remove(&addr);
             }
         }
-        Err(errno::ETIMEDOUT)
+        Err(if waiter.interrupted.load(SeqCst) { errno::EINTR } else { errno::ETIMEDOUT })
     }
 
     /// `FUTEX_WAKE(_BITSET)`: wake up to `count` waiters on `addr` whose bitset intersects
@@ -202,12 +246,12 @@ mod tests {
         let mem = FlatMemory::new(0, 0x1000);
         let f = Futexes::default();
         mem.write(0x10, &5u32.to_le_bytes()).unwrap();
-        assert_eq!(f.wait(&mem, 0x10, 4, None, MATCH_ANY), Err(errno::EAGAIN));
+        assert_eq!(f.wait(&mem, 0x10, 4, None, MATCH_ANY, None), Err(errno::EAGAIN));
         let soon = Some(Instant::now() + Duration::from_millis(10));
-        assert_eq!(f.wait(&mem, 0x10, 5, soon, MATCH_ANY), Err(errno::ETIMEDOUT));
+        assert_eq!(f.wait(&mem, 0x10, 5, soon, MATCH_ANY, None), Err(errno::ETIMEDOUT));
         assert_eq!(f.wake(0x10, 1, MATCH_ANY), Ok(0), "the timed-out waiter left the queue");
-        assert_eq!(f.wait(&mem, 0x11, 5, None, MATCH_ANY), Err(errno::EINVAL));
-        assert_eq!(f.wait(&mem, 0x2000, 5, None, MATCH_ANY), Err(errno::EFAULT));
+        assert_eq!(f.wait(&mem, 0x11, 5, None, MATCH_ANY, None), Err(errno::EINVAL));
+        assert_eq!(f.wait(&mem, 0x2000, 5, None, MATCH_ANY, None), Err(errno::EFAULT));
     }
 
     #[test]
@@ -217,7 +261,7 @@ mod tests {
         let f = Arc::new(Futexes::default());
         let spawn_waiter = |addr| {
             let (mem, f) = (mem.clone(), f.clone());
-            std::thread::spawn(move || f.wait(&*mem, addr, 0, None, MATCH_ANY))
+            std::thread::spawn(move || f.wait(&*mem, addr, 0, None, MATCH_ANY, None))
         };
         let waiters: Vec<_> = (0..3).map(|_| spawn_waiter(0x20)).collect();
         let queued = |addr| f.bucket(addr).get(&addr).map_or(0, Vec::len);

@@ -109,8 +109,14 @@ fn main() -> ExitCode {
 
     // The guest gets `args` (argv[0] first) and inherits our environment.
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
-    let envp: Vec<Vec<u8>> =
-        std::env::vars_os().map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat()).collect();
+    // (Except what an exec'ing rvrun passed us about signals.)
+    let signal_set =
+        |name| std::env::var(name).ok().and_then(|v| u64::from_str_radix(&v, 16).ok()).unwrap_or(0);
+    let (ignored, mask) = (signal_set("RVRUN_SIGIGN"), signal_set("RVRUN_SIGMASK"));
+    let envp: Vec<Vec<u8>> = std::env::vars_os()
+        .filter(|(k, _)| k != "RVRUN_SIGIGN" && k != "RVRUN_SIGMASK")
+        .map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat())
+        .collect();
 
     let (proc, mut main_thread) = match Process::spawn(
         &file,
@@ -136,6 +142,17 @@ fn main() -> ExitCode {
         }
     };
     proc.set_exec(Box::new(move |req| exec(req, sysroot.as_deref())));
+    for sig in (1..=champollion_rv::signal::NSIG).filter(|&s| ignored & (1 << (s - 1)) != 0) {
+        let ignore = champollion_rv::signal::Action {
+            handler: champollion_rv::signal::SIG_IGN,
+            ..Default::default()
+        };
+        if champollion_rv::signal::UNBLOCKABLE & (1 << (sig - 1)) == 0 {
+            proc.set_action(sig, ignore);
+        }
+    }
+    main_thread.signals.set_mask(mask);
+    champollion_rv::host::darwin::forward_signals(proc.clone());
     let strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
     proc.log.strace.store(strace, std::sync::atomic::Ordering::Relaxed);
     let cache = CodeCache::new(&file);
@@ -340,6 +357,9 @@ fn exec(req: &champollion_rv::process::Exec, sysroot: Option<&std::path::Path>) 
             cmd.env(k, v);
         }
     }
+    // Ignored signals and the signal mask survive execve.
+    cmd.env("RVRUN_SIGIGN", format!("{:x}", req.ignored));
+    cmd.env("RVRUN_SIGMASK", format!("{:x}", req.mask));
     let err = cmd.exec(); // only returns on failure
     // The common errno values agree with Linux.
     err.raw_os_error().unwrap_or(5)

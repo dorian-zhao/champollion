@@ -107,7 +107,15 @@ impl Exit {
                 libc::sigemptyset(&mut set);
                 libc::sigaddset(&mut set, sig);
                 libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-                libc::raise(sig);
+                // To the process, not this thread: a thread-directed signal would be lost if
+                // another thread execs first, while a process-directed one survives exec.
+                libc::kill(libc::getpid(), sig);
+                // Let it arrive here before exiting another way.
+                libc::sigsuspend(&{
+                    let mut none: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut none);
+                    none
+                });
             }
         }
         std::process::exit(self.report(cpu).into())
@@ -184,6 +192,9 @@ pub struct Process {
     orphaned: AtomicBool,
     /// How to start a new program for `execve` (the embedder knows how to launch itself).
     exec: std::sync::OnceLock<ExecFn>,
+    /// Run in a forked child, which keeps only the forking thread: restarts whatever host
+    /// threads the process relies on (the host signal pump).
+    on_fork: std::sync::OnceLock<Box<dyn Fn(Arc<Process>) + Send + Sync>>,
 }
 
 /// What `execve` asks the embedder to run: a guest executable (a host path) with its
@@ -195,6 +206,10 @@ pub struct Exec {
     pub path: std::path::PathBuf,
     pub argv: Vec<Vec<u8>>,
     pub envp: Vec<Vec<u8>>,
+    /// Signals the new program starts with ignored (ignored dispositions survive `execve`;
+    /// handlers do not), and its signal mask.
+    pub ignored: u64,
+    pub mask: u64,
 }
 
 struct Threads {
@@ -231,6 +246,9 @@ pub struct Thread {
     /// Signal mask and pending thread-directed signals, shared with senders.
     pub signals: Arc<ThreadSignals>,
     pub altstack: AltStack,
+    /// The mask to restore when the next handler returns, if not the current one
+    /// (`rt_sigsuspend` runs the handler under its temporary mask).
+    pub saved_mask: Option<u64>,
     /// Set by `set_tid_address`; on thread exit the kernel zeroes it and wakes futex
     /// waiters (M5, for `pthread_join`).
     pub clear_child_tid: u64,
@@ -238,6 +256,41 @@ pub struct Thread {
     pub engine: Engine,
     /// This thread's JIT, if enabled (the default); otherwise `engine` runs everything.
     pub jit: Option<Jit>,
+}
+
+/// The host signal that interrupts a guest thread's blocking host syscall (EINTR) when a
+/// guest signal arrives for it. Its handler does nothing; guest code never sees it.
+const WAKE_SIGNAL: i32 = libc::SIGURG;
+
+extern "C" fn wake_handler(_: libc::c_int) {}
+
+fn install_wake_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: installing a handler without SA_RESTART, so blocking calls return EINTR.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = wake_handler as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(WAKE_SIGNAL, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+/// A thread blocked in a wait of ours; see [`Process::blocked`].
+pub struct Blocked<'a> {
+    process: &'a Process,
+    thread: &'a Thread,
+}
+
+impl futex::Interruptible for Blocked<'_> {
+    fn arm(&self, waker: Option<signal::Waker>) {
+        *lock(&self.thread.signals.waker) = waker;
+    }
+
+    fn interrupted(&self) -> bool {
+        self.process.signal_waiting(self.thread).is_some()
+    }
 }
 
 /// `path` under `sysroot` if it is absolute and exists there, else `path` itself. Paths
@@ -424,6 +477,7 @@ impl Process {
             main_tid: std::sync::atomic::AtomicU32::new(id.pid),
             orphaned: AtomicBool::new(false),
             exec: std::sync::OnceLock::new(),
+            on_fork: std::sync::OnceLock::new(),
         });
         Ok((
             process,
@@ -433,6 +487,7 @@ impl Process {
                 name: *b"rvrun\0\0\0\0\0\0\0\0\0\0\0",
                 signals: main_signals,
                 altstack: AltStack::default(),
+                saved_mask: None,
                 clear_child_tid: 0,
                 engine: Engine::new(),
                 jit: None,
@@ -489,6 +544,7 @@ impl Process {
                     name,
                     signals,
                     altstack: AltStack::default(),
+                    saved_mask: None,
                     clear_child_tid,
                     engine: Engine::new(),
                     jit,
@@ -528,6 +584,7 @@ impl Process {
     /// `pthread_join` learns of the exit), and end the process if it was the last thread.
     fn thread_exited(&self, thread: &Thread, status: i32) {
         lock(&self.thread_signals).remove(&thread.tid);
+        thread.signals.host_thread.store(0, Ordering::SeqCst);
         self.free_slot(thread.signals.slot);
         if thread.clear_child_tid != 0 {
             let addr = thread.clear_child_tid;
@@ -548,6 +605,12 @@ impl Process {
 
     /// Run `thread` until it exits or the process ends.
     fn run_thread(&self, thread: &mut Thread) -> End {
+        // SAFETY: pthread_self has no preconditions.
+        thread
+            .signals
+            .host_thread
+            .store(unsafe { libc::pthread_self() } as usize, Ordering::SeqCst);
+        install_wake_handler();
         loop {
             if let Some(end) = self.deliver_signals(thread) {
                 return end;
@@ -597,6 +660,11 @@ impl Process {
         let _ = self.exec.set(exec);
     }
 
+    /// Set what a forked child must restart (once); see the field.
+    pub fn set_on_fork(&self, f: Box<dyn Fn(Arc<Process>) + Send + Sync>) {
+        let _ = self.on_fork.set(f);
+    }
+
     /// `execve`: replace this program. Returns only on failure, with a Linux errno.
     pub fn exec(&self, request: &Exec) -> i32 {
         match self.exec.get() {
@@ -641,7 +709,18 @@ impl Process {
         *own_pending = Pending::default();
         thread.tid = new;
         drop((brk, threads, registry, slots, pending, own_pending, maps));
+        if let (Some(f), Some(this)) = (self.on_fork.get(), self.this.upgrade()) {
+            f(this);
+        }
         Ok(0)
+    }
+
+    /// Signals whose disposition is `SIG_IGN`.
+    pub fn ignored_signals(&self) -> u64 {
+        let actions = lock(&self.actions);
+        (1..=signal::NSIG)
+            .filter(|&sig| actions[sig as usize - 1].handler == signal::SIG_IGN)
+            .fold(0, |set, sig| set | signal::bit(sig))
     }
 
     /// The disposition of `sig` (1..=64).
@@ -681,11 +760,64 @@ impl Process {
         true
     }
 
-    /// Make thread `t` leave generated code soon if it can take `sig`.
+    /// Make thread `t` take `sig` soon if it can: leave generated code, end a wait of ours,
+    /// or return from a blocking host syscall with EINTR.
     fn interrupt(&self, t: &ThreadSignals, sig: i32) {
-        if t.mask() & signal::bit(sig) == 0 {
-            self.mem.interrupt_flag(t.slot).store(1, Ordering::SeqCst);
+        if t.mask() & signal::bit(sig) != 0 {
+            return;
         }
+        self.mem.interrupt_flag(t.slot).store(1, Ordering::SeqCst);
+        if let Some(wake) = lock(&t.waker).clone() {
+            wake();
+        }
+        let host = t.host_thread.load(Ordering::SeqCst);
+        // SAFETY: pthread_self has no preconditions.
+        if host != 0 && host != unsafe { libc::pthread_self() } as usize {
+            // SAFETY: the host thread is alive while it is registered (it unregisters
+            // before it ends); the signal's handler does nothing (see `wake_handler`).
+            unsafe { libc::pthread_kill(host as libc::pthread_t, WAKE_SIGNAL) };
+        }
+    }
+
+    /// Whether `thread` has a signal it can take now, and if so whether every such signal's
+    /// handler restarts interrupted syscalls (`SA_RESTART`).
+    pub fn signal_waiting(&self, thread: &Thread) -> Option<bool> {
+        let ready = self.pending_for(thread) & !thread.signals.mask();
+        if ready == 0 {
+            return None;
+        }
+        let actions = lock(&self.actions);
+        let restart = (1..=signal::NSIG)
+            .filter(|&sig| ready & signal::bit(sig) != 0)
+            .all(|sig| actions[sig as usize - 1].flags & signal::SA_RESTART != 0);
+        Some(restart)
+    }
+
+    /// A blocking wait of ours for `thread` that signals end (see [`Process::interrupt`]).
+    pub fn blocked<'a>(&'a self, thread: &'a Thread) -> Blocked<'a> {
+        Blocked { process: self, thread }
+    }
+
+    /// `rt_sigsuspend`: wait under `mask` until a signal arrives that it lets through;
+    /// its handler runs under `mask` too, and the old mask comes back when it returns.
+    pub fn sigsuspend(&self, thread: &mut Thread, mask: u64) -> Result<u64, i32> {
+        let old = thread.signals.mask();
+        thread.signals.set_mask(mask);
+        thread.saved_mask = Some(old);
+        let wakeup = Arc::new((Mutex::new(false), Condvar::new()));
+        let w = wakeup.clone();
+        *lock(&thread.signals.waker) = Some(Arc::new(move || {
+            *lock(&w.0) = true;
+            w.1.notify_one();
+        }));
+        let mut woken = lock(&wakeup.0);
+        while self.signal_waiting(thread).is_none() {
+            woken = wakeup.1.wait(woken).unwrap_or_else(|e| e.into_inner());
+            *woken = false;
+        }
+        drop(woken);
+        *lock(&thread.signals.waker) = None;
+        Err(crate::syscall::errno::EINTR)
     }
 
     pub fn thread_exists(&self, tid: u32) -> bool {
@@ -736,7 +868,7 @@ impl Process {
                     sig,
                     info,
                     &action,
-                    mask,
+                    thread.saved_mask.take().unwrap_or(mask),
                     thread.altstack,
                     SIGRETURN_TRAMPOLINE,
                 );

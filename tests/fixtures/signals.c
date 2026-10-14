@@ -13,7 +13,9 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <string.h>
 #include <time.h>
 #include <ucontext.h>
@@ -71,6 +73,19 @@ static void *spin_hard(void *arg) {
     atomic_store(&spinning, 1);
     while (!atomic_load_explicit(&thread_hit, memory_order_relaxed)) {
     }
+    return NULL;
+}
+
+static volatile sig_atomic_t got_chld;
+static void on_chld(int sig) { got_chld = sig == SIGCHLD; }
+static void on_nothing(int sig) { (void)sig; }
+
+static pthread_t sleeper_waker;
+static void *poke_after(void *arg) {
+    struct timespec ts = {0, 50 * 1000000};
+    nanosleep(&ts, NULL);
+    pthread_kill(sleeper_waker, SIGUSR2);
+    if (arg) write(*(int *)arg, "late", 4); // after the signal: read must restart
     return NULL;
 }
 
@@ -159,5 +174,38 @@ int main(int argc, char **argv) {
     pthread_kill(target, SIGUSR1);
     pthread_join(target, NULL);
     printf("signal to spinning thread %s\n", atomic_load(&thread_hit) ? "delivered" : "lost");
+
+    // sigsuspend wakes for SIGCHLD when a child exits.
+    handle(SIGCHLD, on_chld, 0);
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &block, &old);
+    if (fork() == 0) _exit(0);
+    while (!got_chld) sigsuspend(&old);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    wait(NULL);
+    printf("sigsuspend woke for SIGCHLD\n");
+
+    // A handler without SA_RESTART interrupts a sleep, which reports the time left.
+    handle(SIGUSR2, on_nothing, 0);
+    sleeper_waker = pthread_self();
+    pthread_t poker;
+    pthread_create(&poker, NULL, poke_after, NULL);
+    struct timespec req = {2, 0}, rem = {0, 0};
+    int slept = nanosleep(&req, &rem);
+    pthread_join(poker, NULL);
+    printf("nanosleep: %s, time left %s\n", slept == -1 && errno == EINTR ? "EINTR" : "not interrupted",
+           rem.tv_sec >= 1 ? "reported" : "missing");
+
+    // With SA_RESTART, a blocked read resumes after the handler instead of failing.
+    handle(SIGUSR2, on_nothing, SA_RESTART);
+    int fds[2];
+    pipe(fds);
+    pthread_create(&poker, NULL, poke_after, &fds[1]);
+    char buf[8] = {0};
+    ssize_t n = read(fds[0], buf, 4);
+    pthread_join(poker, NULL);
+    printf("read: %s\n", n == 4 && memcmp(buf, "late", 4) == 0 ? "restarted" : "interrupted");
     return 0;
 }

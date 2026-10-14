@@ -40,6 +40,7 @@ pub mod errno {
     pub const ENOPROTOOPT: i32 = 92;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ETIMEDOUT: i32 = 110;
+    pub const EINTR: i32 = 4;
 }
 
 /// Declares the syscall table once: `nr::NAME` constants plus [`name`] for traces and
@@ -111,6 +112,7 @@ syscalls! {
     TKILL = 130 "tkill",
     TGKILL = 131 "tgkill",
     SIGALTSTACK = 132 "sigaltstack",
+    RT_SIGSUSPEND = 133 "rt_sigsuspend",
     RT_SIGACTION = 134 "rt_sigaction",
     RT_SIGPROCMASK = 135 "rt_sigprocmask",
     RT_SIGPENDING = 136 "rt_sigpending",
@@ -696,7 +698,7 @@ fn read_cstr_array(p: &Process, mut addr: u64) -> Result<Vec<Vec<u8>>, i32> {
 
 /// `execve(path, argv, envp)`: the embedder starts the new program (see
 /// [`Process::exec`]); this only returns on failure.
-fn execve(p: &Process, a: [u64; 6]) -> SysResult {
+fn execve(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
     let path = p.mem.read_cstr(a[0], PATH_MAX).map_err(efault)?;
     let argv = read_cstr_array(p, a[1])?;
     let envp = read_cstr_array(p, a[2])?;
@@ -718,12 +720,13 @@ fn execve(p: &Process, a: [u64; 6]) -> SysResult {
     if !elf && !head.starts_with(b"#!") {
         return Err(errno::ENOEXEC);
     }
-    Err(p.exec(&crate::process::Exec { path: host, argv, envp }))
+    let ignored = p.ignored_signals();
+    Err(p.exec(&crate::process::Exec { path: host, argv, envp, ignored, mask: t.signals.mask() }))
 }
 
 /// `futex(uaddr, op, val, timeout or val2, uaddr2, val3)`: the wait, wake, and requeue
 /// operations, private or not (guest processes never share memory).
-fn futex(p: &Process, a: [u64; 6]) -> SysResult {
+fn futex(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
     const PRIVATE: u64 = 128;
     const CLOCK_REALTIME: u64 = 256;
     let [addr, op, val, timeout, addr2, val3] = a;
@@ -746,11 +749,17 @@ fn futex(p: &Process, a: [u64; 6]) -> SysResult {
         Ok(Some(now + d))
     };
     match op & !(PRIVATE | CLOCK_REALTIME) {
-        0 => p.futexes.wait(&p.mem, addr, val as u32, deadline(false)?, futex::MATCH_ANY),
+        0 => {
+            let who = p.blocked(t);
+            p.futexes.wait(&p.mem, addr, val as u32, deadline(false)?, futex::MATCH_ANY, Some(&who))
+        }
         1 => p.futexes.wake(addr, count, futex::MATCH_ANY),
         3 => p.futexes.requeue(&p.mem, addr, count, addr2, timeout as u32, None),
         4 => p.futexes.requeue(&p.mem, addr, count, addr2, timeout as u32, Some(val3 as u32)),
-        9 => p.futexes.wait(&p.mem, addr, val as u32, deadline(true)?, val3 as u32),
+        9 => {
+            let who = p.blocked(t);
+            p.futexes.wait(&p.mem, addr, val as u32, deadline(true)?, val3 as u32, Some(&who))
+        }
         10 => p.futexes.wake(addr, count, val3 as u32),
         _ => Err(errno::ENOSYS),
     }
@@ -788,6 +797,19 @@ pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
         }
         _ => call(p, t, nr, a),
     };
+    // A blocking call interrupted by a signal: restart it after the handler if every
+    // handler waiting asked for SA_RESTART (and the call is one Linux restarts), or if no
+    // signal is waiting after all; otherwise return EINTR. Restarting leaves pc at the
+    // ecall and the arguments in place, so delivery runs the handler first.
+    if result == Err(errno::EINTR) && nr != nr::RT_SIGSUSPEND {
+        let restartable = !matches!(
+            nr,
+            nr::EPOLL_PWAIT | nr::PPOLL | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::FUTEX
+        );
+        if p.signal_waiting(t).is_none_or(|all_restart| all_restart && restartable) {
+            return Flow::Continue;
+        }
+    }
     // Writing to a pipe or socket with no reader raises SIGPIPE (whose default action
     // kills), unless a send asked for MSG_NOSIGNAL. The host only returns EPIPE.
     const EPIPE: i32 = 32;
@@ -903,7 +925,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(8)
         }
         nr::CLONE => clone(p, t, a),
-        nr::EXECVE => execve(p, a),
+        nr::EXECVE => execve(p, t, a),
         nr::WAIT4 => {
             let (pid, status) = host.wait4(a[0] as i32, a[2] as i32)?;
             if a[1] != 0 {
@@ -914,7 +936,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             }
             Ok(pid)
         }
-        nr::FUTEX => futex(p, a),
+        nr::FUTEX => futex(p, t, a),
         // Robust futex lists only matter when a thread dies holding a lock, which ends the
         // whole process here anyway.
         nr::SET_ROBUST_LIST => Ok(0),
@@ -983,6 +1005,14 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         }
         nr::SETGROUPS => Err(errno::EPERM),
         nr::KILL | nr::TKILL | nr::TGKILL => kill(p, nr, a),
+        nr::RT_SIGSUSPEND => {
+            if a[1] != 8 {
+                return Err(errno::EINVAL);
+            }
+            let mut b = [0u8; 8];
+            p.mem.read(a[0], &mut b).map_err(efault)?;
+            p.sigsuspend(t, u64::from_le_bytes(b))
+        }
         nr::EVENTFD2 => host.eventfd(a[0] as u32, a[1] as i32),
         nr::EPOLL_CREATE1 => host.epoll_create1(a[0] as i32),
         nr::EPOLL_CTL => {
@@ -1237,11 +1267,23 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::FCHMODAT => host.fchmodat(fd, &cstr(a[1])?, a[2] as u32, 0),
         nr::UMASK => Ok(host.umask(a[0] as u32) as u64),
         nr::NANOSLEEP => {
-            host.nanosleep(read_timespec(p, a[0])?)?;
-            if a[1] != 0 {
-                put(p, a[1], &[0; 16])?; // no signals yet, so never interrupted
+            let (sec, nsec) = read_timespec(p, a[0])?;
+            let start = std::time::Instant::now();
+            match host.nanosleep((sec, nsec)) {
+                Err(errno::EINTR) if p.signal_waiting(t).is_some() => {
+                    // Interrupted by a signal: report the time left.
+                    if a[1] != 0 {
+                        let total = std::time::Duration::new(sec as u64, nsec as u32);
+                        let left = total.saturating_sub(start.elapsed());
+                        let mut b = (left.as_secs() as i64).to_le_bytes().to_vec();
+                        b.extend((left.subsec_nanos() as i64).to_le_bytes());
+                        put(p, a[1], &b)?;
+                    }
+                    Err(errno::EINTR)
+                }
+                Err(errno::EINTR) => Err(errno::EINTR), // spurious: restarted by dispatch
+                other => other,
             }
-            Ok(0)
         }
         nr::CLOCK_NANOSLEEP => {
             const TIMER_ABSTIME: u64 = 1;
