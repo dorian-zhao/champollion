@@ -134,10 +134,11 @@ fn segfault_exits_like_sigsegv() {
 fn load_errors() {
     let out = rvrun(&["/nonexistent/champollion".as_ref()], b"");
     assert_eq!(out.status.code(), Some(127));
-    // A host (arm64 Mach-O) binary is not a RISC-V ELF.
+    // A host binary (arm64 Mach-O, or an arm64 ELF on Linux) is not a RISC-V ELF.
     let out = rvrun(&[env!("CARGO_BIN_EXE_rvrun").as_ref()], b"");
     assert_eq!(out.status.code(), Some(126));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("NotElf"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NotElf") || stderr.contains("WrongMachine(183)"), "{stderr}");
     let out = rvrun(&[], b"");
     assert_eq!(out.status.code(), Some(2));
 }

@@ -1329,8 +1329,11 @@ mod tests {
         assert_eq!(p.munmap(a, P), Ok(0));
         assert_eq!(std::fs::read(&path).unwrap(), b"Jello", "the write reached the file");
         std::fs::remove_file(&path).unwrap();
-        // Host-page alignment is required for a fixed address.
-        assert_eq!(p.mmap(&*h, 0x1000_1000, P, RW, 0x21 | 0x10, -1, 0), Err(errno::EINVAL));
+        // Host-page alignment is required for a fixed address (16 KiB pages on macOS).
+        // SAFETY: sysconf has no preconditions.
+        if unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64 > P {
+            assert_eq!(p.mmap(&*h, 0x1000_1000, P, RW, 0x21 | 0x10, -1, 0), Err(errno::EINVAL));
+        }
     }
 
     #[test]
