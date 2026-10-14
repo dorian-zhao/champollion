@@ -32,6 +32,7 @@ use crate::engine::Engine;
 use crate::interpreter::Trap;
 use crate::jit::Jit;
 use crate::loader::{self, LoadError, StackInit, auxv};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
@@ -52,6 +53,9 @@ pub const PIE_BASE: u64 = (GUEST_SIZE / 3 * 2) & !(GUEST_PAGE_SIZE - 1);
 /// A page with `li a7, 139; ecall` (`rt_sigreturn`), where signal handlers return to: the
 /// vDSO's job on Linux. It sits just above the mmap region.
 pub const SIGRETURN_TRAMPOLINE: u64 = MMAP_TOP;
+/// Load base of a dynamically linked program's interpreter (the dynamic loader), at the
+/// top of the mmap region as on Linux; the libraries it maps go below.
+pub const INTERP_BASE: u64 = MMAP_TOP - (64 << 20);
 
 /// `AT_HWCAP`: one bit per single-letter extension we implement (bit n = letter 'a' + n).
 const HWCAP: u64 = hwcap(b"imafdc");
@@ -71,6 +75,8 @@ pub enum SpawnError {
     Load(LoadError),
     Map(MapError),
     Reserve(std::io::Error),
+    /// The program interpreter (dynamic loader) at this host path could not be read.
+    Interp(std::path::PathBuf, std::io::Error),
     /// The image overlaps the stack or the mmap region.
     BadLayout,
 }
@@ -169,6 +175,8 @@ pub struct Process {
     pub log: SyscallLog,
     /// Absolute path of the executable, for `/proc/self/exe`.
     pub exe: Vec<u8>,
+    /// Where the guest's absolute paths are looked up first (see [`Process::host_path`]).
+    pub sysroot: Option<std::path::PathBuf>,
 }
 
 struct Threads {
@@ -214,19 +222,35 @@ pub struct Thread {
     pub jit: Option<Jit>,
 }
 
+/// `path` under `sysroot` if it is absolute and exists there (without following a final
+/// symlink out of it), else `path` itself.
+fn resolve(sysroot: Option<&std::path::Path>, path: &std::path::Path) -> std::path::PathBuf {
+    if let Some(root) = sysroot
+        && let Ok(rel) = path.strip_prefix("/")
+    {
+        let candidate = root.join(rel);
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
 fn page_up(a: u64) -> Option<u64> {
     a.checked_add(GUEST_PAGE_SIZE - 1).map(|v| v & !(GUEST_PAGE_SIZE - 1))
 }
 
 impl Process {
-    /// Load a static executable and set up its stack. Returns the process and its main
-    /// thread, ready to run from the entry point. The main thread's tid is the pid.
+    /// Load an executable and set up its stack. Returns the process and its main thread,
+    /// ready to run from the entry point (the interpreter's, for a dynamically linked
+    /// program, found under `sysroot`). The main thread's tid is the pid.
     pub fn spawn(
         file: &[u8],
         argv: &[Vec<u8>],
         envp: &[Vec<u8>],
         execfn: &[u8],
         host: Arc<dyn HostOs>,
+        sysroot: Option<std::path::PathBuf>,
     ) -> Result<(Arc<Self>, Thread), SpawnError> {
         let mut elf = loader::parse(file).map_err(SpawnError::Load)?;
         if elf.pie {
@@ -245,6 +269,28 @@ impl Process {
         let code: Vec<u8> = [LI_A7_139, ECALL].iter().flat_map(|w| w.to_le_bytes()).collect();
         mem.write_privileged(SIGRETURN_TRAMPOLINE, &code).map_err(|_| SpawnError::BadLayout)?;
 
+        // A dynamically linked program starts in its interpreter, which finds the program
+        // through the auxiliary vector (AT_PHDR, AT_ENTRY) and itself through AT_BASE.
+        let (start, interp_base) = match elf.interp {
+            None => (elf.entry, 0),
+            Some(path) => {
+                let path = std::ffi::OsStr::from_bytes(path);
+                let host_path = resolve(sysroot.as_deref(), std::path::Path::new(path));
+                let bytes = std::fs::read(&host_path)
+                    .map_err(|e| SpawnError::Interp(host_path.clone(), e))?;
+                let mut interp = loader::parse(&bytes).map_err(SpawnError::Load)?;
+                if !interp.pie || interp.interp.is_some() {
+                    return Err(SpawnError::BadLayout);
+                }
+                interp.relocate(INTERP_BASE);
+                if interp.span().is_none_or(|(_, hi)| hi > MMAP_TOP) {
+                    return Err(SpawnError::BadLayout);
+                }
+                loader::map_elf(&mem, &interp).map_err(SpawnError::Map)?;
+                (interp.entry, INTERP_BASE)
+            }
+        };
+
         let id = host.identity();
         let mut random = [0u8; 16];
         let rbuf = GuestBuf { ptr: random.as_mut_ptr(), len: random.len() };
@@ -254,7 +300,7 @@ impl Process {
             (auxv::AT_PHENT, 56),
             (auxv::AT_PHNUM, elf.phnum as u64),
             (auxv::AT_PAGESZ, GUEST_PAGE_SIZE),
-            (auxv::AT_BASE, 0),
+            (auxv::AT_BASE, interp_base),
             (auxv::AT_FLAGS, 0),
             (auxv::AT_ENTRY, elf.entry),
             (auxv::AT_UID, id.uid as u64),
@@ -269,7 +315,7 @@ impl Process {
         let sp = loader::build_stack(&mem, STACK_TOP, &init)
             .map_err(|_| SpawnError::Map(MapError::NoSpace))?;
 
-        let mut cpu = CpuState::new(elf.entry);
+        let mut cpu = CpuState::new(start);
         cpu.x[2] = sp;
         let exe = {
             use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -302,6 +348,7 @@ impl Process {
             brk,
             log: SyscallLog::default(),
             exe,
+            sysroot,
         });
         Ok((
             process,
@@ -448,6 +495,19 @@ impl Process {
                 }
             }
         }
+    }
+
+    /// The host path for guest path `path`: under the sysroot if it is absolute and exists
+    /// there (as QEMU's `-L` does), else unchanged.
+    pub fn host_path<'a>(&self, path: &'a std::ffi::CStr) -> std::borrow::Cow<'a, std::ffi::CStr> {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(root) = &self.sysroot else { return path.into() };
+        let guest = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
+        let host = resolve(Some(root), guest);
+        if host.as_path() == guest {
+            return path.into();
+        }
+        std::ffi::CString::new(host.into_os_string().into_vec()).map_or(path.into(), Into::into)
     }
 
     /// The disposition of `sig` (1..=64).
@@ -818,7 +878,7 @@ mod tests {
     fn spawn() -> (Arc<Process>, Thread, Arc<FakeHost>) {
         let host = Arc::new(FakeHost::default());
         let (p, t) =
-            Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", host.clone()).unwrap();
+            Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", host.clone(), None).unwrap();
         (p, t, host)
     }
 

@@ -769,7 +769,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::PREAD64 => host.pread(fd, buf(a[1], a[2], Prot::WRITE)?, a[3] as i64),
         nr::OPENAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
-            host.openat(fd, &path, a[2] as i32, a[3] as u32)
+            host.openat(fd, &p.host_path(&path), a[2] as i32, a[3] as u32)
         }
         nr::CLOSE => host.close(fd),
         nr::FCNTL => match a[1] as i32 {
@@ -790,7 +790,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         }
         nr::NEWFSTATAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
-            let st = host.fstatat(fd, &path, a[3] as i32)?;
+            let st = host.fstatat(fd, &p.host_path(&path), a[3] as i32)?;
             write_stat(p, a[2], &st)
         }
         nr::IOCTL => match a[1] {
@@ -1104,8 +1104,8 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::RENAMEAT => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, 0),
         nr::RENAMEAT2 => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, a[4] as u32),
         nr::MKDIRAT => host.mkdirat(fd, &cstr(a[1])?, a[2] as u32),
-        nr::FACCESSAT => host.faccessat(fd, &cstr(a[1])?, a[2] as i32, 0),
-        nr::FACCESSAT2 => host.faccessat(fd, &cstr(a[1])?, a[2] as i32, a[3] as i32),
+        nr::FACCESSAT => host.faccessat(fd, &p.host_path(&cstr(a[1])?), a[2] as i32, 0),
+        nr::FACCESSAT2 => host.faccessat(fd, &p.host_path(&cstr(a[1])?), a[2] as i32, a[3] as i32),
         nr::READLINKAT => {
             let path = cstr(a[1])?;
             // There is no /proc on macOS; answer the one entry nearly every program asks.
@@ -1114,7 +1114,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 put(p, a[2], &p.exe[..n])?;
                 return Ok(n as u64);
             }
-            host.readlinkat(fd, &path, buf(a[2], a[3], Prot::WRITE)?)
+            host.readlinkat(fd, &p.host_path(&path), buf(a[2], a[3], Prot::WRITE)?)
         }
         nr::GETCWD => {
             // Linux returns the length including the terminating NUL.

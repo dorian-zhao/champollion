@@ -7,7 +7,12 @@ cd "$(dirname "$0")"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 for src in *.c; do
-    zig cc -target riscv64-linux-musl -static -O2 -s "$src" -o "${src%.c}"
+    case $src in
+    dynamic.c) link="-dynamic -lm" ;; # runs against a sysroot's musl (tests/sysroot)
+    *) link=-static ;;
+    esac
+    # shellcheck disable=SC2086 # $link holds two flags
+    zig cc -target riscv64-linux-musl -O2 -s "$src" -o "${src%.c}" $link
 done
 
 # fp.c only uses correctly rounded operations, so the native arm64 build defines the

@@ -30,12 +30,8 @@ pub enum LoadError {
     NotElf,
     Not64BitLittleEndian,
     WrongMachine(u16),
-    /// Has a PT_INTERP; dynamic linking is M5.
-    DynamicallyLinked,
     UnsupportedType(u16),
-    BadSegment {
-        index: usize,
-    },
+    BadSegment { index: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,10 +55,14 @@ pub struct Elf<'a> {
     /// covered by a loadable segment. musl's static startup needs it to find `PT_TLS`.
     pub phdr: Option<u64>,
     pub phnum: u16,
-    /// Position-independent (`ET_DYN` without an interpreter: static-PIE, the default for
-    /// Rust's musl targets). Must be [`relocate`](Elf::relocate)d to a load base; the
-    /// program applies its own relocations at startup.
+    /// Position-independent (`ET_DYN`: a static-PIE, the default for Rust's musl targets, a
+    /// dynamically linked PIE, or a shared object such as the dynamic loader). Must be
+    /// [`relocate`](Elf::relocate)d to a load base; the program (or its interpreter)
+    /// applies its relocations at startup.
     pub pie: bool,
+    /// The program interpreter (`PT_INTERP`) of a dynamically linked program, without its
+    /// trailing NUL.
+    pub interp: Option<&'a [u8]>,
 }
 
 impl Elf<'_> {
@@ -129,10 +129,18 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
 
     let mut segments = Vec::new();
     let mut phdr = None;
+    let mut interp = None;
     for index in 0..phnum {
         let ph = phoff + index * PHDR_SIZE;
         match u32_at(file, ph)? {
-            PT_INTERP => return Err(LoadError::DynamicallyLinked),
+            PT_INTERP => {
+                let (offset, size) =
+                    (u64_at(file, ph + 8)? as usize, u64_at(file, ph + 32)? as usize);
+                let bad = LoadError::BadSegment { index };
+                let path = file.get(offset..offset.checked_add(size).ok_or(bad)?).ok_or(bad)?;
+                interp = Some(path.strip_suffix(&[0]).unwrap_or(path));
+                continue;
+            }
             PT_PHDR => {
                 phdr = Some(u64_at(file, ph + 16)?);
                 continue;
@@ -158,7 +166,7 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
         }
         segments.push(Segment { vaddr, mem_size, data, flags: seg_flags });
     }
-    Ok(Elf { entry, flags, segments, phdr, phnum: phnum as u16, pie })
+    Ok(Elf { entry, flags, segments, phdr, phnum: phnum as u16, pie, interp })
 }
 
 /// Copy every loadable segment into a single [`FlatMemory`] spanning them all, plus

@@ -1,7 +1,9 @@
-//! `rvrun`: run a static riscv64 Linux executable on macOS.
+//! `rvrun`: run a riscv64 Linux executable on macOS.
 //!
-//! Usage: `rvrun [-g PORT] <riscv64-linux-elf> [args...]`
+//! Usage: `rvrun [-g PORT] [-L SYSROOT] <riscv64-linux-elf> [args...]`
 //!
+//! - `-L SYSROOT` looks up the guest's absolute paths (its dynamic loader, libraries,
+//!   `/etc` files) under SYSROOT first, like `qemu-riscv64 -L`; also `RVRUN_SYSROOT`.
 //! - `-g PORT` waits for a GDB remote connection on 127.0.0.1:PORT before running, with the
 //!   guest stopped at its entry point (like `qemu-riscv64 -g`). Port 0 picks a free port;
 //!   the one chosen is printed.
@@ -24,18 +26,31 @@ use champollion_rv::gdb::{self, Session};
 use champollion_rv::host::darwin::DarwinHost;
 use champollion_rv::process::Process;
 
-const USAGE: &str = "usage: rvrun [-g PORT] <riscv64-linux-elf> [args...]";
+const USAGE: &str = "usage: rvrun [-g PORT] [-L SYSROOT] <riscv64-linux-elf> [args...]";
 
 fn main() -> ExitCode {
     let mut args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut gdb_port = None;
-    if args.first().is_some_and(|a| a == "-g") {
-        let port = args.get(1).and_then(|p| p.to_str()?.parse::<u16>().ok());
-        let Some(port) = port else {
-            eprintln!("rvrun: -g needs a port number\n{USAGE}");
-            return ExitCode::from(2);
-        };
-        gdb_port = Some(port);
+    let mut sysroot = std::env::var_os("RVRUN_SYSROOT").map(std::path::PathBuf::from);
+    loop {
+        match args.first().and_then(|a| a.to_str()) {
+            Some("-g") => {
+                let port = args.get(1).and_then(|p| p.to_str()?.parse::<u16>().ok());
+                let Some(port) = port else {
+                    eprintln!("rvrun: -g needs a port number\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                gdb_port = Some(port);
+            }
+            Some("-L") => {
+                let Some(dir) = args.get(1) else {
+                    eprintln!("rvrun: -L needs a directory\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                sysroot = Some(dir.into());
+            }
+            _ => break,
+        }
         args.drain(..2);
     }
     let Some(path) = args.first() else {
@@ -55,15 +70,29 @@ fn main() -> ExitCode {
     let envp: Vec<Vec<u8>> =
         std::env::vars_os().map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat()).collect();
 
-    let (proc, mut main_thread) =
-        match Process::spawn(&file, &argv, &envp, path.as_bytes(), Arc::new(DarwinHost::default()))
-        {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("rvrun: {}: cannot load: {e:?}", path.to_string_lossy());
-                return ExitCode::from(126);
-            }
-        };
+    let (proc, mut main_thread) = match Process::spawn(
+        &file,
+        &argv,
+        &envp,
+        path.as_bytes(),
+        Arc::new(DarwinHost::default()),
+        sysroot,
+    ) {
+        Ok(p) => p,
+        Err(champollion_rv::process::SpawnError::Interp(interp, e)) => {
+            eprintln!(
+                "rvrun: {}: dynamically linked, and its loader {} is missing ({e}); point -L \
+                 at a riscv64 sysroot",
+                path.to_string_lossy(),
+                interp.display()
+            );
+            return ExitCode::from(126);
+        }
+        Err(e) => {
+            eprintln!("rvrun: {}: cannot load: {e:?}", path.to_string_lossy());
+            return ExitCode::from(126);
+        }
+    };
     let strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
     proc.log.strace.store(strace, std::sync::atomic::Ordering::Relaxed);
     let cache = CodeCache::new(&file);
