@@ -83,8 +83,16 @@ fn main() -> ExitCode {
     let mut path = std::path::PathBuf::from(args.remove(1));
     let mut file;
     let mut depth = 0;
+    let mut opened = binfmt_fd();
     loop {
-        file = match std::fs::read(&path) {
+        let read = match opened.take() {
+            Some(mut f) => {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut f, &mut bytes).map(|_| bytes)
+            }
+            None => std::fs::read(&path),
+        };
+        file = match read {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("rvrun: {}: {e}", path.display());
@@ -235,6 +243,29 @@ struct CodeCache {
     path: std::path::PathBuf,
     /// Identifies the executable and this build of rvrun, which together determine the code.
     key: u64,
+}
+
+/// The program binfmt_misc opened for us (with the `O` flag, implied by `C`), which it
+/// passes as `AT_EXECFD`. Taken (and closed after reading), so the guest never sees it.
+#[cfg(target_os = "linux")]
+fn binfmt_fd() -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: errno is thread-local; getauxval has no preconditions.
+    let fd = unsafe {
+        *libc::__errno_location() = 0;
+        let fd = libc::getauxval(libc::AT_EXECFD);
+        if fd == 0 && *libc::__errno_location() == libc::ENOENT {
+            return None;
+        }
+        fd
+    };
+    // SAFETY: the kernel opened it for us and nothing else owns it.
+    Some(unsafe { std::fs::File::from_raw_fd(fd as i32) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn binfmt_fd() -> Option<std::fs::File> {
+    None
 }
 
 /// Whether binfmt_misc started us for a guest program with the `P` (preserve-argv0) flag,
