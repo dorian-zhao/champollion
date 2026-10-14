@@ -718,7 +718,13 @@ fn execve(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
     let elf =
         n >= 20 && head[..4] == *b"\x7fELF" && u16::from_le_bytes([head[18], head[19]]) == EM_RISCV;
     if !elf && !head.starts_with(b"#!") {
-        return Err(errno::ENOEXEC);
+        // A host (Mach-O) program found through a host path can never run in the guest:
+        // say it is not there, so a shell's PATH search goes on to the guest's own copy.
+        let macho = n >= 4
+            && [0xfeed_facf_u32, 0xcafe_babe]
+                .iter()
+                .any(|m| head[..4] == m.to_le_bytes() || head[..4] == m.to_be_bytes());
+        return Err(if macho { errno::ENOENT } else { errno::ENOEXEC });
     }
     let ignored = p.ignored_signals();
     Err(p.exec(&crate::process::Exec { path: host, argv, envp, ignored, mask: t.signals.mask() }))

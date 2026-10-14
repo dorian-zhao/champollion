@@ -61,9 +61,14 @@ fn alpine_busybox() {
     // /bin/busybox, resolved inside the sysroot.
     let out = run(&["sh", "-c", "x=$(echo sub); echo $x $(echo a b c | wc -w)"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "sub 3\n");
-    // Background jobs, kill, and wait (SIGCHLD reaches the shell, sigsuspend wakes up).
-    let out = run(&["sh", "-c", "sleep 5 & kill $!; wait $!; echo $?"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "143\n");
+    // Background jobs, kill, and wait (SIGCHLD reaches the shell, sigsuspend wakes up);
+    // /usr/bin/sort is not in the sysroot, so the host's must not be picked up.
+    let out = run(&[
+        "sh",
+        "-c",
+        "sleep 5 & kill $!; wait $!; echo $?; printf 'b\\na\\n' | sort | tr '\\n' ' '",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "143\na b ");
     // /etc comes from the sysroot.
     let out = run(&["cat", "/etc/alpine-release"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.24.2");
