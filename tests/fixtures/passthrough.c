@@ -1,4 +1,4 @@
-// System calls rvrun does not emulate, which on Linux (route A) go to the host kernel as
+// System calls rvrun does not emulate, which on Linux (VM mode) go to the host kernel as
 // they are. Prints one line per check, like syscalls.c. argv[1] is a scratch directory.
 #define _GNU_SOURCE
 #include <errno.h>

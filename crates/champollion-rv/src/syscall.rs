@@ -5,7 +5,7 @@
 //! owns that ABI: numbers, Linux struct layouts, and copying arguments in and out of guest
 //! memory. Memory-management calls (`brk`, `mmap`, ...) are served by [`Process`] itself,
 //! since the guest address space is ours. Everything else goes through [`HostOs`], so the
-//! backend can be native Darwin (route B) or passthrough to Linux (route A).
+//! backend can be native Darwin (Direct mode) or passthrough to Linux (VM mode).
 
 use std::collections::HashSet;
 use std::ffi::CStr;
@@ -1033,7 +1033,7 @@ fn prctl_passes_through(option: u64) -> bool {
 }
 
 fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
-    // Credentials are real in route A; what follows for them is route B's emulation.
+    // Credentials are real in VM mode; what follows for them is Direct mode's emulation.
     if matches!(
         nr,
         nr::SETUID

@@ -4,18 +4,19 @@ Oct 13, 2026 · Dorian Verlaine
 
 ## Goals and Positioning
 
-Champollion is a user-mode binary translator that runs RISC-V Linux executables on macOS arm64: `rvrun ./hello`. It has two goals:
+Champollion is a user-mode binary translator that runs RISC-V Linux executables on arm64: `rvrun ./hello` on an Apple silicon Mac, or the same build natively on an arm64 Linux host. It has two goals:
 
 1. **A testing and emulation environment for RISC-V developers on Apple Silicon Macs.** Cross-compile on the Mac, then run and debug the result immediately: `rvrun` as the test runner for `cargo test` / `ctest`, a built-in gdbstub for debugging, no VM to boot and no files to sync.
 2. **A learning project:** implement CS61C (ISA, CPU) and CS162 (syscalls, threads, virtual memory) in reverse, then add a JIT on top.
 
-The plan is **route B first, then route A**, sharing one translation core:
+The plan is **Direct mode first, then VM mode**, sharing one translation core:
 
-- **Route B (native, primary).** Run directly on macOS; Linux syscalls are caught by our own runtime and translated into Darwin calls. This covers the developer's daily build → test → debug loop with zero startup cost and the Mac's own file system. QEMU linux-user does not support macOS as a host, so this is the open space.
-- **Route A (Linux VM, full compatibility, M6).** An arm64 Linux VM (`Virtualization.framework`) runs the same translator as a binfmt\_misc handler, and syscalls pass through to a real Linux kernel. This covers what B fundamentally cannot: containers, full distribution userlands, `/proc`-heavy and `ptrace`-based tools. It is the model of Rosetta for Linux.
-- **Why both:** B alone tops out at "most developer programs" (an estimated 85–90% of developers' own programs and tests, 60–70% of arbitrary distribution binaries, no containers). WSL1, which took the same approach on Windows, hit the same ceiling and was succeeded by a VM (WSL2). A alone gives up B's instant, integrated developer loop.
+- **Direct mode (native, primary).** Run directly on macOS; Linux syscalls are caught by our own runtime and translated into Darwin calls. This covers the developer's daily build → test → debug loop with zero startup cost and the Mac's own file system. QEMU linux-user does not support macOS as a host, so this is the open space.
+- **VM mode (Linux VM, full compatibility, M6).** An arm64 Linux VM (`Virtualization.framework`) runs the same translator as a binfmt\_misc handler, and syscalls pass through to a real Linux kernel. This covers what Direct mode fundamentally cannot: containers, full distribution userlands, `/proc`-heavy and `ptrace`-based tools. It is the model of Rosetta for Linux.
+- **Why both:** Direct mode alone tops out at "most developer programs" (an estimated 85–90% of developers' own programs and tests, 60–70% of arbitrary distribution binaries, no containers). WSL1, which took the same approach on Windows, hit the same ceiling and was succeeded by a VM (WSL2). VM mode alone gives up Direct mode's instant, integrated developer loop.
 - **Consequence for the core:** the translator must also build and run on arm64 Linux. In particular, JIT code memory must sit behind an interface (macOS: `MAP_JIT` + `pthread_jit_write_protect_np`; Linux: `mprotect` or a dual mapping), decided before M4.
-- **Differences from Rosetta 2:** transparent execution on macOS is impossible (no binfmt\_misc), so B needs a launcher; but we borrow Rosetta's strategy of AOT first, JIT to fill the gaps.
+- **The Linux build also stands alone.** On arm64 Linux hosts (servers, CI runners, single-board computers), the Linux build runs natively as the `binfmt_misc` handler — riscv64 containers need no VM there; the launcher is how a Mac reaches the same backend.
+- **Differences from Rosetta 2:** transparent execution on macOS is impossible (no binfmt\_misc), so Direct mode needs a launcher; but we borrow Rosetta's strategy of AOT first, JIT to fill the gaps.
 
 ## Why RISC-V → ARM64 Is Easier Than x86 → ARM64
 
@@ -28,7 +29,7 @@ The shape of the ISAs makes translation in this direction inherently cheap, and 
 | Registers | 16 GPRs | 31 GPRs, matching ARM64's 31, allowing a near 1:1 static mapping (reserving a few for the context pointer) |
 | Decoding | Variable length, 1 to 15 bytes | Fixed 4 bytes, plus 2-byte compressed instructions (C extension) |
 
-## Scope: What B-lite Supports and What It Doesn't
+## Scope: What the First Version Supports and What It Doesn't
 
 What would actually sink this project is the Linux→Darwin syscall compatibility layer, not CPU translation, so the scope deliberately starts small.
 
@@ -67,7 +68,7 @@ The target is **RV64GC**, which is what the RVA20U64 profile requires and what m
 
 ## System Architecture
 
-The translation core (5 layers) is shared by both routes; only the `HostOs` implementation behind the syscall layer (part of a 4-layer runtime) changes.
+The translation core (5 layers) is shared by both modes; only the `HostOs` implementation behind the syscall layer (part of a 4-layer runtime) changes.
 
 Rosetta 2's strategy is AOT first, JIT to fill the gaps: on first run it translates and caches to `~/Library/Caches`, and only translates on the fly when it hits JIT-generated or self-modifying code. This project adds an AOT cache at M4.
 
@@ -79,7 +80,7 @@ Rust at the core; ARM64 assembly and Swift at the edges.
 | --- | --- | --- |
 | Translator core, runtime | Rust | A JIT is full of raw pointers, so memory safety is worth a lot; `dynasm-rs` can serve as the ARM64 emitter |
 | Dispatcher, trampolines, context switch | ARM64 assembly (`global_asm!` or `.s`) | Entering and leaving translated blocks needs precise register control |
-| Launcher, route A VM host (M6) | Swift | Smoothest path to `Virtualization.framework` and macOS APIs |
+| Launcher, VM mode's host (M6) | Swift | Smoothest path to `Virtualization.framework` and macOS APIs |
 | Test generation, benchmarks | Python | Generate random instruction sequences, run differential comparisons |
 | Building RISC-V test executables | Zig (`zig cc`) | `zig cc -target riscv64-linux-musl -static hello.c -o hello`, no cross toolchain to install |
 | Reference oracle | Spike, QEMU (on Linux) | Compare register state instruction by instruction |
@@ -252,7 +253,7 @@ The engine (M2) adds a per-thread software TLB and a decoded-block cache, both i
 
 ## Milestones
 
-Each step uses the previous step's interpreter as its correctness baseline. M1–M5 are route B; M6 is route A.
+Each step uses the previous step's interpreter as its correctness baseline. M1–M5 were done in Direct mode; M6 is VM mode.
 
 | Milestone | Content | Done when | Course |
 | --- | --- | --- | --- |
@@ -261,7 +262,7 @@ Each step uses the previous step's interpreter as its correctness baseline. M1�
 | M3 | F, D, Zicsr, Zifencei + remaining syscalls + gdbstub + test-runner integration | Runs a static `lua` or `sqlite`; `cargo test` for a riscv64 target runs through `rvrun` | CS61C |
 | M4 | Basic-block JIT, block chaining, indirect-jump optimization, AOT cache | Zero differences in differential tests against the interpreter; clear benchmark speedup | Extracurricular |
 | M5 | Multithreading, `futex`, signals, sockets, epoll, dynamic linking (with a riscv64 sysroot), fork/exec | Runs multithreaded programs, Go binaries, and dynamically linked programs (e.g. Python) | CS162 |
-| M6 | Route A: arm64 Linux VM via `Virtualization.framework`, translator as binfmt\_misc handler, Linux syscall passthrough | A riscv64 Docker image runs on the Mac | CS162 |
+| M6 | VM mode: arm64 Linux VM via `Virtualization.framework`, translator as binfmt\_misc handler, Linux syscall passthrough | A riscv64 Docker image runs on the Mac | CS162 |
 
 ## Testing Strategy
 
@@ -271,13 +272,13 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 2. **Differential tests:** Python generates random instruction sequences; compare register and memory state between this project's interpreter and Spike.
 3. **JIT vs. interpreter:** riscv-tests run on the interpreter, the engine, and the JIT, which must end in identical `CpuState`. `jit::tests::fuzz` generates random looping programs (integer, M, A, and F/D instructions, accesses through moving base registers, branches, direct and indirect jumps) and compares traps, the whole CPU state, and memory between the interpreter, the JIT, and the JIT running restored translations; `FUZZ_CASES` and `FUZZ_SEED` run longer campaigns. Its first run found a wrong `divuw` by x0.
 4. **Real programs:** static builds of busybox, lua, and sqlite, with output compared against QEMU.
-5. **Both hosts:** the suite runs on macOS and, through `tools/linux.sh` (a container on OrbStack or Docker Desktop), on arm64 Linux, route A's host.
+5. **Both hosts:** the suite runs on macOS and, through `tools/linux.sh` (a container on OrbStack or Docker Desktop), on arm64 Linux, VM mode's host.
 
 ## Known Gaps
 
 Things that do not work yet, roughly by how likely a program is to notice.
 
-### Route B
+### Direct mode
 
 - **Dynamically linked programs get no persistent code cache.** Mapping libraries changes executable mappings, which drops translations and disables saving; CPython pays its startup translation on every run (about 0.2 s for `python3 -c pass`). The cache key would have to cover every mapped library.
 - **Realtime signals do not queue.** Each signal has at most one pending instance, as standard signals do; `sigqueue` payloads are not delivered.
@@ -285,7 +286,7 @@ Things that do not work yet, roughly by how likely a program is to notice.
 - **Startup grew by about 0.5 ms** (3.4 ms for a static hello, native 1.9 ms), mostly the host signal thread.
 - **Memory protection is coarser in generated code** (16 KiB host pages, aliasing above 2^38); see [Performance boundary](#performance-boundary).
 
-### Route A
+### VM mode
 
 - **Every `run` unpacks the image again** into a fresh ext4 file (a second or two for Debian); there are no persistent containers, no `exec` into a running one, and no published ports yet.
 - **The Kata kernel is 6.12**, while Containerization tests from 6.14.9.
@@ -298,21 +299,21 @@ Things that do not work yet, roughly by how likely a program is to notice.
 
 ## Decision Log
 
-- **Oct 14, 2026 — Route A's launcher is rvcontainer, built on apple/containerization.** A Swift command (`launcher/`) pulls an image's linux/riscv64 variant, unpacks it to ext4, and runs it in an arm64 Linux VM booted from Apple's published vminit image and Kata's kernel, with vmnet networking. rvrun's Linux build is shared into the VM over virtiofs and registered with binfmt\_misc through vminitd's public `SetupEmulator` call, exactly as Containerization registers Rosetta, so no fork is needed (this was the open question). Flags `POCF`: setuid programs run with their owner's credentials, and rvrun reads the program from `AT_EXECFD`. Alpine and Debian images run interactively or not and install packages; a warm run of a small command takes 0.8 s, and Lua runs as fast as in OrbStack's VM.
+- **Oct 14, 2026 — VM mode's launcher is rvcontainer, built on apple/containerization.** A Swift command (`launcher/`) pulls an image's linux/riscv64 variant, unpacks it to ext4, and runs it in an arm64 Linux VM booted from Apple's published vminit image and Kata's kernel, with vmnet networking. rvrun's Linux build is shared into the VM over virtiofs and registered with binfmt\_misc through vminitd's public `SetupEmulator` call, exactly as Containerization registers Rosetta, so no fork is needed (this was the open question). Flags `POCF`: setuid programs run with their owner's credentials, and rvrun reads the program from `AT_EXECFD`. Alpine and Debian images run interactively or not and install packages; a warm run of a small command takes 0.8 s, and Lua runs as fast as in OrbStack's VM.
 - **Oct 14, 2026 — On Linux, guest addresses are host addresses, and calls we do not emulate go to the kernel.** Guest memory on Linux uses an identity layout: guest address `g` is host address `g`, reserved from `mmap_min_addr` up to 2^38 plus the guard, with the control area in a separate mapping (macOS keeps the offset layout, since it reserves the low 4 GiB of every process). Guest pointers are then host pointers, and since riscv64 and arm64 share syscall numbers and structure layouts, any call the dispatcher does not handle can be passed through as it is, pointers inside structures included, which a table of pointer arguments (QEMU's way) could not do without per-call code. Excluded are calls that would undercut the emulation: thread creation and `execveat`, signals and signal-sending timers, host memory protections, seccomp, ptrace, the architecture-specific range, and everything when a sysroot is set. Generated code also gets simpler: no base addition, and the interrupt check is one load through the register that held the base. Static musl binaries must then be linked above the guest space (`.cargo/config.toml`), which zig's linker cannot do, so Linux builds use GNU ld via `tools/linux.sh`. With this, Debian trixie's riscv64 root runs `apt-get update` and installs packages.
-- **Oct 14, 2026 — In route A, rvrun is the binfmt\_misc handler and `execve` goes to the kernel.** Registered for riscv64 ELF files with the `F` (open at registration, so it works in containers and chroots) and `P` (preserve `argv[0]`, announced in `AT_FLAGS`) flags, rvrun starts guest programs like native ones; a guest `execve` is the kernel's again, which finds rvrun for riscv64 programs and `#!` interpreters by itself. Tested in a private binfmt\_misc instance (a user namespace, so the VM's global registrations stay untouched) with Alpine's and Debian trixie's riscv64 roots: busybox, bash, coreutils, dpkg, apt, perl, and CPython run. In the same OrbStack VM, rvrun runs Lua 4.8× and SQLite 4.2× faster than the `qemu-riscv64` registered there (93 vs. 446 ms, 35 vs. 146 ms).
-- **Oct 14, 2026 — Route A starts as route B on a Linux backend.** The first M6 step keeps `Process` (guest memory, threads, signals, futexes) as it is and swaps only the `HostOs` backend: `host::linux` passes syscalls to the host kernel, translating just the four `open` flags whose arm64 bits differ from asm-generic. The whole suite, including Alpine's busybox and CPython, passes on arm64 Linux with no other change, and Lua runs within about 10% of its macOS time inside OrbStack's VM. Passing through what `Process` does itself (`clone`, signals, `execve` through binfmt\_misc) is the next decision, once programs need it.
-- **Oct 14, 2026 — M5 done.** Multithreaded C and Go programs, Alpine's busybox (shell pipelines, job control) and CPython 3.14 (subprocess, asyncio, multiprocessing with shared memory) run under route B and match native output in the test suite. What route B still lacks is listed in [Known Gaps](#known-gaps); none of it blocks M6, which reuses the translator inside a Linux VM where most of those gaps disappear.
+- **Oct 14, 2026 — In VM mode, rvrun is the binfmt\_misc handler and `execve` goes to the kernel.** Registered for riscv64 ELF files with the `F` (open at registration, so it works in containers and chroots) and `P` (preserve `argv[0]`, announced in `AT_FLAGS`) flags, rvrun starts guest programs like native ones; a guest `execve` is the kernel's again, which finds rvrun for riscv64 programs and `#!` interpreters by itself. Tested in a private binfmt\_misc instance (a user namespace, so the VM's global registrations stay untouched) with Alpine's and Debian trixie's riscv64 roots: busybox, bash, coreutils, dpkg, apt, perl, and CPython run. In the same OrbStack VM, rvrun runs Lua 4.8× and SQLite 4.2× faster than the `qemu-riscv64` registered there (93 vs. 446 ms, 35 vs. 146 ms).
+- **Oct 14, 2026 — VM mode starts as Direct mode on a Linux backend.** The first M6 step keeps `Process` (guest memory, threads, signals, futexes) as it is and swaps only the `HostOs` backend: `host::linux` passes syscalls to the host kernel, translating just the four `open` flags whose arm64 bits differ from asm-generic. The whole suite, including Alpine's busybox and CPython, passes on arm64 Linux with no other change, and Lua runs within about 10% of its macOS time inside OrbStack's VM. Passing through what `Process` does itself (`clone`, signals, `execve` through binfmt\_misc) is the next decision, once programs need it.
+- **Oct 14, 2026 — M5 done.** Multithreaded C and Go programs, Alpine's busybox (shell pipelines, job control) and CPython 3.14 (subprocess, asyncio, multiprocessing with shared memory) run under Direct mode and match native output in the test suite. What Direct mode still lacks is listed in [Known Gaps](#known-gaps); none of it blocks M6, which reuses the translator inside a Linux VM where most of those gaps disappear.
 - **Oct 14, 2026 — Dynamically linked programs run against a sysroot, resolved like a chroot.** `rvrun -L DIR` (or `RVRUN_SYSROOT`) names a riscv64 userland; the tests use Alpine's minirootfs and packages, pinned by SHA-256. Absolute guest paths resolve inside it when they exist there, following absolute symlinks within it (distributions are full of them), and on the host otherwise; host programs found that way are reported missing to `execve`, so PATH searches reach the guest's own. Alpine's busybox and CPython 3.14 (with subprocess, asyncio, and multiprocessing) run unmodified.
-- **Oct 14, 2026 — epoll and eventfd are emulated on kqueue in the Darwin backend.** Go's netpoller needs them even for programs without networking. An epoll instance is a kqueue whose filters carry the guest's `epoll_data` in `udata`; regular files are refused with `EPERM` as on Linux. An eventfd is a counter kept by the backend plus a socketpair end that holds a byte while the counter is nonzero. Route A will pass both through.
-- **Oct 14, 2026 — M5 grows fork/exec and sockets; Python is a target.** Dynamically linked programs like Python need `subprocess`, which needs `fork` and `execve`. In route B the whole guest lives in one host process, so `fork` can be the host's (copy-on-write duplicates guest memory and translations alike) and `execve` a fresh rvrun.
+- **Oct 14, 2026 — epoll and eventfd are emulated on kqueue in the Darwin backend.** Go's netpoller needs them even for programs without networking. An epoll instance is a kqueue whose filters carry the guest's `epoll_data` in `udata`; regular files are refused with `EPERM` as on Linux. An eventfd is a counter kept by the backend plus a socketpair end that holds a byte while the counter is nonzero. VM mode will pass both through.
+- **Oct 14, 2026 — M5 grows fork/exec and sockets; Python is a target.** Dynamically linked programs like Python need `subprocess`, which needs `fork` and `execve`. In Direct mode the whole guest lives in one host process, so `fork` can be the host's (copy-on-write duplicates guest memory and translations alike) and `execve` a fresh rvrun.
 - **Oct 14, 2026 — Code cache as snapshots of the code buffer, not ahead-of-time translation.** Translating a whole executable up front would translate cold and data-in-text bytes and needs a separate code layout; saving what a run actually translated reuses the JIT unchanged and only required removing the one host address from generated code. See [Persistent code cache](#persistent-code-cache).
 - **Oct 14, 2026 — Generated code keeps masking guest addresses.** The mask keeps a guest from reaching host memory outside its reservation, as a sandbox would (QEMU linux-user does not mask). It costs Lua 5% and SQLite 3%, on pointer chasing; isolation is worth more than that.
 - **Oct 14, 2026 — `instret` stays exact.** Counted per block in x30, it costs under 1% (removing it entirely measured 0.6–0.8%), so there is no case for a cheaper approximate mode.
 - **Oct 14, 2026 — No return-address prediction for guest returns.** We translated guest calls to `bl` into a call stub with a landing pad, and returns to `ret` through the jump cache, as Rosetta 2 does. The first version made recursive code 2× slower: overlapping blocks each had their own landing pad for the same call, so the `bl` pushed one pad while the jump cache held another and every return mispredicted. With one shared stub per call the mispredicts were gone (no profile samples on landing pads), but Lua, SQLite, and Rust tests ended within ±3% of plain `br`: Apple's indirect predictor already predicts our returns well, and the stubs cost a host register (t2 went back to memory). Dropped; revisit for call-heavy C++ code with many callers per function.
 - **Oct 14, 2026 — Mask the base register, not the sum, behind guard pages.** Generated loads and stores mask a base register once into the guest space and reuse the host address across accesses with immediate offsets. Offsets can then reach up to 32 KiB past either end of the guest space, so the reservation has 64 KiB guard regions there; such accesses fault with their true address instead of wrapping.
 
-- **Oct 14, 2026 — Route B first, then route A as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. B covers the daily build → test → debug loop best (instant, no VM, Mac file system); A (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux; see [Goals and Positioning](#goals-and-positioning).
+- **Oct 14, 2026 — Direct mode first, then VM mode as a full milestone (M6).** The project's first goal is now a test and emulation environment for RISC-V developers on Apple Silicon. Direct mode covers the daily build → test → debug loop best (instant, no VM, Mac file system); VM mode (Linux VM + syscall passthrough) is promoted from escape hatch to M6 for containers and full distributions. The core must therefore also run on arm64 Linux — which also makes the Linux build usable directly on arm64 Linux hosts; see [Goals and Positioning](#goals-and-positioning).
 - **Oct 14, 2026 — M3 done; gdbstub runs on the reference interpreter.** `rvrun -g PORT` serves the GDB remote protocol through the `gdbstub` crate. While attached, the guest single-steps on the oracle interpreter, so breakpoints (kept on our side, code is never patched), stepping, and Ctrl-C are exact; detaching hands the guest back to the engine. Only x0–x31 and pc are exposed for now (the stock RISC-V target description); FP registers need a custom description.
 - **Oct 14, 2026 — Static-PIE moves into M3.** Rust's musl targets link static-PIE by default, so `cargo test` needs it; images load at `PIE_BASE` (2/3 up, like Linux) and relocate themselves.
 - **Oct 14, 2026 — `cargo test` works before threads.** libtest falls back to the main thread when `clone` fails, so the M3 criterion holds without M5; parallel test execution waits for M5 (and works since).

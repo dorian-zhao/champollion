@@ -11,7 +11,7 @@
 //! - macOS: the region is mapped `MAP_JIT`, and each thread toggles it between writable and
 //!   executable with `pthread_jit_write_protect_np` (W^X per thread); `sys_icache_invalidate`
 //!   makes new code visible to instruction fetch.
-//! - Linux (route A, M6): a plain RWX mapping plus explicit cache maintenance.
+//! - Linux (VM mode, M6): a plain RWX mapping plus explicit cache maintenance.
 
 use std::io;
 

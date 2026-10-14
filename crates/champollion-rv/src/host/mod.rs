@@ -1,4 +1,4 @@
-//! [`HostOs`](crate::syscall::HostOs) backends: Darwin for route B, Linux for route A.
+//! [`HostOs`](crate::syscall::HostOs) backends: Darwin for Direct mode, Linux for VM mode.
 
 #[cfg(target_os = "macos")]
 pub mod darwin;

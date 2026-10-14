@@ -1,5 +1,5 @@
 # rustc links static musl executables at a fixed low address (no static PIE for this
-# target), right where riscv64 programs live in the identity layout of guest memory (route A,
+# target), right where riscv64 programs live in the identity layout of guest memory (VM mode,
 # see crates/champollion-rv/src/memory/guest.rs). Link them above the guest address space
 # instead (2^38 + 4 GiB, which fits 39-bit host address spaces). Needs GNU ld or lld; build
 # Linux binaries with tools/linux.sh.

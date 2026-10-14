@@ -1,4 +1,4 @@
-//! Route B backend: serve Linux syscalls with Darwin (macOS) calls.
+//! Direct mode's backend: serve Linux syscalls with Darwin (macOS) calls.
 //!
 //! Guest file descriptors are host file descriptors. Every Linux-specific value coming in
 //! (open flags, `AT_*` constants, `whence`, clock ids) is translated to its Darwin

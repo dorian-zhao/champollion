@@ -154,7 +154,7 @@ fn main() -> ExitCode {
             return ExitCode::from(126);
         }
     };
-    // Started by binfmt_misc (route A), the kernel itself knows how to run guest programs.
+    // Started by binfmt_misc (VM mode), the kernel itself knows how to run guest programs.
     let native_exec = preserved_argv0() && sysroot.is_none();
     proc.set_exec(Box::new(move |req| {
         if native_exec { exec_native(req) } else { exec(req, sysroot.as_deref()) }

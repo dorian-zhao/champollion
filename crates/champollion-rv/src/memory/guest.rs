@@ -18,7 +18,7 @@
 //! base + GUEST_SIZE       guard
 //! ```
 //!
-//! The identity layout (Linux, route A) puts guest address `g` at host address `g`
+//! The identity layout (Linux, VM mode) puts guest address `g` at host address `g`
 //! (`base` is 0), so guest pointers are host pointers and system calls can pass them to the
 //! kernel as they are. The guest space then starts at the lowest address the host lets a
 //! process map ([`GuestMemory::lowest`]), what lies below acts as the lower guard, and the

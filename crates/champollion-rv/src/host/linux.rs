@@ -1,4 +1,4 @@
-//! Route A backend: serve the guest's Linux syscalls with the host Linux kernel's.
+//! VM mode's backend: serve the guest's Linux syscalls with the host Linux kernel's.
 //!
 //! riscv64 and arm64 share the asm-generic syscall ABI, so almost every value passes
 //! through unchanged: errno, signal numbers, `AT_*`, `MSG_*`, socket addresses and options,

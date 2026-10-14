@@ -1,5 +1,5 @@
 // swift-tools-version: 6.2
-// rvcontainer: run riscv64 Linux container images on a Mac (route A). Each container gets a
+// rvcontainer: run riscv64 Linux container images on a Mac (VM mode). Each container gets a
 // lightweight arm64 Linux VM (apple/containerization on Virtualization.framework) in which
 // rvrun, built for Linux, is registered with binfmt_misc for riscv64 programs.
 

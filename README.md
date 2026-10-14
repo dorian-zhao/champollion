@@ -1,11 +1,11 @@
 # Champollion
 
-Run RISC-V (RV64GC) Linux programs on Apple silicon.
+Run RISC-V (RV64GC) Linux programs on arm64: Apple silicon Macs, and arm64 Linux hosts.
 
-Champollion is a user-mode binary translator from riscv64 Linux to arm64. It started as a learning project, which aims at what Rosetta 2 does for x86 programs: no emulated machine, no guest kernel, just the program translated to native code and running at close to native speed. Champollion accomplishes this in two ways:
+Champollion is a user-mode binary translator from riscv64 Linux to arm64. It started as a learning project, which aims at what Rosetta 2 does for x86 programs: no emulated machine, no guest kernel, just the program translated to native code and running at close to native speed. A guest runs in one of two modes, sharing one translator:
 
-- **Route B, on macOS:** `rvrun ./program` runs a riscv64 Linux executable directly as a Mac process and Linux system calls are translated to Darwin ones.
-- **Route A, in a Linux VM:** `rvcontainer run debian:trixie` runs riscv64 container images. Each runs in a lightweight arm64 Linux VM, with rvrun registered as the kernel's handler for riscv64 programs and system calls going to a real Linux kernel.
+- **Direct mode, on macOS:** `rvrun ./program` runs a riscv64 Linux executable directly as a Mac process and Linux system calls are translated to Darwin ones. The daily build → test → debug loop, with no VM to boot or sync.
+- **VM mode, against a real Linux kernel:** `rvcontainer run debian:trixie` runs riscv64 container images, each in a lightweight arm64 Linux VM whose kernel is the guest's — rvrun is registered as the kernel's handler for riscv64 programs and system calls pass straight through. On an arm64 Linux host the same Linux build runs directly, no VM needed: see [On arm64 Linux](#on-arm64-linux-binfmt_misc).
 
 The name comes from Jean-François Champollion, who deciphered the Rosetta Stone 🪨.
 
@@ -19,11 +19,11 @@ The name comes from Jean-François Champollion, who deciphered the Rosetta Stone
 | Known to run | busybox, Lua, SQLite, Go programs, Rust test binaries, CPython 3.14 (Alpine), and Debian trixie's userland: bash, coreutils, apt, dpkg, perl, python3 |
 | Debugging | A GDB remote stub (`rvrun -g PORT`) |
 
-Milestones M1 through M5 (interpreter, JIT, threads, signals, dynamic linking) are complete. M6 (route A) is working. See [`docs/design.md`](docs/design.md) for the design, the milestones, and the [known gaps](docs/design.md#known-gaps).
+Milestones M1 through M5 (interpreter, JIT, threads, signals, dynamic linking) are complete. M6 (VM mode) is working. See [`docs/design.md`](docs/design.md) for the design, the milestones, and the [known gaps](docs/design.md#known-gaps).
 
 ### Performance
 
-Compared with the same programs built natively for arm64 (route B on MacBook Pro M2 2022, 16G):
+Compared with the same programs built natively for arm64 (Direct mode on a MacBook Pro M2 2022, 16G):
 
 | Benchmark | Slowdown vs. native |
 | --- | --- |
@@ -36,12 +36,11 @@ The target is at most 2× slower than native. In the same Linux VM, rvrun runs L
 
 ## Requirements
 
-- A Mac with Apple silicon.
-- Route B: macOS 14.4 or later, and Rust (stable, edition 2024).
-- Route A: macOS 26 or later and Xcode 26 or later, plus Docker (OrbStack recommended) to build rvrun for Linux.
+- Direct mode: a Mac with Apple silicon running macOS 14.4 or later, and Rust (stable, edition 2024).
+- VM mode: on macOS, macOS 26 or later and Xcode 26 or later for `rvcontainer`, plus Docker (OrbStack recommended) to build the Linux build; on an arm64 Linux host, just Docker for that build.
 - To rebuild the test programs: [`zig`](https://ziglang.org) 0.17 or later, used as a riscv64 C cross compiler.
 
-## Route B: `rvrun`
+## Direct mode: `rvrun`
 
 ```sh
 cargo build --release
@@ -74,7 +73,11 @@ Options and environment variables:
 | `RVRUN_PROF=FILE` | Sample generated code; render the report with `tools/jitprof.py FILE` |
 | `RVRUN_CACHE=0` | Disable the persistent code cache (`~/Library/Caches/champollion`) |
 
-## Route A: `rvcontainer`
+## VM mode
+
+VM mode runs the guest against a real Linux kernel, two ways: inside an arm64 Linux VM on a Mac (`rvcontainer`), or directly on an arm64 Linux host as the kernel's `binfmt_misc` handler.
+
+### On macOS: `rvcontainer`
 
 `rvcontainer` is a small Swift launcher built on [apple/containerization](https://github.com/apple/containerization). It pulls an image's `linux/riscv64` variant and boots an arm64 Linux VM with Virtualization.framework and shares rvrun's Linux build into the VM and registers it with `binfmt_misc`, the same way Containerization registers Rosetta for amd64 images.
 
@@ -91,6 +94,23 @@ root@rv-1c2a90f3:/# apt-get update && apt-get install -y jq
 ```
 
 `rvcontainer run` accepts `-v HOST:CONTAINER` to share a directory, `-e NAME=VALUE`, `-w DIR`, `--cpus`, `--memory`, and `--no-network`. Containers have networking by default. Each run starts from a fresh copy of the image.
+
+### On arm64 Linux: `binfmt_misc`
+
+On an arm64 Linux host the VM is the host itself: register the Linux build as the kernel's
+handler for riscv64 programs, and they run like native ones — including inside containers.
+This is the same registration `rvcontainer` performs inside its VM.
+
+```sh
+tools/linux.sh build --release -p rvrun       # produces target/linux/release/rvrun
+sudo install -m755 target/linux/release/rvrun /usr/local/bin/rvrun-riscv64
+sudo sh -c 'printf "%s\n" ":rvrun-riscv64:M::\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xf3\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/local/bin/rvrun-riscv64:POCF" > /proc/sys/fs/binfmt_misc/register'
+sudo docker run --platform linux/riscv64 alpine uname -m
+riscv64
+```
+
+If `/proc/sys/fs/binfmt_misc` is not mounted yet, run
+`sudo mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc` first.
 
 On Linux, guest memory sits at the same addresses as on the host. Therefore, guest pointers are host pointers, and system calls rvrun does not emulate go to the kernel unchanged.
 
@@ -110,7 +130,7 @@ On Linux, guest memory sits at the same addresses as on the host. Therefore, gue
 | `crates/champollion-rv` | The translator: decoder, interpreters, JIT, memory, loader, system calls, host backends |
 | `crates/rvrun` | The `rvrun` command and its end-to-end tests |
 | `crates/softfloat` | Berkeley SoftFloat 3, the reference for floating-point semantics |
-| `launcher` | `rvcontainer`, route A's Swift launcher |
+| `launcher` | `rvcontainer`, VM mode's Swift launcher |
 | `tests` | Fixtures, riscv-tests, real programs, and sysroot setup |
 | `tools` | The profiler's report renderer and `linux.sh`, which runs cargo on arm64 Linux in a container |
 | `docs/design.md` | Design brief |
@@ -121,7 +141,7 @@ On Linux, guest memory sits at the same addresses as on the host. Therefore, gue
 cargo test --release                    # everything on macOS
 tools/linux.sh                          # the same suite on arm64 Linux, in a container
 FUZZ_CASES=100000 cargo test --release -p champollion-rv fuzz
-launcher/test.sh                        # route A smoke test (boots VMs, needs network)
+launcher/test.sh                        # VM mode smoke test (boots VMs, needs network)
 ```
 
 The suite includes riscv-tests on all three execution modes, unit tests for every instruction, and a differential fuzzer. The fuzzer runs random programs on the interpreter and the JIT and requires identical traps, registers, and memory. It also includes end-to-end runs of real programs compared against native builds. Test binaries are committed. `tests/fixtures/build.sh`, `tests/programs/build.sh`, and `tests/riscv-tests/build.sh` rebuild them with zig.

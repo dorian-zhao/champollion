@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run cargo on arm64 Linux (route A's host) in a container, e.g. on OrbStack or Docker
+# Run cargo on arm64 Linux (where VM mode runs) in a container, e.g. on OrbStack or Docker
 # Desktop: `tools/linux.sh test --release`, `tools/linux.sh clippy --all-targets`.
 # With no arguments, runs the test suite. Builds go to target/linux.
 set -eu
