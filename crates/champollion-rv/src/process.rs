@@ -711,7 +711,7 @@ impl Process {
         let mut slots = lock(&self.slots);
         let mut pending = lock(&self.pending);
         let mut own_pending = lock(&thread.signals.pending);
-        let maps = self.mem.lock_for_fork();
+        let mut maps = self.mem.lock_for_fork();
         // SAFETY: plain fork; the child continues on this thread only, holding the locks.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -735,6 +735,8 @@ impl Process {
         *pending = Pending::default();
         *own_pending = Pending::default();
         thread.tid = new;
+        // The forking thread is in a syscall, so its own TLB readers are idle too.
+        maps.forget_other_threads();
         drop((brk, threads, registry, slots, pending, own_pending, maps));
         if let (Some(f), Some(this)) = (self.on_fork.get(), self.this.upgrade()) {
             f(this);

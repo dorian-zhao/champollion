@@ -23,7 +23,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::cpu::CpuState;
 use crate::engine::decode_block;
 use crate::interpreter::{self, Trap};
-use crate::memory::{GuestMemory, MemFault, Tlb, TlbMemory};
+use crate::memory::{GuestMemory, MemFault, Tlb, TlbMemory, TlbReader};
 use code::CodeBuffer;
 use translate::exit;
 
@@ -63,6 +63,8 @@ pub struct Jit {
     /// Instruction fetch for translation, valid for `GuestMemory::generation` `tlb_generation`.
     tlb: Tlb,
     tlb_generation: u64,
+    /// Tells unmapping which TLB generation the fetch may still use (created on first use).
+    tlb_reader: Option<TlbReader>,
     faults: fault::Table,
     /// Exits waiting for their target to be translated: target pc -> byte offsets of the
     /// exits' `b` instructions, patched to jump straight to the target when it appears.
@@ -154,6 +156,7 @@ impl Jit {
             generation: 0,
             tlb: Tlb::default(),
             tlb_generation: u64::MAX,
+            tlb_reader: None,
             faults,
             unchained: HashMap::default(),
             chaining: true,
@@ -196,12 +199,15 @@ impl Jit {
         }
         // Fetch through a TLB: a lookup per instruction in the mapping table showed up as
         // 11% of a short program's run time.
-        let generation = mem.generation();
+        let reader = self.tlb_reader.get_or_insert_with(|| mem.tlb_reader());
+        let generation = reader.enter(mem);
         if generation != self.tlb_generation {
             self.tlb.flush();
             self.tlb_generation = generation;
         }
-        let block = decode_block(&TlbMemory { mem, tlb: &self.tlb }, pc, false)?;
+        let block = decode_block(&TlbMemory { mem, tlb: &self.tlb }, pc, false);
+        reader.leave();
+        let block = block?;
         for attempt in 0..2 {
             let word = (self.code.used() / 4) as i64;
             let cache = self.code.data_offset() as i64;

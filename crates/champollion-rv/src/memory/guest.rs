@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use super::{MemFault, Memory};
 
@@ -103,7 +103,21 @@ pub struct GuestBuf {
 }
 
 /// See [`GuestMemory::lock_for_fork`].
-pub struct ForkGuard<'a>(#[allow(dead_code)] RwLockWriteGuard<'a, Maps>);
+pub struct ForkGuard<'a> {
+    _maps: RwLockWriteGuard<'a, Maps>,
+    readers: std::sync::MutexGuard<'a, Vec<Weak<AtomicU64>>>,
+    _pending: std::sync::MutexGuard<'a, Vec<Range<u64>>>,
+}
+
+impl ForkGuard<'_> {
+    /// In the child: the other threads are gone, and their TLBs with them. Without this,
+    /// `settle` would wait forever for readers that never move on.
+    pub fn forget_other_threads(&mut self) {
+        for r in self.readers.iter().filter_map(Weak::upgrade) {
+            r.store(QUIESCENT, SeqCst);
+        }
+    }
+}
 
 /// Non-overlapping guest mappings, keyed by start address. Adjacent mappings are not
 /// merged; nothing depends on that and it keeps splitting simple.
@@ -183,6 +197,47 @@ pub struct GuestMemory {
     maps: RwLock<Maps>,
     generation: AtomicU64,
     code_generation: AtomicU64,
+    /// The generation each software TLB user is working with (see [`TlbReader`]).
+    readers: Mutex<Vec<Weak<AtomicU64>>>,
+    /// Unmapped host pages, already emptied, still to be made inaccessible once no TLB can
+    /// point at them (see [`GuestMemory::settle`]).
+    pending: Mutex<Vec<Range<u64>>>,
+}
+
+/// A TLB user that is not using its TLB.
+const QUIESCENT: u64 = u64::MAX;
+
+/// Registration of a software TLB with its memory (see [`GuestMemory::tlb_reader`]).
+///
+/// TLB hits skip the mapping lock, so a TLB could still point at a page another thread
+/// unmaps. Unmapping therefore replaces the page with fresh, still accessible zero pages
+/// at once, and makes it inaccessible (for generated code's precise faults) only after
+/// every reader has moved past the generation of the unmap.
+pub struct TlbReader(Arc<AtomicU64>);
+
+impl TlbReader {
+    /// Start (or keep) using a TLB: publish the current generation and return it. The TLB
+    /// must be flushed if it holds entries of an older generation.
+    pub fn enter(&self, mem: &GuestMemory) -> u64 {
+        loop {
+            let generation = mem.generation.load(SeqCst);
+            self.0.store(generation, SeqCst);
+            if mem.generation.load(SeqCst) == generation {
+                return generation;
+            }
+        }
+    }
+
+    /// Stop using the TLB (until the next `enter`).
+    pub fn leave(&self) {
+        self.0.store(QUIESCENT, SeqCst);
+    }
+}
+
+impl Drop for TlbReader {
+    fn drop(&mut self) {
+        self.leave();
+    }
 }
 
 // SAFETY: `base` points to a reservation owned by this object for its whole lifetime, and
@@ -218,6 +273,8 @@ impl GuestMemory {
         let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         assert!(host_page.is_power_of_two() && host_page >= GUEST_PAGE_SIZE);
         Ok(Self {
+            readers: Mutex::default(),
+            pending: Mutex::default(),
             base,
             host_page,
             maps: RwLock::default(),
@@ -237,10 +294,6 @@ impl GuestMemory {
         self.generation.load(Acquire)
     }
 
-    /// Counter bumped by mapping changes that involve executable pages (before or after the
-    /// change). Caches of decoded or translated code follow this one, so data-only `mmap`,
-    /// `brk`, and `munmap` traffic leaves them intact.
-    #[inline]
     /// The interrupt flag of thread slot `slot`: nonzero asks the thread to leave generated
     /// code at the next block entry (for signal delivery).
     pub fn interrupt_flag(&self, slot: usize) -> &AtomicU32 {
@@ -252,8 +305,62 @@ impl GuestMemory {
         }
     }
 
+    /// Counter bumped by mapping changes that involve executable pages (before or after the
+    /// change). Caches of decoded or translated code follow this one, so data-only `mmap`,
+    /// `brk`, and `munmap` traffic leaves them intact.
+    #[inline]
     pub fn code_generation(&self) -> u64 {
         self.code_generation.load(Acquire)
+    }
+
+    /// Register a software TLB (see [`TlbReader`]).
+    pub fn tlb_reader(&self) -> TlbReader {
+        let slot = Arc::new(AtomicU64::new(QUIESCENT));
+        let mut readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+        readers.retain(|r| r.strong_count() > 0);
+        readers.push(Arc::downgrade(&slot));
+        TlbReader(slot)
+    }
+
+    /// Finish unmapping: once no TLB reader works with a generation older than now, make
+    /// the emptied host pages inaccessible, unless they were mapped again meanwhile. Runs
+    /// without the mapping lock while waiting, since a reader may need it to make progress.
+    fn settle(&self) {
+        let mut pending =
+            std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+        // Pages mapped again meanwhile (MAP_FIXED replacing a mapping) need nothing.
+        let hp = self.host_page;
+        pending.retain(|r| !self.maps().is_any_mapped(r.start..r.start + hp));
+        if pending.is_empty() {
+            return;
+        }
+        let target = self.generation.load(SeqCst);
+        loop {
+            let readers = self.readers.lock().unwrap_or_else(|e| e.into_inner());
+            let busy = readers.iter().filter_map(Weak::upgrade).any(|r| r.load(SeqCst) < target);
+            drop(readers);
+            if !busy {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let maps = self.maps_mut();
+        for r in pending {
+            let mut page = r.start;
+            while page < r.end {
+                if !maps.is_any_mapped(page..page + hp) {
+                    // SAFETY: an unmapped host page of our reservation; no TLB points at it.
+                    unsafe {
+                        libc::mprotect(
+                            self.base.add(page as usize).cast(),
+                            hp as usize,
+                            libc::PROT_NONE,
+                        )
+                    };
+                }
+                page += hp;
+            }
+        }
     }
 
     /// Force every thread's caches to flush, e.g. for `riscv_flush_icache`.
@@ -290,7 +397,11 @@ impl GuestMemory {
     /// Hold the mapping table still across a host `fork`, so the child (which keeps only
     /// the forking thread) never inherits it locked by a thread that no longer exists.
     pub fn lock_for_fork(&self) -> ForkGuard<'_> {
-        ForkGuard(self.maps_mut())
+        ForkGuard {
+            _maps: self.maps_mut(),
+            readers: self.readers.lock().unwrap_or_else(|e| e.into_inner()),
+            _pending: self.pending.lock().unwrap_or_else(|e| e.into_inner()),
+        }
     }
 
     fn check_range(addr: u64, len: u64) -> Result<Range<u64>, MapError> {
@@ -312,6 +423,8 @@ impl GuestMemory {
         let mut maps = self.maps_mut();
         self.unmap_locked(&mut maps, r.clone());
         self.insert_locked(&mut maps, r, prot);
+        drop(maps);
+        self.settle();
         Ok(())
     }
 
@@ -343,6 +456,7 @@ impl GuestMemory {
     pub fn unmap(&self, addr: u64, len: u64) -> Result<(), MapError> {
         let r = Self::check_range(addr, len)?;
         self.unmap_locked(&mut self.maps_mut(), r);
+        self.settle();
         Ok(())
     }
 
@@ -452,6 +566,8 @@ impl GuestMemory {
         }
         maps.0.insert(addr, Mapping { end: addr + len, prot, shared: true });
         self.changed(prot.contains(Prot::EXEC));
+        drop(maps);
+        self.settle();
         Ok(addr)
     }
 
@@ -509,19 +625,21 @@ impl GuestMemory {
                     )
                 };
             } else {
-                // SAFETY: replaces the page with a fresh PROT_NONE one inside our own
-                // reservation, discarding its contents.
+                // SAFETY: replaces the page with a fresh zero one inside our own reservation,
+                // discarding its contents. It stays accessible for a TLB that may still
+                // point at it, and becomes PROT_NONE in `settle`.
                 let rc = unsafe {
                     libc::mmap(
                         self.base.add(p.start as usize).cast(),
                         hp as usize,
-                        libc::PROT_NONE,
+                        libc::PROT_READ | libc::PROT_WRITE,
                         libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE | libc::MAP_FIXED,
                         -1,
                         0,
                     )
                 };
                 assert_ne!(rc, libc::MAP_FAILED, "{}", std::io::Error::last_os_error());
+                self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(p);
             }
             page += hp;
         }
@@ -889,5 +1007,34 @@ mod tests {
         assert!(m.host_buf(0xa0010, 16, Prot::WRITE).is_err());
         assert!(m.host_buf(0xa0ff0, 32, Prot::READ).is_err());
         assert!(m.host_buf(0xb0000, 0, Prot::READ).is_ok(), "empty buffers need no mapping");
+    }
+
+    #[test]
+    fn unmap_waits_for_tlb_readers_before_revoking_host_pages() {
+        let m = Arc::new(GuestMemory::new().unwrap());
+        let hp = m.host_page;
+        m.map(0x40000, hp, Prot::RW).unwrap();
+        m.write(0x40000, &[7]).unwrap();
+        let reader = m.tlb_reader();
+        reader.enter(&m);
+        let unmapper = {
+            let m = m.clone();
+            std::thread::spawn(move || m.unmap(0x40000, hp).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!unmapper.is_finished(), "unmap returned under an active reader");
+        // A stale TLB entry still reaches the page: zeroed, but no host fault.
+        // SAFETY: the page is pending and still readable.
+        let byte = unsafe { std::ptr::read_volatile(m.host_base().add(0x40000)) };
+        assert_eq!(byte, 0);
+        assert!(m.read(0x40000, &mut [0]).is_err(), "unmapped for everyone else");
+        reader.leave();
+        unmapper.join().unwrap();
+        assert!(m.pending.lock().unwrap().is_empty());
+        // Entering again sees the new generation; an idle reader holds nothing up.
+        reader.enter(&m);
+        reader.leave();
+        m.map(0x40000, hp, Prot::RW).unwrap();
+        m.unmap(0x40000, hp).unwrap();
     }
 }

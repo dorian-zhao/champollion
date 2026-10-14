@@ -13,7 +13,7 @@ mod tlb;
 
 pub use guest::{
     CONTROL_OFFSET, GUARD_SIZE, GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory,
-    INTERRUPT_SLOTS, MapError, Prot,
+    INTERRUPT_SLOTS, MapError, Prot, TlbReader,
 };
 pub use tlb::{Tlb, TlbMemory};
 

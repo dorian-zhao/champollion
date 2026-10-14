@@ -21,7 +21,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::cpu::CpuState;
 use crate::decoder::{self, Inst};
 use crate::interpreter::{self, Trap};
-use crate::memory::{GUEST_PAGE_SIZE, GuestMemory, Memory, Tlb, TlbMemory};
+use crate::memory::{GUEST_PAGE_SIZE, GuestMemory, Memory, Tlb, TlbMemory, TlbReader};
 
 /// Longest block we decode ahead, in instructions.
 const MAX_BLOCK: usize = 64;
@@ -99,6 +99,8 @@ pub struct Engine {
     generation: u64,
     code_generation: u64,
     cache: BlockCache,
+    /// Tells unmapping which TLB generation we may still use (created on first run).
+    reader: Option<TlbReader>,
 }
 
 /// Whether `inst` may change the pc non-sequentially (or must end a block for another
@@ -162,10 +164,16 @@ impl Engine {
         mem: &GuestMemory,
         max_steps: u64,
     ) -> (Option<Trap>, u64) {
+        let reader = self.reader.get_or_insert_with(|| mem.tlb_reader());
         let mut retired = 0;
         let mut prev: Option<u32> = None;
-        while retired < max_steps {
-            let generation = mem.generation();
+        let result = loop {
+            if retired >= max_steps {
+                break (None, retired);
+            }
+            // Per block: our TLB entries are good for this generation, and unmapping waits
+            // until we have moved past older ones (see `TlbReader`).
+            let generation = reader.enter(mem);
             if generation != self.generation {
                 self.tlb.flush();
                 self.generation = generation;
@@ -188,28 +196,35 @@ impl Engine {
                         }
                         i
                     }
-                    Err(trap) => return (Some(trap), retired),
+                    Err(trap) => break (Some(trap), retired),
                 },
             };
 
             let mut fence_i = false;
+            let mut trap = None;
             for &(inst, len) in cache.blocks[index as usize].insts.iter() {
                 if retired == max_steps {
-                    return (None, retired);
+                    break;
                 }
-                if let Err(trap) = interpreter::execute(cpu, &tm, inst, len as u64) {
-                    return (Some(trap), retired);
+                if let Err(t) = interpreter::execute(cpu, &tm, inst, len as u64) {
+                    trap = Some(t);
+                    break;
                 }
                 retired += 1;
                 fence_i = inst == Inst::FenceI;
+            }
+            if trap.is_some() {
+                break (trap, retired);
             }
             prev = Some(index);
             if fence_i {
                 cache.clear();
                 prev = None;
             }
-        }
-        (None, retired)
+        };
+        // Blocked in a syscall or elsewhere, we hold no TLB entries unmapping must wait for.
+        reader.leave();
+        result
     }
 }
 

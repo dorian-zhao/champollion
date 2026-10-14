@@ -248,7 +248,7 @@ The locks and per-access permission checks above belong to the **interpreter onl
 - **JIT atomics** are single ARM64 LSE instructions (`ldadd`, `swp`, `cas`, ...); `lr`/`sc` become `ldaxr`/`stlxr` or a `cas` against the reserved value.
 - **JIT fences** map RISC-V `pred`/`succ` sets to the cheapest sufficient `dmb` variant (`ish`, `ishld`, `ishst`).
 
-The engine (M2) adds a per-thread software TLB and a decoded-block cache, both invalidated by a global mapping-generation counter bumped on every mapping change, without changing any interface. With threads (M5), `munmap` must wait until every running thread has observed the new generation before it decommits host pages, since TLB hits skip the lock.
+The engine (M2) adds a per-thread software TLB and a decoded-block cache, both invalidated by a global mapping-generation counter bumped on every mapping change, without changing any interface. With threads (M5), TLB hits skip the lock, so unmapping cannot revoke host pages at once: freed host pages are replaced with fresh zero pages, and `munmap` makes them inaccessible only after every thread using a TLB has published (per block, through a `TlbReader`) that it has seen the new generation. A thread outside the engine, e.g. blocked in a syscall, publishes that it holds no entries, so it never holds anyone up.
 
 ## Milestones
 
@@ -277,7 +277,6 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 Things route B does not do yet, roughly by how likely a program is to notice.
 
 - **Dynamically linked programs get no persistent code cache.** Mapping libraries changes executable mappings, which drops translations and disables saving; CPython pays its startup translation on every run (about 0.2 s for `python3 -c pass`). The cache key would have to cover every mapped library.
-- **The software TLB races `munmap`.** The engine (`RVRUN_JIT=0`) and the JIT's instruction fetch for translation trust a TLB entry without the mapping lock; if another thread unmaps that page meanwhile, the host access faults outside generated code and rvrun crashes. `munmap` should wait until every running thread has seen the new generation before decommitting (see [Performance boundary](#performance-boundary)).
 - **Realtime signals do not queue.** Each signal has at most one pending instance, as standard signals do; `sigqueue` payloads are not delivered.
 - **Only `ITIMER_REAL`.** The CPU-time timers (`ITIMER_VIRTUAL`, `ITIMER_PROF`) and POSIX `timer_create` are missing.
 - **Startup grew by about 0.5 ms** (3.4 ms for a static hello, native 1.9 ms), mostly the host signal thread.
