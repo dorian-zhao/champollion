@@ -25,7 +25,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use champollion_rv::gdb::{self, Session};
-use champollion_rv::host::darwin::DarwinHost;
 use champollion_rv::process::Process;
 
 const USAGE: &str =
@@ -123,7 +122,7 @@ fn main() -> ExitCode {
         &argv,
         &envp,
         path.as_bytes(),
-        Arc::new(DarwinHost::default()),
+        Arc::new(champollion_rv::host::Native::default()),
         sysroot.clone(),
     ) {
         Ok(p) => p,
@@ -152,7 +151,7 @@ fn main() -> ExitCode {
         }
     }
     main_thread.signals.set_mask(mask);
-    champollion_rv::host::darwin::forward_signals(proc.clone());
+    champollion_rv::host::forward_signals(proc.clone());
     let strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
     proc.log.strace.store(strace, std::sync::atomic::Ordering::Relaxed);
     let cache = CodeCache::new(&file);
