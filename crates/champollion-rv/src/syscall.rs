@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use crate::futex;
 use crate::memory::{GuestBuf, MemFault, Memory, Prot};
 use crate::process::{Process, Thread};
+use crate::signal;
 
 /// Linux errno values (asm-generic), which differ from Darwin's past 34 (and at 11).
 pub mod errno {
@@ -101,6 +102,8 @@ syscalls! {
     SIGALTSTACK = 132 "sigaltstack",
     RT_SIGACTION = 134 "rt_sigaction",
     RT_SIGPROCMASK = 135 "rt_sigprocmask",
+    RT_SIGPENDING = 136 "rt_sigpending",
+    RT_SIGRETURN = 139 "rt_sigreturn",
     UNAME = 160 "uname",
     GETRUSAGE = 165 "getrusage",
     UMASK = 166 "umask",
@@ -370,8 +373,7 @@ pub enum Flow {
     ExitThread(i32),
     /// `exit_group`: end the whole process.
     ExitGroup(i32),
-    /// The process sent itself a signal whose default action terminates it (`abort()`
-    /// does this with SIGABRT). Handlers arrive with signals in M5.
+    /// The thread must die by this signal now (a corrupt signal frame on `rt_sigreturn`).
     Killed(i32),
 }
 
@@ -399,11 +401,44 @@ const F_SETLKW: i32 = 7;
 
 /// Whether sending `sig` to ourselves must end the process now: its default action
 /// terminates, and handlers are not supported yet. Returns the signal if so.
-fn signal_to_self(to_self: bool, sig: i32) -> Option<i32> {
-    // Default action ignore: SIGCHLD 17, SIGCONT 18, SIGURG 23, SIGWINCH 28. Signal 0 only
-    // checks that the target exists.
-    const IGNORED: [i32; 5] = [0, 17, 18, 23, 28];
-    (to_self && !IGNORED.contains(&sig) && (1..=64).contains(&sig)).then_some(sig)
+fn signal_number(sig: u64) -> Result<i32, i32> {
+    let sig = sig as i32;
+    if (0..=signal::NSIG).contains(&sig) { Ok(sig) } else { Err(errno::EINVAL) }
+}
+
+/// `kill`, `tkill`, `tgkill`. Signals to this process or its threads are queued and
+/// delivered by the recipient's run loop (right after this syscall, for the caller).
+fn kill(p: &Process, nr: u64, a: [u64; 6]) -> SysResult {
+    let me = p.host.identity();
+    let pid = me.pid as i32;
+    let sent = |code| signal::Info::Sent { code, pid: me.pid, uid: me.uid };
+    match nr {
+        nr::KILL => {
+            let (target, sig) = (a[0] as i32, signal_number(a[1])?);
+            if target != pid && target != 0 && target != -pid {
+                return p.host.kill(target, sig);
+            }
+            if sig != 0 {
+                p.send_to_process(sig, sent(signal::SI_USER));
+            }
+            Ok(0)
+        }
+        _ => {
+            let (tgid, tid, sig) = match nr {
+                nr::TKILL => (pid, a[0] as i32, signal_number(a[1])?),
+                _ => (a[0] as i32, a[1] as i32, signal_number(a[2])?),
+            };
+            if tgid != pid || tid <= 0 {
+                return Err(errno::ESRCH);
+            }
+            let exists = if sig == 0 {
+                p.thread_exists(tid as u32) // signal 0 only checks the target
+            } else {
+                p.send_to_thread(tid as u32, sig, sent(signal::SI_TKILL))
+            };
+            if exists { Ok(0) } else { Err(errno::ESRCH) }
+        }
+    }
 }
 
 fn read_timespec(p: &Process, addr: u64) -> Result<(i64, i64), i32> {
@@ -490,9 +525,11 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
     let started = set(CLONE_PARENT_SETTID, parent_tid)
         .and_then(|()| set(CLONE_CHILD_SETTID, child_tid))
-        .and_then(|()| p.start_thread(cpu, tid, t.name, clear).map_err(|_| errno::EAGAIN));
+        .and_then(|()| {
+            p.start_thread(cpu, tid, t.name, t.signals.mask(), clear).map_err(|_| errno::EAGAIN)
+        });
     if let Err(e) = started {
-        p.forget_tid();
+        p.forget_tid(tid);
         return Err(e);
     }
     Ok(tid as u64)
@@ -541,7 +578,6 @@ fn put(p: &Process, addr: u64, bytes: &[u8]) -> Result<(), i32> {
 /// Handle the `ecall` at `t.cpu.pc`: read the request from the thread's registers, perform
 /// it, write the result to `a0`, and advance past the `ecall`.
 pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
-    let host = &*p.host;
     let nr = t.cpu.x[17];
     let a: [u64; 6] = std::array::from_fn(|i| t.cpu.x[10 + i]);
 
@@ -553,28 +589,16 @@ pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
             let status = a[0] as i32 & 0xff;
             return if nr == nr::EXIT { Flow::ExitThread(status) } else { Flow::ExitGroup(status) };
         }
-        nr::KILL | nr::TKILL | nr::TGKILL => {
-            let pid = host.identity().pid as i64;
-            let (target, sig) = match nr {
-                nr::KILL => (a[0] as i32 as i64, a[1] as i32),
-                nr::TKILL => (a[0] as i32 as i64, a[1] as i32),
-                _ => (a[1] as i32 as i64, a[2] as i32),
+        nr::RT_SIGRETURN => {
+            let Ok(mask) = signal::pop_frame(&p.mem, &mut t.cpu) else {
+                return Flow::Killed(signal::SIGSEGV); // a corrupt frame, as on Linux
             };
-            let to_self = target == pid || (nr == nr::KILL && target == 0);
-            match signal_to_self(to_self, sig) {
-                Some(sig) => {
-                    if p.log.strace.load(std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!(
-                            "[rvrun {}] {}(..., {sig}) = ? (fatal)",
-                            t.tid,
-                            name(nr).unwrap()
-                        );
-                    }
-                    return Flow::Killed(sig);
-                }
-                None if to_self => Ok(0),
-                None => host.kill(target as i32, sig),
+            t.signals.set_mask(mask);
+            if p.log.strace.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[rvrun {}] rt_sigreturn() = {:#x}", t.tid, t.cpu.x[10]);
             }
+            // The restored registers are the result: no a0, no pc advance.
+            return Flow::Continue;
         }
         _ => call(p, t, nr, a),
     };
@@ -708,30 +732,88 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::GETEUID => Ok(host.identity().euid as u64),
         nr::GETGID => Ok(host.identity().gid as u64),
         nr::GETEGID => Ok(host.identity().egid as u64),
+        nr::KILL | nr::TKILL | nr::TGKILL => kill(p, nr, a),
         nr::RT_SIGACTION => {
-            // Signals arrive in M5. Until then, accept handlers and report SIG_DFL as the
-            // old one (riscv64 kernel struct sigaction: handler, flags, mask = 24 bytes).
+            let sig = signal_number(a[0])?;
+            if sig == 0 || a[3] != 8 {
+                return Err(errno::EINVAL);
+            }
+            let new = if a[1] != 0 {
+                if signal::UNBLOCKABLE & signal::bit(sig) != 0 {
+                    return Err(errno::EINVAL);
+                }
+                let mut b = [0u8; 24];
+                p.mem.read(a[1], &mut b).map_err(efault)?;
+                Some(signal::Action::from_bytes(&b))
+            } else {
+                None
+            };
+            let old = match new {
+                Some(action) => p.set_action(sig, action),
+                None => p.action(sig),
+            };
             if a[2] != 0 {
-                put(p, a[2], &[0; 24])?;
+                put(p, a[2], &old.to_bytes())?;
             }
             Ok(0)
         }
         nr::SIGALTSTACK => {
-            // No signal is ever delivered before M5, so accept the new stack and report the
-            // old one as disabled (stack_t: ss_sp, ss_flags = SS_DISABLE, ss_size).
+            let sp = t.cpu.x[2];
+            let old = t.altstack.to_bytes(sp);
+            if a[0] != 0 {
+                let mut b = [0u8; 24];
+                p.mem.read(a[0], &mut b).map_err(efault)?;
+                if t.altstack.contains(sp) {
+                    return Err(errno::EPERM); // cannot change the stack we are running on
+                }
+                let flags = u32::from_le_bytes(b[8..12].try_into().unwrap());
+                let size = u64::from_le_bytes(b[16..24].try_into().unwrap());
+                const MINSIGSTKSZ: u64 = 2048;
+                t.altstack = if flags & signal::SS_DISABLE != 0 {
+                    signal::AltStack { sp: 0, flags: signal::SS_DISABLE, size: 0 }
+                } else if flags & !signal::SS_ONSTACK != 0 {
+                    return Err(errno::EINVAL);
+                } else if size < MINSIGSTKSZ {
+                    return Err(errno::ENOMEM);
+                } else {
+                    let base = u64::from_le_bytes(b[..8].try_into().unwrap());
+                    signal::AltStack { sp: base, flags: 0, size }
+                };
+            }
             if a[1] != 0 {
-                const SS_DISABLE: u64 = 2;
-                let mut old = 0u64.to_le_bytes().to_vec();
-                old.extend(SS_DISABLE.to_le_bytes());
-                old.extend(0u64.to_le_bytes());
                 put(p, a[1], &old)?;
             }
             Ok(0)
         }
         nr::RT_SIGPROCMASK => {
-            if a[2] != 0 {
-                put(p, a[2], &[0; 8])?;
+            const SIG_BLOCK: u64 = 0;
+            const SIG_UNBLOCK: u64 = 1;
+            const SIG_SETMASK: u64 = 2;
+            if a[3] != 8 {
+                return Err(errno::EINVAL);
             }
+            let old = t.signals.mask();
+            if a[1] != 0 {
+                let mut b = [0u8; 8];
+                p.mem.read(a[1], &mut b).map_err(efault)?;
+                let set = u64::from_le_bytes(b);
+                t.signals.set_mask(match a[0] {
+                    SIG_BLOCK => old | set,
+                    SIG_UNBLOCK => old & !set,
+                    SIG_SETMASK => set,
+                    _ => return Err(errno::EINVAL),
+                });
+            }
+            if a[2] != 0 {
+                put(p, a[2], &old.to_le_bytes())?;
+            }
+            Ok(0)
+        }
+        nr::RT_SIGPENDING => {
+            if a[1] != 8 {
+                return Err(errno::EINVAL);
+            }
+            put(p, a[0], &p.pending_for(t).to_le_bytes())?;
             Ok(0)
         }
         nr::RISCV_FLUSH_ICACHE => {

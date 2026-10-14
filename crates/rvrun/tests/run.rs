@@ -50,6 +50,30 @@ fn threads() {
 }
 
 #[test]
+fn signals() {
+    let out = rvrun(&[fixture("signals").as_os_str()], b"");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "handler ran 2 times\n\
+         siginfo ok\n\
+         blocked: pending 1, ran 2\n\
+         unblocked: ran 3\n\
+         ignored: ran 3\n\
+         caught fault 1 at 0x10\n\
+         caught fault 2 at 0x20\n\
+         alternate stack used\n\
+         resumed after illegal instruction with 42\n\
+         signal to thread delivered\n"
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    // Default actions: SIGTERM and abort()'s SIGABRT kill the process.
+    let out = rvrun(&[fixture("signals").as_os_str(), "term".as_ref()], b"");
+    assert_eq!(out.status.code(), Some(128 + 15));
+    let out = rvrun(&[fixture("signals").as_os_str(), "abort".as_ref()], b"");
+    assert_eq!(out.status.code(), Some(128 + 6));
+}
+
+#[test]
 fn syscalls() {
     let dir = std::env::temp_dir().join(format!("champollion-run-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

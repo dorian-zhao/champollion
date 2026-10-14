@@ -24,6 +24,7 @@ pub mod jit;
 pub mod loader;
 pub mod memory;
 pub mod process;
+pub mod signal;
 pub mod syscall;
 
 pub use cpu::CpuState;

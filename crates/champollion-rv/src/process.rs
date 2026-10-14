@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 use crate::futex::{self, Futexes};
+use crate::signal::{self, Action, AltStack, Info, Pending, ThreadSignals};
 
 use crate::memory::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Memory, Prot};
 use crate::syscall::{self, Flow, HostOs, SysResult, SyscallLog, errno};
@@ -46,6 +47,9 @@ pub const MMAP_TOP: u64 = STACK_TOP - (1 << 30);
 /// Load base for static-PIE executables: two thirds up the address space, as Linux does
 /// (`ELF_ET_DYN_BASE`), leaving room below for fixed-address images and above for brk.
 pub const PIE_BASE: u64 = (GUEST_SIZE / 3 * 2) & !(GUEST_PAGE_SIZE - 1);
+/// A page with `li a7, 139; ecall` (`rt_sigreturn`), where signal handlers return to: the
+/// vDSO's job on Linux. It sits just above the mmap region.
+pub const SIGRETURN_TRAMPOLINE: u64 = MMAP_TOP;
 
 /// `AT_HWCAP`: one bit per single-letter extension we implement (bit n = letter 'a' + n).
 const HWCAP: u64 = hwcap(b"imafdc");
@@ -130,6 +134,12 @@ pub struct Process {
     all_exited: Condvar,
     /// Whether new threads get a JIT (set by the embedder, like the main thread's).
     pub jit: AtomicBool,
+    /// Signal dispositions, by signal number - 1.
+    actions: Mutex<[Action; signal::NSIG as usize]>,
+    /// Process-directed pending signals (`kill`), taken by whichever thread can first.
+    pending: Mutex<Pending>,
+    /// Every live thread's shared signal state, by tid (for `tgkill`).
+    thread_signals: Mutex<std::collections::HashMap<u32, Arc<ThreadSignals>>>,
     brk: Mutex<Brk>,
     pub log: SyscallLog,
     /// Absolute path of the executable, for `/proc/self/exe`.
@@ -167,6 +177,9 @@ pub struct Thread {
     pub tid: u32,
     /// `prctl(PR_SET_NAME)`: up to 15 bytes, NUL-padded.
     pub name: [u8; 16],
+    /// Signal mask and pending thread-directed signals, shared with senders.
+    pub signals: Arc<ThreadSignals>,
+    pub altstack: AltStack,
     /// Set by `set_tid_address`; on thread exit the kernel zeroes it and wakes futex
     /// waiters (M5, for `pthread_join`).
     pub clear_child_tid: u64,
@@ -200,6 +213,12 @@ impl Process {
         let mem = GuestMemory::new().map_err(SpawnError::Reserve)?;
         let brk = loader::map_elf(&mem, &elf).map_err(SpawnError::Map)?;
         mem.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::RW).map_err(SpawnError::Map)?;
+        mem.map(SIGRETURN_TRAMPOLINE, GUEST_PAGE_SIZE, Prot::READ | Prot::EXEC)
+            .map_err(SpawnError::Map)?;
+        const LI_A7_139: u32 = 0x08b0_0893;
+        const ECALL: u32 = 0x0000_0073;
+        let code: Vec<u8> = [LI_A7_139, ECALL].iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write_privileged(SIGRETURN_TRAMPOLINE, &code).map_err(|_| SpawnError::BadLayout)?;
 
         let id = host.identity();
         let mut random = [0u8; 16];
@@ -235,6 +254,7 @@ impl Process {
         };
         let brk = Mutex::new(Brk { start: brk, cur: brk });
         let threads = Threads { live: 1, next_tid: id.pid + 1, last_status: 0 };
+        let main_signals = Arc::new(ThreadSignals::default());
         let process = Arc::new_cyclic(|this| Self {
             mem,
             host,
@@ -243,6 +263,12 @@ impl Process {
             threads: Mutex::new(threads),
             all_exited: Condvar::new(),
             jit: AtomicBool::new(false),
+            actions: Mutex::new([Action::default(); signal::NSIG as usize]),
+            pending: Mutex::default(),
+            thread_signals: Mutex::new(std::collections::HashMap::from([(
+                id.pid,
+                main_signals.clone(),
+            )])),
             brk,
             log: SyscallLog::default(),
             exe,
@@ -253,6 +279,8 @@ impl Process {
                 cpu,
                 tid: id.pid,
                 name: *b"rvrun\0\0\0\0\0\0\0\0\0\0\0",
+                signals: main_signals,
+                altstack: AltStack::default(),
                 clear_child_tid: 0,
                 engine: Engine::new(),
                 jit: None,
@@ -282,14 +310,27 @@ impl Process {
         cpu: CpuState,
         tid: u32,
         name: [u8; 16],
+        mask: u64,
         clear_child_tid: u64,
     ) -> std::io::Result<()> {
         let this = self.this.upgrade().expect("a running process is alive");
+        // A new thread inherits the signal mask, but not the alternate stack.
+        let signals = Arc::new(ThreadSignals::default());
+        signals.set_mask(mask);
+        lock(&self.thread_signals).insert(tid, signals.clone());
         std::thread::Builder::new().name(format!("guest thread {tid}")).stack_size(4 << 20).spawn(
             move || {
                 let jit = if this.jit.load(Ordering::Relaxed) { Jit::new().ok() } else { None };
-                let mut thread =
-                    Thread { cpu, tid, name, clear_child_tid, engine: Engine::new(), jit };
+                let mut thread = Thread {
+                    cpu,
+                    tid,
+                    name,
+                    signals,
+                    altstack: AltStack::default(),
+                    clear_child_tid,
+                    engine: Engine::new(),
+                    jit,
+                };
                 match this.run_thread(&mut thread) {
                     End::Thread(status) => this.thread_exited(&thread, status),
                     End::Process(exit) => std::process::exit(exit.report(&thread.cpu).into()),
@@ -308,13 +349,15 @@ impl Process {
     }
 
     /// Undo [`Process::new_tid`] for a thread that could not be started.
-    pub fn forget_tid(&self) {
+    pub fn forget_tid(&self, tid: u32) {
+        lock(&self.thread_signals).remove(&tid);
         lock(&self.threads).live -= 1;
     }
 
     /// Bookkeeping for a thread's `exit`: clear and wake its `clear_child_tid` word (how
     /// `pthread_join` learns of the exit), and end the process if it was the last thread.
     fn thread_exited(&self, thread: &Thread, status: i32) {
+        lock(&self.thread_signals).remove(&thread.tid);
         if thread.clear_child_tid != 0 {
             let addr = thread.clear_child_tid;
             if self.mem.write(addr, &0u32.to_le_bytes()).is_ok() {
@@ -332,6 +375,9 @@ impl Process {
     /// Run `thread` until it exits or the process ends.
     fn run_thread(&self, thread: &mut Thread) -> End {
         loop {
+            if let Some(end) = self.deliver_signals(thread) {
+                return end;
+            }
             let trap = match &mut thread.jit {
                 Some(jit) => jit.run(&mut thread.cpu, &self.mem),
                 None => match thread.engine.run(&mut thread.cpu, &self.mem, u64::MAX) {
@@ -346,9 +392,136 @@ impl Process {
                     Flow::ExitGroup(status) => return End::Process(Exit::Status(status)),
                     Flow::Killed(sig) => return End::Process(Exit::Signal(sig)),
                 },
-                trap => return End::Process(Exit::Trap(trap)),
+                trap => {
+                    if let Some(end) = self.trap_signal(thread, trap) {
+                        return end;
+                    }
+                }
             }
         }
+    }
+
+    /// The disposition of `sig` (1..=64).
+    pub fn action(&self, sig: i32) -> Action {
+        lock(&self.actions)[sig as usize - 1]
+    }
+
+    /// `rt_sigaction`: set the disposition of `sig`, returning the old one. Signals that
+    /// become ignored are dropped from every pending set.
+    pub fn set_action(&self, sig: i32, action: Action) -> Action {
+        let old = std::mem::replace(&mut lock(&self.actions)[sig as usize - 1], action);
+        let ignored = action.handler == signal::SIG_IGN
+            || (action.handler == signal::SIG_DFL
+                && signal::default_action(sig) != signal::DefaultAction::Terminate);
+        if ignored {
+            lock(&self.pending).discard(signal::bit(sig));
+            for t in lock(&self.thread_signals).values() {
+                lock(&t.pending).discard(signal::bit(sig));
+            }
+        }
+        old
+    }
+
+    /// Send `sig` to the process (`kill`): any thread that does not block it takes it.
+    pub fn send_to_process(&self, sig: i32, info: Info) {
+        lock(&self.pending).add(sig, info);
+    }
+
+    /// Send `sig` to thread `tid` (`tgkill`). False if there is no such thread.
+    pub fn send_to_thread(&self, tid: u32, sig: i32, info: Info) -> bool {
+        let Some(t) = lock(&self.thread_signals).get(&tid).cloned() else { return false };
+        lock(&t.pending).add(sig, info);
+        true
+    }
+
+    pub fn thread_exists(&self, tid: u32) -> bool {
+        lock(&self.thread_signals).contains_key(&tid)
+    }
+
+    /// Signals pending for `thread`, directed at it or at the process.
+    pub fn pending_for(&self, thread: &Thread) -> u64 {
+        lock(&thread.signals.pending).set | lock(&self.pending).set
+    }
+
+    /// Deliver the signals `thread` can take now. Returns how the process ends if one of
+    /// them terminates it.
+    fn deliver_signals(&self, thread: &mut Thread) -> Option<End> {
+        loop {
+            let blocked = thread.signals.mask();
+            let next = lock(&thread.signals.pending).take(blocked);
+            let (sig, info) = next.or_else(|| lock(&self.pending).take(blocked))?;
+            if let Some(end) = self.deliver(thread, sig, info) {
+                return Some(end);
+            }
+        }
+    }
+
+    /// Act on `sig` for `thread`: ignore it, end the process, or run its handler.
+    fn deliver(&self, thread: &mut Thread, sig: i32, info: Info) -> Option<End> {
+        let action = {
+            let mut actions = lock(&self.actions);
+            let action = actions[sig as usize - 1];
+            if action.flags & signal::SA_RESETHAND != 0 && action.handler > signal::SIG_IGN {
+                actions[sig as usize - 1] = Action::default();
+            }
+            action
+        };
+        match action.handler {
+            signal::SIG_IGN => None,
+            signal::SIG_DFL => match signal::default_action(sig) {
+                signal::DefaultAction::Terminate => Some(End::Process(Exit::Signal(sig))),
+                _ => None,
+            },
+            _ => {
+                let mask = thread.signals.mask();
+                let pushed = signal::push_frame(
+                    &self.mem,
+                    &mut thread.cpu,
+                    sig,
+                    info,
+                    &action,
+                    mask,
+                    thread.altstack,
+                    SIGRETURN_TRAMPOLINE,
+                );
+                if pushed.is_err() {
+                    // No room for the frame: Linux kills with SIGSEGV.
+                    return Some(End::Process(Exit::Signal(signal::SIGSEGV)));
+                }
+                let defer =
+                    if action.flags & signal::SA_NODEFER == 0 { signal::bit(sig) } else { 0 };
+                thread.signals.set_mask(mask | action.mask | defer);
+                None
+            }
+        }
+    }
+
+    /// A trap in guest code: run the guest's handler for the matching signal, or end the
+    /// process if there is none (or the signal is blocked, as Linux does for faults).
+    fn trap_signal(&self, thread: &mut Thread, trap: Trap) -> Option<End> {
+        let (sig, info) = match trap {
+            Trap::FetchFault(f) => {
+                (signal::SIGSEGV, Info::Fault { code: signal::SEGV_MAPERR, addr: f.addr })
+            }
+            Trap::LoadFault { fault, .. } | Trap::StoreFault { fault, .. } => {
+                (signal::SIGSEGV, Info::Fault { code: signal::SEGV_MAPERR, addr: fault.addr })
+            }
+            Trap::IllegalInstruction { pc, .. } | Trap::ReservedRoundingMode { pc } => {
+                (signal::SIGILL, Info::Fault { code: signal::ILL_ILLOPC, addr: pc })
+            }
+            Trap::Ebreak { pc } => {
+                (signal::SIGTRAP, Info::Fault { code: signal::TRAP_BRKPT, addr: pc })
+            }
+            Trap::MisalignedAtomic { addr, .. } => {
+                (signal::SIGBUS, Info::Fault { code: signal::BUS_ADRALN, addr })
+            }
+            Trap::Ecall { .. } => unreachable!("ecall is a syscall"),
+        };
+        let handled = self.action(sig).handler > signal::SIG_IGN;
+        if !handled || thread.signals.mask() & signal::bit(sig) != 0 {
+            return Some(End::Process(Exit::Trap(trap)));
+        }
+        self.deliver(thread, sig, info)
     }
 
     /// `brk`: move the program break. Returns the new break, or the old one if the
