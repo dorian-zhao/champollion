@@ -600,7 +600,29 @@ impl GuestMemory {
             return Err(MapError::NotMapped);
         }
         let mut code = prot.contains(Prot::EXEC);
-        for (start, _) in maps.split_out(r) {
+        // Shared mappings start read-only on the host unless writable (see `map_shared`), so
+        // making one writable needs the host's consent: a file opened read-only refuses.
+        // (Write access is never taken back on the host; software checks enforce that.)
+        let splits = maps.split_out(r);
+        if prot.contains(Prot::WRITE) {
+            for &(start, m) in &splits {
+                if m.shared {
+                    let hr = self.host_pages(start..m.end);
+                    // SAFETY: host pages of a shared mapping, which it has to itself.
+                    let rc = unsafe {
+                        libc::mprotect(
+                            self.host(hr.start).cast(),
+                            (hr.end - hr.start) as usize,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                        )
+                    };
+                    if rc != 0 {
+                        return Err(MapError::Host(13)); // EACCES
+                    }
+                }
+            }
+        }
+        for (start, _) in splits {
             let m = maps.0.get_mut(&start).unwrap();
             code |= m.prot.contains(Prot::EXEC);
             m.prot = prot;
@@ -672,13 +694,20 @@ impl GuestMemory {
             Some((fd, offset)) => (libc::MAP_SHARED, fd, offset as libc::off_t),
             None => (libc::MAP_SHARED | libc::MAP_ANON, -1, 0),
         };
+        // Read-only unless the guest asks for writes: a file opened read-only cannot be
+        // mapped shared and writable (see `protect` for later changes).
+        let host_prot = if prot.contains(Prot::WRITE) {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
         // SAFETY: replaces whole host pages of our own reservation, which no other mapping
         // uses (they are free, or were just unmapped).
         let rc = unsafe {
             libc::mmap(
                 self.host(addr).cast(),
                 len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
+                host_prot,
                 flags | libc::MAP_FIXED,
                 fd,
                 offset,
@@ -1132,6 +1161,28 @@ mod tests {
         assert!(m.host_buf(0xa0010, 16, Prot::WRITE).is_err());
         assert!(m.host_buf(0xa0ff0, 32, Prot::READ).is_err());
         assert!(m.host_buf(0xb0000, 0, Prot::READ).is_ok(), "empty buffers need no mapping");
+    }
+
+    #[test]
+    fn shared_file_mappings_follow_the_file_access_mode() {
+        use std::os::fd::AsRawFd;
+        let m = GuestMemory::new().unwrap();
+        let hp = m.host_page;
+        let path = std::env::temp_dir().join(format!("champollion-ro-{}", std::process::id()));
+        std::fs::write(&path, b"read only").unwrap();
+        let ro = std::fs::File::open(&path).unwrap();
+        let a = m.map_shared(None, hp, GUEST_SIZE, Prot::READ, Some((ro.as_raw_fd(), 0))).unwrap();
+        let mut b = [0u8; 9];
+        m.read(a, &mut b).unwrap();
+        assert_eq!(&b, b"read only");
+        assert_eq!(m.protect(a, hp, Prot::RW), Err(MapError::Host(13)), "EACCES, as on Linux");
+        let rw = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let a = m.map_shared(None, hp, GUEST_SIZE, Prot::READ, Some((rw.as_raw_fd(), 0))).unwrap();
+        m.protect(a, hp, Prot::RW).unwrap();
+        m.write(a, b"R").unwrap();
+        m.unmap(a, hp).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"Read only");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -1196,6 +1196,7 @@ impl Process {
         }
         self.mem.protect(addr, len, Prot(prot)).map_err(|e| match e {
             MapError::NotMapped => errno::ENOMEM,
+            MapError::Host(e) => e,
             _ => errno::EINVAL,
         })?;
         Ok(0)
