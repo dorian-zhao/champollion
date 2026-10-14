@@ -3,4 +3,6 @@
 #[cfg(target_os = "macos")]
 pub mod darwin;
 #[cfg(target_os = "macos")]
+mod dirs;
+#[cfg(target_os = "macos")]
 mod kqueue;

@@ -247,6 +247,11 @@ pub trait HostOs: Send + Sync {
     fn eventfd(&self, initval: u32, flags: i32) -> SysResult {
         Err(errno::ENOSYS)
     }
+    /// `linux_dirent64` records for the next entries of directory `fd`, at most `max` bytes.
+    fn getdents64(&self, fd: i32, max: usize) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+
     fn write(&self, fd: i32, buf: GuestBuf) -> SysResult {
         Err(errno::ENOSYS)
     }
@@ -809,6 +814,12 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(ready.len() as u64)
         }
         nr::RISCV_HWPROBE => hwprobe(p, a),
+        nr::GETDENTS64 => {
+            p.mem.host_buf(a[1], a[2], Prot::WRITE).map_err(efault)?;
+            let records = host.getdents64(fd, a[2] as usize)?;
+            put(p, a[1], &records)?;
+            Ok(records.len() as u64)
+        }
         nr::RT_SIGACTION => {
             let sig = signal_number(a[0])?;
             if sig == 0 || a[3] != 8 {

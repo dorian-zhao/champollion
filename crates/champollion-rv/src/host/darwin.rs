@@ -9,11 +9,13 @@ use std::ffi::CStr;
 use crate::memory::GuestBuf;
 use crate::syscall::{AT_FDCWD, Flock, HostOs, Identity, PollFd, Rusage, Stat, SysResult, errno};
 
-/// The Darwin backend. Guest fds are host fds; the only state kept here is for the Linux
-/// fd types Darwin lacks (eventfd; epoll instances are plain kqueues).
+/// The Darwin backend. Guest fds are host fds; the only state kept here is for what Darwin
+/// lacks: eventfds (epoll instances are plain kqueues) and directory streams for
+/// `getdents64`.
 #[derive(Default)]
 pub struct DarwinHost {
     eventfds: super::kqueue::EventFds,
+    dirs: super::dirs::Dirs,
 }
 
 /// Linux (asm-generic) `open` flags.
@@ -265,6 +267,10 @@ impl HostOs for DarwinHost {
         self.eventfds.create(initval, flags)
     }
 
+    fn getdents64(&self, fd: i32, max: usize) -> Result<Vec<u8>, i32> {
+        self.dirs.getdents64(fd, max)
+    }
+
     fn read(&self, fd: i32, buf: GuestBuf) -> SysResult {
         if let Some(r) = self.eventfds.read(fd, buf) {
             return r;
@@ -306,6 +312,7 @@ impl HostOs for DarwinHost {
 
     fn close(&self, fd: i32) -> SysResult {
         self.eventfds.close(fd);
+        self.dirs.forget(fd);
         // SAFETY: closing an arbitrary fd is memory-safe.
         check(unsafe { libc::close(fd) } as isize)
     }
@@ -334,6 +341,7 @@ impl HostOs for DarwinHost {
     }
 
     fn lseek(&self, fd: i32, offset: i64, whence: i32) -> SysResult {
+        self.dirs.forget(fd); // a directory stream restarts at the new offset
         let whence = match whence {
             0..=2 => whence, // SEEK_SET/CUR/END agree
             3 => libc::SEEK_DATA,
