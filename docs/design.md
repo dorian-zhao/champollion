@@ -283,13 +283,13 @@ Things that do not work yet, roughly by how likely a program is to notice.
 - **Realtime signals do not queue.** Each signal has at most one pending instance, as standard signals do; `sigqueue` payloads are not delivered.
 - **Only `ITIMER_REAL`.** The CPU-time timers (`ITIMER_VIRTUAL`, `ITIMER_PROF`) and POSIX `timer_create` are missing.
 - **Startup grew by about 0.5 ms** (3.4 ms for a static hello, native 1.9 ms), mostly the host signal thread.
-- **Linux builds linked by GNU ld run SQLite about 12% slower than zig-linked ones** (37.9 vs. 33.5 ms in OrbStack's VM, same code and memory layout); the cause is not known yet.
 - **Memory protection is coarser in generated code** (16 KiB host pages, aliasing above 2^38); see [Performance boundary](#performance-boundary).
 
 ### Route A
 
 - **Every `run` unpacks the image again** into a fresh ext4 file (a second or two for Debian); there are no persistent containers, no `exec` into a running one, and no published ports yet.
 - **The Kata kernel is 6.12**, while Containerization tests from 6.14.9.
+- **Linux builds linked by GNU ld run SQLite about 12% slower than zig-linked ones** (37.9 vs. 33.5 ms in OrbStack's VM, same code and memory layout); the cause is not known yet.
 
 ## Open Questions
 
