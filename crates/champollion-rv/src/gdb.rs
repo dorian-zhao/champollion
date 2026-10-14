@@ -30,7 +30,7 @@ use gdbstub_arch::riscv::reg::RiscvCoreRegs;
 use crate::interpreter::{self, Trap};
 use crate::memory::GUEST_PAGE_SIZE;
 use crate::process::{Exit, Process, Thread};
-use crate::syscall::{self, Flow, HostOs};
+use crate::syscall::{self, Flow};
 
 /// Instructions to run between checks for an interrupt (Ctrl-C) from the debugger.
 const POLL_INTERVAL: u32 = 1024;
@@ -55,7 +55,6 @@ enum Event {
 pub struct Debuggee<'a> {
     process: &'a Process,
     thread: &'a mut Thread,
-    host: &'a dyn HostOs,
     breakpoints: BTreeSet<u64>,
     mode: Mode,
     /// Signal GDB asked to deliver on resume; any signal is fatal until M5.
@@ -65,11 +64,10 @@ pub struct Debuggee<'a> {
 }
 
 impl<'a> Debuggee<'a> {
-    pub fn new(process: &'a Process, thread: &'a mut Thread, host: &'a dyn HostOs) -> Self {
+    pub fn new(process: &'a Process, thread: &'a mut Thread) -> Self {
         Debuggee {
             process,
             thread,
-            host,
             breakpoints: BTreeSet::new(),
             mode: Mode::Continue,
             pending_signal: None,
@@ -85,15 +83,13 @@ impl<'a> Debuggee<'a> {
         loop {
             match interpreter::step(&mut self.thread.cpu, &self.process.mem) {
                 Ok(()) => {}
-                Err(Trap::Ecall { .. }) => {
-                    match syscall::dispatch(self.process, self.thread, self.host) {
-                        Flow::Continue => {}
-                        Flow::ExitThread(status) | Flow::ExitGroup(status) => {
-                            return Event::Exited(Exit::Status(status));
-                        }
-                        Flow::Killed(sig) => return Event::Exited(Exit::Signal(sig)),
+                Err(Trap::Ecall { .. }) => match syscall::dispatch(self.process, self.thread) {
+                    Flow::Continue => {}
+                    Flow::ExitThread(status) | Flow::ExitGroup(status) => {
+                        return Event::Exited(Exit::Status(status));
                     }
-                }
+                    Flow::Killed(sig) => return Event::Exited(Exit::Signal(sig)),
+                },
                 Err(trap) => return Event::Fault(trap),
             }
             if self.mode == Mode::Step {
@@ -286,10 +282,9 @@ pub fn serve(
     conn: Box<dyn ConnectionExt<Error = std::io::Error>>,
     process: &Process,
     thread: &mut Thread,
-    host: &dyn HostOs,
 ) -> Result<Session, String> {
     use gdbstub::stub::{DisconnectReason, GdbStub};
-    let mut target = Debuggee::new(process, thread, host);
+    let mut target = Debuggee::new(process, thread);
     let reason =
         GdbStub::new(conn).run_blocking::<EventLoop<'_>>(&mut target).map_err(|e| e.to_string())?;
     Ok(match reason {

@@ -216,7 +216,7 @@ pub struct Identity {
 /// own thread. Buffers are [`GuestBuf`]s, validated but not borrowed, so no lock is held
 /// while the host blocks.
 #[allow(unused_variables)]
-pub trait HostOs: Sync {
+pub trait HostOs: Send + Sync {
     fn read(&self, fd: i32, buf: GuestBuf) -> SysResult {
         Err(errno::ENOSYS)
     }
@@ -374,8 +374,8 @@ pub enum Flow {
 /// Syscall tracing and one-time warnings for unsupported calls. Shared by all threads.
 #[derive(Default)]
 pub struct SyscallLog {
-    /// Set before the guest starts; read-only afterwards.
-    pub strace: bool,
+    /// Trace every syscall to stderr (set before the guest starts).
+    pub strace: std::sync::atomic::AtomicBool,
     warned: Mutex<HashSet<u64>>,
 }
 
@@ -459,13 +459,14 @@ fn put(p: &Process, addr: u64, bytes: &[u8]) -> Result<(), i32> {
 
 /// Handle the `ecall` at `t.cpu.pc`: read the request from the thread's registers, perform
 /// it, write the result to `a0`, and advance past the `ecall`.
-pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
+pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
+    let host = &*p.host;
     let nr = t.cpu.x[17];
     let a: [u64; 6] = std::array::from_fn(|i| t.cpu.x[10 + i]);
 
     let result = match nr {
         nr::EXIT | nr::EXIT_GROUP => {
-            if p.log.strace {
+            if p.log.strace.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("[rvrun {}] {}({}) = ?", t.tid, name(nr).unwrap(), a[0] as i32);
             }
             let status = a[0] as i32 & 0xff;
@@ -481,7 +482,7 @@ pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
             let to_self = target == pid || (nr == nr::KILL && target == 0);
             match signal_to_self(to_self, sig) {
                 Some(sig) => {
-                    if p.log.strace {
+                    if p.log.strace.load(std::sync::atomic::Ordering::Relaxed) {
                         eprintln!(
                             "[rvrun {}] {}(..., {sig}) = ? (fatal)",
                             t.tid,
@@ -494,10 +495,10 @@ pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
                 None => host.kill(target as i32, sig),
             }
         }
-        _ => call(p, t, host, nr, a),
+        _ => call(p, t, nr, a),
     };
 
-    if p.log.strace {
+    if p.log.strace.load(std::sync::atomic::Ordering::Relaxed) {
         let ret = match result {
             Ok(v) => format!("{v:#x}"),
             Err(e) => format!("-{e} ({})", errno_name(e)),
@@ -521,7 +522,8 @@ pub fn dispatch(p: &Process, t: &mut Thread, host: &dyn HostOs) -> Flow {
     Flow::Continue
 }
 
-fn call(p: &Process, t: &mut Thread, host: &dyn HostOs, nr: u64, a: [u64; 6]) -> SysResult {
+fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
+    let host = &*p.host;
     let fd = a[0] as i32;
     let buf = |addr, len, need| p.mem.host_buf(addr, len, need).map_err(efault);
     let cstr = |addr| p.mem.read_cstr(addr, PATH_MAX).map_err(efault);

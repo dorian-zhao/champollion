@@ -26,7 +26,7 @@ use crate::engine::Engine;
 use crate::interpreter::Trap;
 use crate::jit::Jit;
 use crate::loader::{self, LoadError, StackInit, auxv};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::memory::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Prot};
 use crate::syscall::{self, Flow, HostOs, SysResult, SyscallLog, errno};
@@ -94,6 +94,8 @@ impl Exit {
 
 pub struct Process {
     pub mem: GuestMemory,
+    /// The host the guest's syscalls go to.
+    pub host: Arc<dyn HostOs>,
     brk: Mutex<Brk>,
     pub log: SyscallLog,
     /// Absolute path of the executable, for `/proc/self/exe`.
@@ -130,8 +132,8 @@ impl Process {
         argv: &[Vec<u8>],
         envp: &[Vec<u8>],
         execfn: &[u8],
-        host: &dyn HostOs,
-    ) -> Result<(Self, Thread), SpawnError> {
+        host: Arc<dyn HostOs>,
+    ) -> Result<(Arc<Self>, Thread), SpawnError> {
         let mut elf = loader::parse(file).map_err(SpawnError::Load)?;
         if elf.pie {
             elf.relocate(PIE_BASE);
@@ -176,7 +178,7 @@ impl Process {
                 .map_or_else(|_| execfn.to_vec(), |p| p.into_os_string().into_vec())
         };
         let brk = Mutex::new(Brk { start: brk, cur: brk });
-        let process = Self { mem, brk, log: SyscallLog::default(), exe };
+        let process = Arc::new(Self { mem, host, brk, log: SyscallLog::default(), exe });
         Ok((
             process,
             Thread { cpu, tid: id.pid, clear_child_tid: 0, engine: Engine::new(), jit: None },
@@ -187,7 +189,7 @@ impl Process {
     ///
     /// Until `clone` arrives (M5) the main thread is the only one, so `exit` ends the
     /// process too; afterwards the process ends when its last thread exits.
-    pub fn run(&self, thread: &mut Thread, host: &dyn HostOs) -> Exit {
+    pub fn run(&self, thread: &mut Thread) -> Exit {
         loop {
             let trap = match &mut thread.jit {
                 Some(jit) => jit.run(&mut thread.cpu, &self.mem),
@@ -197,7 +199,7 @@ impl Process {
                 },
             };
             match trap {
-                Trap::Ecall { .. } => match syscall::dispatch(self, thread, host) {
+                Trap::Ecall { .. } => match syscall::dispatch(self, thread) {
                     Flow::Continue => {}
                     Flow::ExitThread(status) | Flow::ExitGroup(status) => {
                         return Exit::Status(status);
@@ -438,9 +440,10 @@ mod tests {
         }
     }
 
-    fn spawn() -> (Process, Thread, FakeHost) {
-        let host = FakeHost::default();
-        let (p, t) = Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", &host).unwrap();
+    fn spawn() -> (Arc<Process>, Thread, Arc<FakeHost>) {
+        let host = Arc::new(FakeHost::default());
+        let (p, t) =
+            Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", host.clone()).unwrap();
         (p, t, host)
     }
 
@@ -484,27 +487,27 @@ mod tests {
     #[test]
     fn mmap_anonymous() {
         let (p, _, h) = spawn();
-        let a = p.mmap(&h, 0, 100, RW, PRIVATE_ANON, -1, 0).unwrap();
+        let a = p.mmap(&*h, 0, 100, RW, PRIVATE_ANON, -1, 0).unwrap();
         assert!(a % P == 0 && a + P <= MMAP_TOP);
-        let b = p.mmap(&h, 0, 2 * P, 1, PRIVATE_ANON, -1, 0).unwrap();
+        let b = p.mmap(&*h, 0, 2 * P, 1, PRIVATE_ANON, -1, 0).unwrap();
         assert!(b + 2 * P <= a, "allocations go top-down without overlap");
         p.mem.write(a + 99, &[1]).unwrap();
         assert!(p.mem.write(b, &[1]).is_err(), "PROT_READ is enforced");
 
         // A free hint is honored; MAP_FIXED replaces; MAP_FIXED_NOREPLACE refuses.
         let hint = 0x2000_0000;
-        assert_eq!(p.mmap(&h, hint, P, RW, PRIVATE_ANON, -1, 0), Ok(hint));
+        assert_eq!(p.mmap(&*h, hint, P, RW, PRIVATE_ANON, -1, 0), Ok(hint));
         p.mem.write(hint, &[7]).unwrap();
-        assert_eq!(p.mmap(&h, hint, P, RW, PRIVATE_ANON | 0x10, -1, 0), Ok(hint));
+        assert_eq!(p.mmap(&*h, hint, P, RW, PRIVATE_ANON | 0x10, -1, 0), Ok(hint));
         let mut v = [9u8];
         p.mem.read(hint, &mut v).unwrap();
         assert_eq!(v, [0]);
-        assert_eq!(p.mmap(&h, hint, P, RW, PRIVATE_ANON | 0x10_0000, -1, 0), Err(errno::EEXIST));
+        assert_eq!(p.mmap(&*h, hint, P, RW, PRIVATE_ANON | 0x10_0000, -1, 0), Err(errno::EEXIST));
 
-        assert_eq!(p.mmap(&h, 0, 0, RW, PRIVATE_ANON, -1, 0), Err(errno::EINVAL));
-        assert_eq!(p.mmap(&h, 0, P, RW, 0x20, -1, 0), Err(errno::EINVAL), "no SHARED/PRIVATE");
-        assert_eq!(p.mmap(&h, 0, P, RW, PRIVATE_ANON, -1, 1), Err(errno::EINVAL));
-        assert_eq!(p.mmap(&h, 0x1001, P, RW, PRIVATE_ANON | 0x10, -1, 0), Err(errno::EINVAL));
+        assert_eq!(p.mmap(&*h, 0, 0, RW, PRIVATE_ANON, -1, 0), Err(errno::EINVAL));
+        assert_eq!(p.mmap(&*h, 0, P, RW, 0x20, -1, 0), Err(errno::EINVAL), "no SHARED/PRIVATE");
+        assert_eq!(p.mmap(&*h, 0, P, RW, PRIVATE_ANON, -1, 1), Err(errno::EINVAL));
+        assert_eq!(p.mmap(&*h, 0x1001, P, RW, PRIVATE_ANON | 0x10, -1, 0), Err(errno::EINVAL));
     }
 
     #[test]
@@ -522,7 +525,7 @@ mod tests {
     #[test]
     fn munmap_and_mprotect() {
         let (p, _, h) = spawn();
-        let a = p.mmap(&h, 0, 3 * P, RW, PRIVATE_ANON, -1, 0).unwrap();
+        let a = p.mmap(&*h, 0, 3 * P, RW, PRIVATE_ANON, -1, 0).unwrap();
         assert_eq!(p.munmap(a + P, P), Ok(0));
         assert!(p.mem.write(a + P, &[1]).is_err());
         p.mem.write(a + 2 * P, &[1]).unwrap();
@@ -535,13 +538,13 @@ mod tests {
     #[test]
     fn dispatch_reads_registers_and_writes_result() {
         let (p, mut t, h) = spawn();
-        let buf = p.mmap(&h, 0, P, RW, PRIVATE_ANON, -1, 0).unwrap();
+        let buf = p.mmap(&*h, 0, P, RW, PRIVATE_ANON, -1, 0).unwrap();
         p.mem.write(buf, b"hi").unwrap();
         let pc = t.cpu.pc;
 
         t.cpu.x[17] = nr::WRITE;
         t.cpu.x[10..13].copy_from_slice(&[1, buf, 2]);
-        assert_eq!(dispatch(&p, &mut t, &h), Flow::Continue);
+        assert_eq!(dispatch(&p, &mut t), Flow::Continue);
         assert_eq!(*h.out.lock().unwrap(), b"hi");
         assert_eq!(t.cpu.x[10], 2);
         assert_eq!(t.cpu.pc, pc + 4);
@@ -549,17 +552,17 @@ mod tests {
         // Bad pointer -> -EFAULT; unknown syscall -> -ENOSYS.
         t.cpu.x[17] = nr::WRITE;
         t.cpu.x[10..13].copy_from_slice(&[1, 0x10, 2]);
-        dispatch(&p, &mut t, &h);
+        dispatch(&p, &mut t);
         assert_eq!(t.cpu.x[10] as i64, -(errno::EFAULT as i64));
         t.cpu.x[17] = 4000;
-        dispatch(&p, &mut t, &h);
+        dispatch(&p, &mut t);
         assert_eq!(t.cpu.x[10] as i64, -(errno::ENOSYS as i64));
 
         // Exit statuses are masked to 8 bits; exit ends a thread, exit_group the process.
         t.cpu.x[17] = nr::EXIT_GROUP;
         t.cpu.x[10] = 0x1_01;
-        assert_eq!(dispatch(&p, &mut t, &h), Flow::ExitGroup(1));
+        assert_eq!(dispatch(&p, &mut t), Flow::ExitGroup(1));
         t.cpu.x[17] = nr::EXIT;
-        assert_eq!(dispatch(&p, &mut t, &h), Flow::ExitThread(1));
+        assert_eq!(dispatch(&p, &mut t), Flow::ExitThread(1));
     }
 }

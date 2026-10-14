@@ -18,6 +18,7 @@
 
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use champollion_rv::gdb::{self, Session};
 use champollion_rv::host::darwin::DarwinHost;
@@ -54,16 +55,16 @@ fn main() -> ExitCode {
     let envp: Vec<Vec<u8>> =
         std::env::vars_os().map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat()).collect();
 
-    let host = DarwinHost;
-    let (mut proc, mut main_thread) =
-        match Process::spawn(&file, &argv, &envp, path.as_bytes(), &host) {
+    let (proc, mut main_thread) =
+        match Process::spawn(&file, &argv, &envp, path.as_bytes(), Arc::new(DarwinHost)) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("rvrun: {}: cannot load: {e:?}", path.to_string_lossy());
                 return ExitCode::from(126);
             }
         };
-    proc.log.strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
+    let strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
+    proc.log.strace.store(strace, std::sync::atomic::Ordering::Relaxed);
     let cache = CodeCache::new(&file);
     if std::env::var_os("RVRUN_JIT").is_none_or(|v| v != "0") {
         match champollion_rv::jit::Jit::new() {
@@ -82,10 +83,10 @@ fn main() -> ExitCode {
 
     let start = std::time::Instant::now();
     let exit = match gdb_port {
-        None => proc.run(&mut main_thread, &host),
-        Some(port) => match debug(port, &proc, &mut main_thread, &host) {
+        None => proc.run(&mut main_thread),
+        Some(port) => match debug(port, &proc, &mut main_thread) {
             Ok(Session::Exited(exit)) => exit,
-            Ok(Session::Detached) => proc.run(&mut main_thread, &host),
+            Ok(Session::Detached) => proc.run(&mut main_thread),
             Ok(Session::Killed) => return ExitCode::from(128 + 9),
             Err(e) => {
                 eprintln!("rvrun: gdb: {e}");
@@ -132,14 +133,13 @@ fn debug(
     port: u16,
     proc: &Process,
     thread: &mut champollion_rv::process::Thread,
-    host: &DarwinHost,
 ) -> Result<Session, String> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     eprintln!("rvrun: waiting for a debugger on 127.0.0.1:{port} (gdb: target remote :{port})");
     let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
-    gdb::serve(Box::new(stream), proc, thread, host)
+    gdb::serve(Box::new(stream), proc, thread)
 }
 
 /// Where a program's translations are kept between runs (see `champollion_rv::jit::persist`).
