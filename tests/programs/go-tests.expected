@@ -1,0 +1,5 @@
+goroutines: 100 164177475000
+timers: ticked true
+gc: maps 1000 key0 key999 50
+files: 100 1 f.txt
+tcp: echo: HELLO OVER TCP

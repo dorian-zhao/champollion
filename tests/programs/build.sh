@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build real programs (lua, sqlite3) as static riscv64-linux-musl executables into
+# Build real programs (lua, sqlite3, a Rust test crate, a Go program) as static riscv64
+# Linux executables into
 # tests/fixtures/programs/, and generate each test script's expected output by running the
 # same source built natively. Outputs are committed so `cargo test` needs no network or zig.
 #
@@ -51,6 +52,14 @@ for line in sys.stdin:
 )
 llvm_strip=/opt/homebrew/opt/llvm/bin/llvm-strip
 [ -x "$llvm_strip" ] && "$llvm_strip" "$out/rust-tests"
+
+# A Go program (the Go runtime: many threads, signals, the epoll netpoller), and its
+# expected output from the native build. Needs Go; -trimpath keeps the build reproducible.
+(
+    cd "$here/go-tests"
+    CGO_ENABLED=0 GOOS=linux GOARCH=riscv64 go build -trimpath -ldflags="-s -w" -o "$out/go-tests" .
+    go run . > "$here/go-tests.expected"
+)
 
 # Expected outputs. Scripts must be deterministic (no clocks, no randomness).
 for script in "$here"/*.lua; do

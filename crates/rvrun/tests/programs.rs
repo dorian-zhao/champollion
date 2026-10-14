@@ -67,6 +67,14 @@ fn code_cache_reuses_translations() {
 }
 
 #[test]
+fn go() {
+    // The Go runtime: goroutines on many threads, async preemption by signals, timers,
+    // the garbage collector, files, and loopback TCP through the epoll netpoller.
+    let out = rvrun(&[path("fixtures/programs/go-tests").as_os_str()], b"");
+    assert_matches_native(&out, "programs/go-tests.expected");
+}
+
+#[test]
 fn lua() {
     let script = path("programs/basics.lua");
     let out = rvrun(&[path("fixtures/programs/lua").as_os_str(), script.as_os_str()], b"");
