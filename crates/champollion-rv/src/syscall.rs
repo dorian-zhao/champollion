@@ -31,7 +31,10 @@ pub mod errno {
     pub const ENOTTY: i32 = 25;
     pub const ESRCH: i32 = 3;
     pub const ERANGE: i32 = 34;
+    pub const ENAMETOOLONG: i32 = 36;
     pub const ENOSYS: i32 = 38;
+    pub const ENOPROTOOPT: i32 = 92;
+    pub const EAFNOSUPPORT: i32 = 97;
     pub const ETIMEDOUT: i32 = 110;
 }
 
@@ -142,6 +145,7 @@ syscalls! {
     MMAP = 222 "mmap",
     MPROTECT = 226 "mprotect",
     MADVISE = 233 "madvise",
+    ACCEPT4 = 242 "accept4",
     WAIT4 = 260 "wait4",
     RISCV_HWPROBE = 258 "riscv_hwprobe",
     RISCV_FLUSH_ICACHE = 259 "riscv_flush_icache",
@@ -252,6 +256,47 @@ pub trait HostOs: Send + Sync {
         Err(errno::ENOSYS)
     }
 
+    // Sockets. Addresses are Linux `sockaddr` bytes, flags Linux values.
+    fn socket(&self, domain: i32, ty: i32, protocol: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn socketpair(&self, domain: i32, ty: i32, protocol: i32) -> Result<[i32; 2], i32> {
+        Err(errno::ENOSYS)
+    }
+    fn bind(&self, fd: i32, addr: &[u8]) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn connect(&self, fd: i32, addr: &[u8]) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn listen(&self, fd: i32, backlog: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// The new socket and its peer's address.
+    fn accept4(&self, fd: i32, flags: i32) -> Result<(u64, Vec<u8>), i32> {
+        Err(errno::ENOSYS)
+    }
+    /// `getsockname`, or `getpeername` if `peer`.
+    fn sockname(&self, fd: i32, peer: bool) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    fn setsockopt(&self, fd: i32, level: i32, name: i32, value: &[u8]) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// The option's value, at most `len` bytes.
+    fn getsockopt(&self, fd: i32, level: i32, name: i32, len: usize) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    fn sendmsg(&self, fd: i32, to: Option<&[u8]>, bufs: &[GuestBuf], flags: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Bytes received, the sender's address (if any), and the message flags.
+    fn recvmsg(&self, fd: i32, bufs: &[GuestBuf], flags: i32) -> Result<(u64, Vec<u8>, i32), i32> {
+        Err(errno::ENOSYS)
+    }
+    fn shutdown(&self, fd: i32, how: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
     fn write(&self, fd: i32, buf: GuestBuf) -> SysResult {
         Err(errno::ENOSYS)
     }
@@ -814,6 +859,89 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(ready.len() as u64)
         }
         nr::RISCV_HWPROBE => hwprobe(p, a),
+        nr::SOCKET => host.socket(a[0] as i32, a[1] as i32, a[2] as i32),
+        nr::SOCKETPAIR => {
+            let [s0, s1] = host.socketpair(a[0] as i32, a[1] as i32, a[2] as i32)?;
+            let mut b = s0.to_le_bytes().to_vec();
+            b.extend(s1.to_le_bytes());
+            if let Err(e) = put(p, a[3], &b) {
+                let _ = (host.close(s0), host.close(s1));
+                return Err(e);
+            }
+            Ok(0)
+        }
+        nr::BIND | nr::CONNECT => {
+            let addr = read_sockaddr(p, a[1], a[2])?;
+            if nr == nr::BIND { host.bind(fd, &addr) } else { host.connect(fd, &addr) }
+        }
+        nr::LISTEN => host.listen(fd, a[1] as i32),
+        nr::ACCEPT | nr::ACCEPT4 => {
+            let flags = if nr == nr::ACCEPT4 { a[3] as i32 } else { 0 };
+            let (new, addr) = host.accept4(fd, flags)?;
+            if let Err(e) = put_sockaddr(p, a[1], a[2], &addr) {
+                let _ = host.close(new as i32);
+                return Err(e);
+            }
+            Ok(new)
+        }
+        nr::GETSOCKNAME | nr::GETPEERNAME => {
+            let addr = host.sockname(fd, nr == nr::GETPEERNAME)?;
+            put_sockaddr(p, a[1], a[2], &addr)?;
+            Ok(0)
+        }
+        nr::SETSOCKOPT => {
+            let mut value = vec![0u8; (a[4] as usize).min(256)];
+            p.mem.read(a[3], &mut value).map_err(efault)?;
+            host.setsockopt(fd, a[1] as i32, a[2] as i32, &value)
+        }
+        nr::GETSOCKOPT => {
+            let mut len = [0u8; 4];
+            p.mem.read(a[4], &mut len).map_err(efault)?;
+            let len = u32::from_le_bytes(len) as usize;
+            let value = host.getsockopt(fd, a[1] as i32, a[2] as i32, len)?;
+            let n = value.len().min(len);
+            put(p, a[3], &value[..n])?;
+            put(p, a[4], &(n as u32).to_le_bytes())?;
+            Ok(0)
+        }
+        nr::SENDTO => {
+            let to = if a[4] != 0 { Some(read_sockaddr(p, a[4], a[5])?) } else { None };
+            host.sendmsg(fd, to.as_deref(), &[buf(a[1], a[2], Prot::READ)?], a[3] as i32)
+        }
+        nr::RECVFROM => {
+            let (n, from, _) = host.recvmsg(fd, &[buf(a[1], a[2], Prot::WRITE)?], a[3] as i32)?;
+            put_sockaddr(p, a[4], a[5], &from)?;
+            Ok(n)
+        }
+        nr::SENDMSG | nr::RECVMSG => {
+            // struct msghdr: name, namelen (u32, padded), iov, iovlen, control,
+            // controllen, flags. Ancillary data (e.g. SCM_RIGHTS) is not supported.
+            let mut m = [0u8; 56];
+            p.mem.read(a[1], &mut m).map_err(efault)?;
+            let word = |i: usize| u64::from_le_bytes(m[i..i + 8].try_into().unwrap());
+            let (name, namelen) = (word(0), u32::from_le_bytes(m[8..12].try_into().unwrap()));
+            let need = if nr == nr::SENDMSG { Prot::READ } else { Prot::WRITE };
+            let bufs = read_iovec(p, word(16), word(24))?
+                .into_iter()
+                .map(|(base, len)| buf(base, len, need))
+                .collect::<Result<Vec<_>, _>>()?;
+            if nr == nr::SENDMSG {
+                let to =
+                    if name != 0 { Some(read_sockaddr(p, name, namelen as u64)?) } else { None };
+                host.sendmsg(fd, to.as_deref(), &bufs, a[2] as i32)
+            } else {
+                let (n, from, flags) = host.recvmsg(fd, &bufs, a[2] as i32)?;
+                if name != 0 {
+                    let len = from.len().min(namelen as usize);
+                    put(p, name, &from[..len])?;
+                    put(p, a[1] + 8, &(from.len() as u32).to_le_bytes())?;
+                }
+                put(p, a[1] + 40, &0u64.to_le_bytes())?; // msg_controllen
+                put(p, a[1] + 48, &flags.to_le_bytes())?;
+                Ok(n)
+            }
+        }
+        nr::SHUTDOWN => host.shutdown(fd, a[1] as i32),
         nr::GETDENTS64 => {
             p.mem.host_buf(a[1], a[2], Prot::WRITE).map_err(efault)?;
             let records = host.getdents64(fd, a[2] as usize)?;
@@ -1066,6 +1194,30 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
 }
 
 /// Read a guest `struct iovec` array as `(base, len)` pairs.
+/// A `sockaddr` of `len` bytes from the guest.
+fn read_sockaddr(p: &Process, addr: u64, len: u64) -> Result<Vec<u8>, i32> {
+    if len > 128 {
+        return Err(errno::EINVAL);
+    }
+    let mut b = vec![0u8; len as usize];
+    p.mem.read(addr, &mut b).map_err(efault)?;
+    Ok(b)
+}
+
+/// Return a `sockaddr` the way the kernel does: into the buffer at `addr` whose size is
+/// the u32 at `len_ptr` (truncated if short), then the full size into `*len_ptr`. Nothing
+/// if `addr` is null.
+fn put_sockaddr(p: &Process, addr: u64, len_ptr: u64, sockaddr: &[u8]) -> Result<(), i32> {
+    if addr == 0 {
+        return Ok(());
+    }
+    let mut len = [0u8; 4];
+    p.mem.read(len_ptr, &mut len).map_err(efault)?;
+    let room = u32::from_le_bytes(len) as usize;
+    put(p, addr, &sockaddr[..sockaddr.len().min(room)])?;
+    put(p, len_ptr, &(sockaddr.len() as u32).to_le_bytes())
+}
+
 fn read_iovec(p: &Process, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, i32> {
     if count > IOV_MAX {
         return Err(errno::EINVAL);

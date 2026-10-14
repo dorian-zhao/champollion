@@ -6,3 +6,5 @@ pub mod darwin;
 mod dirs;
 #[cfg(target_os = "macos")]
 mod kqueue;
+#[cfg(target_os = "macos")]
+mod socket;

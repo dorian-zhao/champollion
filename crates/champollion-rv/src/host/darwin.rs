@@ -271,6 +271,78 @@ impl HostOs for DarwinHost {
         self.dirs.getdents64(fd, max)
     }
 
+    fn socket(&self, domain: i32, ty: i32, protocol: i32) -> SysResult {
+        super::socket::socket(domain, ty, protocol)
+    }
+
+    fn socketpair(&self, domain: i32, ty: i32, protocol: i32) -> Result<[i32; 2], i32> {
+        super::socket::socketpair(domain, ty, protocol)
+    }
+
+    fn bind(&self, fd: i32, addr: &[u8]) -> SysResult {
+        super::socket::bind(fd, addr)
+    }
+
+    fn connect(&self, fd: i32, addr: &[u8]) -> SysResult {
+        super::socket::connect(fd, addr)
+    }
+
+    fn listen(&self, fd: i32, backlog: i32) -> SysResult {
+        // SAFETY: plain syscall.
+        check(unsafe { libc::listen(fd, backlog) } as isize)
+    }
+
+    fn accept4(&self, fd: i32, flags: i32) -> Result<(u64, Vec<u8>), i32> {
+        super::socket::accept4(fd, flags)
+    }
+
+    fn sockname(&self, fd: i32, peer: bool) -> Result<Vec<u8>, i32> {
+        super::socket::name(fd, peer)
+    }
+
+    fn setsockopt(&self, fd: i32, level: i32, name: i32, value: &[u8]) -> SysResult {
+        super::socket::setsockopt(fd, level, name, value)
+    }
+
+    fn getsockopt(&self, fd: i32, level: i32, name: i32, len: usize) -> Result<Vec<u8>, i32> {
+        super::socket::getsockopt(fd, level, name, len)
+    }
+
+    fn sendmsg(&self, fd: i32, to: Option<&[u8]>, bufs: &[GuestBuf], flags: i32) -> SysResult {
+        let addr = to.map(super::socket::to_darwin).transpose()?;
+        // SAFETY: GuestBuf is layout-compatible with iovec; the kernel validates buffers.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        if let Some((ss, len)) = &addr {
+            msg.msg_name = (ss as *const libc::sockaddr_storage).cast_mut().cast();
+            msg.msg_namelen = *len;
+        }
+        msg.msg_iov = bufs.as_ptr().cast_mut().cast();
+        msg.msg_iovlen = bufs.len() as i32;
+        check(unsafe { libc::sendmsg(fd, &msg, super::socket::msg_flags_in(flags)) })
+    }
+
+    fn recvmsg(&self, fd: i32, bufs: &[GuestBuf], flags: i32) -> Result<(u64, Vec<u8>, i32), i32> {
+        // SAFETY: as in `sendmsg`, receiving the address into a local storage.
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = (&raw mut ss).cast();
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msg.msg_iov = bufs.as_ptr().cast_mut().cast();
+        msg.msg_iovlen = bufs.len() as i32;
+        let n = check(unsafe { libc::recvmsg(fd, &mut msg, super::socket::msg_flags_in(flags)) })?;
+        let from = if msg.msg_namelen > 0 {
+            super::socket::to_linux(&ss, msg.msg_namelen)
+        } else {
+            Vec::new()
+        };
+        Ok((n, from, super::socket::msg_flags_out(msg.msg_flags)))
+    }
+
+    fn shutdown(&self, fd: i32, how: i32) -> SysResult {
+        // SAFETY: plain syscall (SHUT_RD/WR/RDWR agree).
+        check(unsafe { libc::shutdown(fd, how) } as isize)
+    }
+
     fn read(&self, fd: i32, buf: GuestBuf) -> SysResult {
         if let Some(r) = self.eventfds.read(fd, buf) {
             return r;
