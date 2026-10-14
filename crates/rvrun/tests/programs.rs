@@ -100,9 +100,9 @@ fn sqlite_on_disk() {
 #[test]
 fn rust_unit_tests() {
     // A static-PIE Rust test binary, run the way `cargo test` does with rvrun as the
-    // runner. libtest falls back to the main thread while clone is unsupported (M5).
+    // runner, so libtest runs the tests on threads in parallel.
     let out = rvrun(&[path("fixtures/programs/rust-tests").as_os_str()], b"");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("test result: ok. 4 passed; 0 failed"), "{stdout}");
+    assert!(stdout.contains("test result: ok. 5 passed; 0 failed"), "{stdout}");
 }

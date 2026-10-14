@@ -165,6 +165,8 @@ struct Brk {
 pub struct Thread {
     pub cpu: CpuState,
     pub tid: u32,
+    /// `prctl(PR_SET_NAME)`: up to 15 bytes, NUL-padded.
+    pub name: [u8; 16],
     /// Set by `set_tid_address`; on thread exit the kernel zeroes it and wakes futex
     /// waiters (M5, for `pthread_join`).
     pub clear_child_tid: u64,
@@ -247,7 +249,14 @@ impl Process {
         });
         Ok((
             process,
-            Thread { cpu, tid: id.pid, clear_child_tid: 0, engine: Engine::new(), jit: None },
+            Thread {
+                cpu,
+                tid: id.pid,
+                name: *b"rvrun\0\0\0\0\0\0\0\0\0\0\0",
+                clear_child_tid: 0,
+                engine: Engine::new(),
+                jit: None,
+            },
         ))
     }
 
@@ -272,13 +281,15 @@ impl Process {
         &self,
         cpu: CpuState,
         tid: u32,
+        name: [u8; 16],
         clear_child_tid: u64,
     ) -> std::io::Result<()> {
         let this = self.this.upgrade().expect("a running process is alive");
         std::thread::Builder::new().name(format!("guest thread {tid}")).stack_size(4 << 20).spawn(
             move || {
                 let jit = if this.jit.load(Ordering::Relaxed) { Jit::new().ok() } else { None };
-                let mut thread = Thread { cpu, tid, clear_child_tid, engine: Engine::new(), jit };
+                let mut thread =
+                    Thread { cpu, tid, name, clear_child_tid, engine: Engine::new(), jit };
                 match this.run_thread(&mut thread) {
                     End::Thread(status) => this.thread_exited(&thread, status),
                     End::Process(exit) => std::process::exit(exit.report(&thread.cpu).into()),

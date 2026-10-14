@@ -1,10 +1,69 @@
 //! Exercises Rust std on riscv64 Linux under rvrun: allocation, collections, formatting,
-//! floats, panics caught by the test harness, files, and the environment.
+//! floats, panics caught by the test harness, files, the environment, and threads.
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::io::{Read, Write};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+    use std::thread;
+
+    #[test]
+    fn threads() {
+        // Spawn and join, with names and results.
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                thread::Builder::new()
+                    .name(format!("worker-{i}"))
+                    .spawn(move || (thread::current().name().unwrap().to_string(), i * i))
+                    .unwrap()
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results[3], ("worker-3".to_string(), 9));
+
+        // Shared state under a mutex, a barrier, scoped threads borrowing the stack.
+        let total = Mutex::new(0u64);
+        let barrier = Barrier::new(4);
+        thread::scope(|s| {
+            for i in 0..4u64 {
+                let (total, barrier) = (&total, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10_000 {
+                        *total.lock().unwrap() += i;
+                    }
+                });
+            }
+        });
+        assert_eq!(*total.lock().unwrap(), 60_000);
+
+        // Channels, a condition variable, park/unpark, and a panicking thread.
+        let (tx, rx) = mpsc::channel();
+        for i in 0..8 {
+            let tx = tx.clone();
+            thread::spawn(move || tx.send(i).unwrap());
+        }
+        drop(tx);
+        assert_eq!(rx.iter().sum::<i32>(), 28);
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let pair2 = pair.clone();
+        let main = thread::current();
+        let t = thread::spawn(move || {
+            *pair2.0.lock().unwrap() = true;
+            pair2.1.notify_one();
+            main.unpark();
+        });
+        let mut ready = pair.0.lock().unwrap();
+        while !*ready {
+            ready = pair.1.wait(ready).unwrap();
+        }
+        drop(ready);
+        thread::park_timeout(std::time::Duration::from_secs(5));
+        t.join().unwrap();
+        assert!(thread::spawn(|| panic!("in a thread")).join().is_err());
+        assert!(thread::available_parallelism().unwrap().get() >= 1);
+    }
 
     #[test]
     fn collections() {

@@ -104,6 +104,7 @@ syscalls! {
     UNAME = 160 "uname",
     GETRUSAGE = 165 "getrusage",
     UMASK = 166 "umask",
+    PRCTL = 167 "prctl",
     GETPID = 172 "getpid",
     GETPPID = 173 "getppid",
     GETUID = 174 "getuid",
@@ -489,7 +490,7 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
     let started = set(CLONE_PARENT_SETTID, parent_tid)
         .and_then(|()| set(CLONE_CHILD_SETTID, child_tid))
-        .and_then(|()| p.start_thread(cpu, tid, clear).map_err(|_| errno::EAGAIN));
+        .and_then(|()| p.start_thread(cpu, tid, t.name, clear).map_err(|_| errno::EAGAIN));
     if let Err(e) = started {
         p.forget_tid();
         return Err(e);
@@ -831,6 +832,24 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 put(p, a[0] + i as u64 * 8 + 6, &f.revents.to_le_bytes())?;
             }
             Ok(n)
+        }
+        nr::PRCTL => {
+            // Thread names (libtest and std name their threads); the rest are unsupported.
+            const PR_SET_NAME: u64 = 15;
+            const PR_GET_NAME: u64 = 16;
+            match a[0] {
+                PR_SET_NAME => {
+                    let mut name = [0u8; 16];
+                    let s = p.mem.read_cstr(a[1], 4096).map_err(efault)?;
+                    let s = s.as_bytes();
+                    let n = s.len().min(15);
+                    name[..n].copy_from_slice(&s[..n]);
+                    t.name = name;
+                    Ok(0)
+                }
+                PR_GET_NAME => put(p, a[1], &t.name).map(|()| 0),
+                _ => Err(errno::EINVAL),
+            }
         }
         nr::SCHED_YIELD => {
             std::thread::yield_now();
