@@ -272,6 +272,17 @@ The interpreter comes before the JIT and is kept forever, because JIT bugs usual
 3. **JIT vs. interpreter:** riscv-tests run on the interpreter, the engine, and the JIT, which must end in identical `CpuState`. `jit::tests::fuzz` generates random looping programs (integer, M, A, and F/D instructions, accesses through moving base registers, branches, direct and indirect jumps) and compares traps, the whole CPU state, and memory between the interpreter, the JIT, and the JIT running restored translations; `FUZZ_CASES` and `FUZZ_SEED` run longer campaigns. Its first run found a wrong `divuw` by x0.
 4. **Real programs:** static builds of busybox, lua, and sqlite, with output compared against QEMU.
 
+## Known Gaps
+
+Things route B does not do yet, roughly by how likely a program is to notice.
+
+- **Dynamically linked programs get no persistent code cache.** Mapping libraries changes executable mappings, which drops translations and disables saving; CPython pays its startup translation on every run (about 0.2 s for `python3 -c pass`). The cache key would have to cover every mapped library.
+- **The software TLB races `munmap`.** The engine (`RVRUN_JIT=0`) and the JIT's instruction fetch for translation trust a TLB entry without the mapping lock; if another thread unmaps that page meanwhile, the host access faults outside generated code and rvrun crashes. `munmap` should wait until every running thread has seen the new generation before decommitting (see [Performance boundary](#performance-boundary)).
+- **Realtime signals do not queue.** Each signal has at most one pending instance, as standard signals do; `sigqueue` payloads are not delivered.
+- **Only `ITIMER_REAL`.** The CPU-time timers (`ITIMER_VIRTUAL`, `ITIMER_PROF`) and POSIX `timer_create` are missing.
+- **Startup grew by about 0.5 ms** (3.4 ms for a static hello, native 1.9 ms), mostly the host signal thread.
+- **Memory protection is coarser in generated code** (16 KiB host pages, aliasing above 2^38); see [Performance boundary](#performance-boundary).
+
 ## Open Questions
 
 - Crate name is `champollion-rv` (crates.io: no existing crate as of Oct 13, 2026); CLI is `rvrun`.
