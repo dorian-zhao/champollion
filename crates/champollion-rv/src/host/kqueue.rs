@@ -179,6 +179,36 @@ pub fn epoll_wait(epfd: i32, max: usize, timeout_ms: i32) -> Result<Vec<(u32, u6
     Ok(events.into_iter().map(|(_, ev, data)| (ev, data)).collect())
 }
 
+/// `pidfd_open`: a kqueue watching `pid` for its exit. Like a pidfd, it polls readable once
+/// the process has exited (only polling is supported, not `pidfd_send_signal`).
+pub fn pidfd_open(pid: i32, flags: u32) -> SysResult {
+    const PIDFD_NONBLOCK: u32 = linux::NONBLOCK as u32;
+    if pid <= 0 || flags & !PIDFD_NONBLOCK != 0 {
+        return Err(errno::EINVAL);
+    }
+    // SAFETY: plain syscalls on a descriptor we create.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(last_errno());
+    }
+    set_cloexec(kq); // pidfds are always close-on-exec
+    let watch = libc::kevent {
+        ident: pid as usize,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one valid change, no events out.
+    if unsafe { libc::kevent(kq, &watch, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+        let e = last_errno();
+        unsafe { libc::close(kq) };
+        return Err(e);
+    }
+    Ok(kq as u64)
+}
+
 /// Copies between Rust and guest buffers through a pipe, so the kernel does the guest side.
 struct Bounce {
     pipe: Mutex<Option<[i32; 2]>>,

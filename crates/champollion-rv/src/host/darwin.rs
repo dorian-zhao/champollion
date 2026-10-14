@@ -67,6 +67,64 @@ fn linux_signal(sig: i32) -> i32 {
     (1..=31).find(|&l| darwin_signal(l) == Some(sig)).unwrap_or(sig)
 }
 
+/// A Darwin `statfs` as Linux's riscv64 `struct statfs`: type, bsize, blocks, bfree, bavail,
+/// files, ffree (i64 each), fsid (2 x i32), namelen, frsize, flags, spare[4].
+fn linux_statfs(st: &libc::statfs) -> Vec<u8> {
+    // Linux magic numbers for the file system types a Mac has.
+    let fs_type: i64 =
+        match unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) }.to_bytes() {
+            b"apfs" | b"hfs" => 0x1badface, // reported as "other"; there is no Linux magic for APFS
+            b"msdos" => 0x4d44,
+            b"nfs" => 0x6969,
+            b"smbfs" => 0xff534d42u32 as i64,
+            b"devfs" => 0x1373,
+            _ => 0x1badface,
+        };
+    let mut b = Vec::with_capacity(120);
+    for v in [
+        fs_type,
+        st.f_bsize as i64,
+        st.f_blocks as i64,
+        st.f_bfree as i64,
+        st.f_bavail as i64,
+        st.f_files as i64,
+        st.f_ffree as i64,
+    ] {
+        b.extend(v.to_le_bytes());
+    }
+    // SAFETY: fsid_t is two i32s (its field is private in the libc crate).
+    let fsid: [i32; 2] = unsafe { std::mem::transmute(st.f_fsid) };
+    b.extend(fsid[0].to_le_bytes());
+    b.extend(fsid[1].to_le_bytes());
+    for v in [255i64, st.f_bsize as i64, 0, 0, 0, 0, 0] {
+        b.extend(v.to_le_bytes());
+    }
+    b
+}
+
+// Public since macOS 14.4 (<os/os_sync_wait_on_address.h>): futexes that work across
+// processes on shared memory.
+unsafe extern "C" {
+    fn os_sync_wait_on_address(
+        addr: *mut libc::c_void,
+        value: u64,
+        size: usize,
+        flags: u32,
+    ) -> libc::c_int;
+    fn os_sync_wait_on_address_with_timeout(
+        addr: *mut libc::c_void,
+        value: u64,
+        size: usize,
+        flags: u32,
+        clockid: u32,
+        timeout_ns: u64,
+    ) -> libc::c_int;
+    fn os_sync_wake_by_address_any(addr: *mut libc::c_void, size: usize, flags: u32)
+    -> libc::c_int;
+    fn os_sync_wake_by_address_all(addr: *mut libc::c_void, size: usize, flags: u32)
+    -> libc::c_int;
+}
+
 /// Linux `RLIMIT_*` -> Darwin, or `None` for limits Darwin does not have.
 fn darwin_rlimit(resource: u32) -> Option<libc::c_int> {
     Some(match resource {
@@ -268,6 +326,10 @@ impl HostOs for DarwinHost {
         super::kqueue::epoll_wait(epfd, max, timeout_ms)
     }
 
+    fn pidfd_open(&self, pid: i32, flags: u32) -> SysResult {
+        super::kqueue::pidfd_open(pid, flags)
+    }
+
     fn eventfd(&self, initval: u32, flags: i32) -> SysResult {
         self.eventfds.create(initval, flags)
     }
@@ -458,6 +520,80 @@ impl HostOs for DarwinHost {
         check(unsafe { libc::lseek(fd, offset, whence) } as isize)
     }
 
+    fn futex_wait_shared(
+        &self,
+        word: GuestBuf,
+        expected: u32,
+        timeout: Option<std::time::Duration>,
+    ) -> SysResult {
+        const SHARED: u32 = 1; // OS_SYNC_WAIT_ON_ADDRESS_SHARED
+        const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
+        let addr = word.ptr.cast::<u32>();
+        // SAFETY: a validated, aligned guest word; read atomically.
+        let current = unsafe { std::sync::atomic::AtomicU32::from_ptr(addr) }
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if current != expected {
+            return Err(errno::EAGAIN);
+        }
+        // SAFETY: the kernel compares and sleeps on the word; a guest signal interrupts it
+        // with EINTR (see Process::interrupt).
+        let rc = unsafe {
+            match timeout {
+                None => os_sync_wait_on_address(addr.cast(), expected as u64, 4, SHARED),
+                Some(t) => os_sync_wait_on_address_with_timeout(
+                    addr.cast(),
+                    expected as u64,
+                    4,
+                    SHARED,
+                    OS_CLOCK_MACH_ABSOLUTE_TIME,
+                    t.as_nanos().clamp(1, u64::MAX as u128) as u64,
+                ),
+            }
+        };
+        if rc < 0 { Err(last_errno()) } else { Ok(0) }
+    }
+
+    fn futex_wake_shared(&self, word: GuestBuf, count: u32) -> SysResult {
+        const SHARED: u32 = 1; // OS_SYNC_WAKE_BY_ADDRESS_SHARED
+        let addr = word.ptr.cast::<libc::c_void>();
+        if count >= i32::MAX as u32 {
+            // SAFETY: waking by address has no memory effects.
+            unsafe { os_sync_wake_by_address_all(addr, 4, SHARED) };
+            return Ok(0); // the count of woken waiters is not reported for "all"
+        }
+        let mut woken = 0;
+        // SAFETY: as above; ENOENT ends the loop when nobody is left waiting.
+        while woken < count && unsafe { os_sync_wake_by_address_any(addr, 4, SHARED) } == 0 {
+            woken += 1;
+        }
+        Ok(woken as u64)
+    }
+
+    fn bytes_readable(&self, fd: i32) -> SysResult {
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int.
+        check(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) } as isize)?;
+        Ok(n.max(0) as u64)
+    }
+
+    fn statfs(&self, path: &CStr) -> Result<Vec<u8>, i32> {
+        let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: a valid path and out-pointer.
+        check(unsafe { libc::statfs(path.as_ptr(), st.as_mut_ptr()) } as isize)?;
+        // SAFETY: initialized by the successful call.
+        let st = unsafe { st.assume_init() };
+        Ok(linux_statfs(&st))
+    }
+
+    fn fstatfs(&self, fd: i32) -> Result<Vec<u8>, i32> {
+        let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: a valid out-pointer.
+        check(unsafe { libc::fstatfs(fd, st.as_mut_ptr()) } as isize)?;
+        // SAFETY: initialized by the successful call.
+        let st = unsafe { st.assume_init() };
+        Ok(linux_statfs(&st))
+    }
+
     fn fstat(&self, fd: i32) -> Result<Stat, i32> {
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: st is a valid out-pointer.
@@ -520,6 +656,30 @@ impl HostOs for DarwinHost {
     fn pwrite(&self, fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
         // SAFETY: the kernel validates the source.
         check(unsafe { libc::pwrite(fd, buf.ptr.cast(), buf.len, offset) })
+    }
+
+    fn linkat(
+        &self,
+        olddirfd: i32,
+        old: &CStr,
+        newdirfd: i32,
+        new: &CStr,
+        flags: i32,
+    ) -> SysResult {
+        const LINUX_AT_SYMLINK_FOLLOW: i32 = 0x400;
+        if flags & !LINUX_AT_SYMLINK_FOLLOW != 0 {
+            return Err(errno::EINVAL);
+        }
+        let dflags = if flags & LINUX_AT_SYMLINK_FOLLOW != 0 { libc::AT_SYMLINK_FOLLOW } else { 0 };
+        // SAFETY: NUL-terminated paths.
+        check(unsafe {
+            libc::linkat(dirfd(olddirfd), old.as_ptr(), dirfd(newdirfd), new.as_ptr(), dflags)
+        } as isize)
+    }
+
+    fn symlinkat(&self, target: &CStr, newdirfd: i32, new: &CStr) -> SysResult {
+        // SAFETY: NUL-terminated paths.
+        check(unsafe { libc::symlinkat(target.as_ptr(), dirfd(newdirfd), new.as_ptr()) } as isize)
     }
 
     fn unlinkat(&self, fd: i32, path: &CStr, flags: i32) -> SysResult {

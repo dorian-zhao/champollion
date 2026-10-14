@@ -75,12 +75,17 @@ pub enum MapError {
     NotMapped,
     /// No free range of the requested size.
     NoSpace,
+    /// The host refused a shared mapping (with this Linux errno).
+    Host(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Mapping {
     end: u64,
     prot: Prot,
+    /// Backed by a host `MAP_SHARED` mapping (a file or memory shared across fork), not
+    /// by the reservation's private pages.
+    shared: bool,
 }
 
 /// A validated host view of guest memory, for handing to the host kernel. Layout-compatible
@@ -130,7 +135,7 @@ impl Maps {
             if let Some((&start, &m)) = self.0.range(..at).next_back()
                 && m.end > at
             {
-                self.0.insert(start, Mapping { end: at, prot: m.prot });
+                self.0.insert(start, Mapping { end: at, ..m });
                 self.0.insert(at, m);
             }
         }
@@ -139,15 +144,20 @@ impl Maps {
 
     /// The highest free range of `len` bytes that ends at or below `limit`.
     fn find_free(&self, len: u64, limit: u64) -> Result<u64, MapError> {
+        self.find_free_aligned(len, limit, GUEST_PAGE_SIZE)
+    }
+
+    /// Like `find_free`, for a range starting at a multiple of `align`.
+    fn find_free_aligned(&self, len: u64, limit: u64, align: u64) -> Result<u64, MapError> {
         let mut hi = limit.min(GUEST_SIZE) & !(GUEST_PAGE_SIZE - 1);
         // Walk mappings from the top down, looking for a gap of `len` below `hi`.
         for (&start, m) in self.0.range(..hi).rev() {
-            if m.end <= hi && hi - m.end >= len {
-                return Ok(hi - len);
+            if m.end <= hi && hi - m.end >= len && ((hi - len) & !(align - 1)) >= m.end {
+                return Ok((hi - len) & !(align - 1));
             }
             hi = hi.min(start);
         }
-        if hi >= len { Ok(hi - len) } else { Err(MapError::NoSpace) }
+        if hi >= len { Ok((hi - len) & !(align - 1)) } else { Err(MapError::NoSpace) }
     }
 }
 
@@ -369,7 +379,7 @@ impl GuestMemory {
 
     fn insert_locked(&self, maps: &mut Maps, r: Range<u64>, prot: Prot) {
         self.commit_host(r.clone());
-        maps.0.insert(r.start, Mapping { end: r.end, prot });
+        maps.0.insert(r.start, Mapping { end: r.end, prot, shared: false });
         self.changed(prot.contains(Prot::EXEC));
     }
 
@@ -378,9 +388,77 @@ impl GuestMemory {
         for (start, m) in maps.split_out(r) {
             code |= m.prot.contains(Prot::EXEC);
             maps.0.remove(&start);
-            self.release(maps, start..m.end);
+            self.release(maps, start..m.end, m.shared);
         }
         self.changed(code);
+    }
+
+    /// Map host memory shared across processes at a host-page-aligned guest range: a file
+    /// (`Some((fd, offset))`, offset host-page aligned) or anonymous memory that a fork
+    /// shares. At `addr`, replacing what is there, or anywhere below `limit`. The range is
+    /// rounded up to whole host pages, so no other mapping shares them.
+    pub fn map_shared(
+        &self,
+        addr: Option<u64>,
+        len: u64,
+        limit: u64,
+        prot: Prot,
+        file: Option<(i32, u64)>,
+    ) -> Result<u64, MapError> {
+        let hp = self.host_page;
+        let len = len.checked_next_multiple_of(hp).filter(|&l| l != 0).ok_or(MapError::Invalid)?;
+        if file.is_some_and(|(_, offset)| !offset.is_multiple_of(hp)) {
+            return Err(MapError::Invalid);
+        }
+        let mut maps = self.maps_mut();
+        let addr = match addr {
+            Some(a) => {
+                let r = Self::check_range(a, len)?;
+                if !a.is_multiple_of(hp) {
+                    return Err(MapError::Invalid);
+                }
+                self.unmap_locked(&mut maps, r);
+                a
+            }
+            None => maps.find_free_aligned(len, limit, hp)?,
+        };
+        let (flags, fd, offset) = match file {
+            Some((fd, offset)) => (libc::MAP_SHARED, fd, offset as libc::off_t),
+            None => (libc::MAP_SHARED | libc::MAP_ANON, -1, 0),
+        };
+        // SAFETY: replaces whole host pages of our own reservation, which no other mapping
+        // uses (they are free, or were just unmapped).
+        let rc = unsafe {
+            libc::mmap(
+                self.base.add(addr as usize).cast(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags | libc::MAP_FIXED,
+                fd,
+                offset,
+            )
+        };
+        if rc == libc::MAP_FAILED {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            // Put the reservation back.
+            self.release(&maps, addr..addr + len, true);
+            return Err(MapError::Host(if e == libc::EACCES {
+                13
+            } else if e == libc::ENODEV {
+                19
+            } else {
+                12
+            }));
+        }
+        maps.0.insert(addr, Mapping { end: addr + len, prot, shared: true });
+        self.changed(prot.contains(Prot::EXEC));
+        Ok(addr)
+    }
+
+    /// Whether `addr` lies in a shared mapping (see [`GuestMemory::map_shared`]).
+    pub fn is_shared(&self, addr: u64) -> bool {
+        let maps = self.maps();
+        maps.0.range(..=addr).next_back().is_some_and(|(_, m)| m.end > addr && m.shared)
     }
 
     /// Host-page-aligned range covering guest range `r`.
@@ -406,13 +484,20 @@ impl GuestMemory {
     /// Restore the zero invariant for a just-unmapped guest range: decommit host pages no
     /// longer used by any mapping, and zero the bytes of pages still shared with one.
     /// Runs under the write lock, so no data access can be in flight.
-    fn release(&self, maps: &Maps, r: Range<u64>) {
+    /// Give the host pages of unmapped range `r` back to the reservation. Pages other
+    /// mappings still use are kept, with `r`'s part zeroed, unless `r` was `shared`: its
+    /// bytes belong to a file or another process, and must not be overwritten.
+    fn release(&self, maps: &Maps, r: Range<u64>, shared: bool) {
         let hp = self.host_page;
         let hr = self.host_pages(r.clone());
         let mut page = hr.start;
         while page < hr.end {
             let p = page..page + hp;
             if maps.is_any_mapped(p.clone()) {
+                if shared {
+                    page += hp;
+                    continue;
+                }
                 let z = p.start.max(r.start)..p.end.min(r.end);
                 // SAFETY: committed (a mapping shares this host page), inside the
                 // reservation, and no access is in flight under the write lock.

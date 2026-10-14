@@ -30,6 +30,7 @@ pub const SIGBUS: i32 = 7;
 pub const SIGKILL: i32 = 9;
 pub const SIGSEGV: i32 = 11;
 pub const SIGPIPE: i32 = 13;
+pub const SIGALRM: i32 = 14;
 pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;
 pub const SIGCONT: i32 = 18;

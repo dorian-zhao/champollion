@@ -192,6 +192,9 @@ pub struct Process {
     orphaned: AtomicBool,
     /// How to start a new program for `execve` (the embedder knows how to launch itself).
     exec: std::sync::OnceLock<ExecFn>,
+    /// `ITIMER_REAL`, served by a thread started on first use.
+    itimer: Mutex<ITimer>,
+    itimer_changed: Condvar,
     /// Run in a forked child, which keeps only the forking thread: restarts whatever host
     /// threads the process relies on (the host signal pump).
     on_fork: std::sync::OnceLock<Box<dyn Fn(Arc<Process>) + Send + Sync>>,
@@ -210,6 +213,16 @@ pub struct Exec {
     /// handlers do not), and its signal mask.
     pub ignored: u64,
     pub mask: u64,
+}
+
+#[derive(Default)]
+struct ITimer {
+    /// When SIGALRM is due, if armed.
+    deadline: Option<std::time::Instant>,
+    /// The period to rearm with after it fires (zero: once).
+    interval: std::time::Duration,
+    /// Whether the timer thread runs.
+    started: bool,
 }
 
 struct Threads {
@@ -478,6 +491,8 @@ impl Process {
             orphaned: AtomicBool::new(false),
             exec: std::sync::OnceLock::new(),
             on_fork: std::sync::OnceLock::new(),
+            itimer: Mutex::default(),
+            itimer_changed: Condvar::new(),
         });
         Ok((
             process,
@@ -638,14 +653,26 @@ impl Process {
         }
     }
 
-    /// The host path for guest path `path`: under the sysroot if it is absolute and exists
-    /// there (as QEMU's `-L` does), else unchanged; see [`resolve`] for `follow`.
+    /// The host path for guest path `path`: `/dev/shm` (POSIX shared memory and named
+    /// semaphores) is a per-user directory under the host's temporary directory; others
+    /// are under the sysroot if they are absolute and exist there (as QEMU's `-L` does),
+    /// else unchanged. See [`resolve`] for `follow`.
     pub fn host_path<'a>(
         &self,
         path: &'a std::ffi::CStr,
         follow: bool,
     ) -> std::borrow::Cow<'a, std::ffi::CStr> {
         use std::os::unix::ffi::OsStrExt;
+        if let Some(rest) = path.to_bytes().strip_prefix(b"/dev/shm")
+            && (rest.is_empty() || rest[0] == b'/')
+        {
+            let id = self.host.identity();
+            let dir = std::env::temp_dir().join(format!("rvrun-shm-{}", id.uid));
+            let _ = std::fs::create_dir_all(&dir);
+            let mut host = dir.into_os_string().into_vec();
+            host.extend_from_slice(rest);
+            return std::ffi::CString::new(host).map_or(path.into(), Into::into);
+        }
         let Some(root) = &self.sysroot else { return path.into() };
         let guest = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
         let host = resolve(Some(root), guest, follow);
@@ -713,6 +740,59 @@ impl Process {
             f(this);
         }
         Ok(0)
+    }
+
+    /// `setitimer(ITIMER_REAL)` with `(value, interval)` (a zero value disarms), or just
+    /// `getitimer` with `None`. Returns the old `(time left, interval)`.
+    pub fn itimer(
+        &self,
+        new: Option<(std::time::Duration, std::time::Duration)>,
+    ) -> (std::time::Duration, std::time::Duration) {
+        let now = std::time::Instant::now();
+        let mut t = lock(&self.itimer);
+        let old = (
+            t.deadline.map_or_else(Default::default, |d| d.saturating_duration_since(now)),
+            t.interval,
+        );
+        if let Some((value, interval)) = new {
+            t.deadline = (!value.is_zero()).then(|| now + value);
+            t.interval = interval;
+            if t.deadline.is_some()
+                && !t.started
+                && let Some(this) = self.this.upgrade()
+            {
+                t.started = std::thread::Builder::new()
+                    .name("rvrun itimer".into())
+                    .spawn(move || this.run_itimer())
+                    .is_ok();
+            }
+            self.itimer_changed.notify_all();
+        }
+        old
+    }
+
+    /// The `ITIMER_REAL` thread: sleep until the deadline, send SIGALRM, rearm.
+    fn run_itimer(&self) {
+        let mut t = lock(&self.itimer);
+        loop {
+            let now = std::time::Instant::now();
+            t = match t.deadline {
+                None => self.itimer_changed.wait(t).unwrap_or_else(|e| e.into_inner()),
+                Some(due) if now < due => {
+                    self.itimer_changed
+                        .wait_timeout(t, due - now)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+                Some(due) => {
+                    t.deadline = (!t.interval.is_zero()).then(|| due + t.interval);
+                    drop(t);
+                    let info = Info::Sent { code: 0x80, pid: 0, uid: 0 }; // SI_KERNEL
+                    self.send_to_process(signal::SIGALRM, info);
+                    lock(&self.itimer)
+                }
+            };
+        }
     }
 
     /// Signals whose disposition is `SIG_IGN`.
@@ -963,8 +1043,17 @@ impl Process {
             _ => return Err(errno::EINVAL),
         };
         let anonymous = flags & MAP_ANONYMOUS != 0;
-        if shared && !anonymous && prot & PROT_WRITE != 0 {
-            return Err(errno::ENODEV);
+        let _ = PROT_WRITE;
+        if shared {
+            // Shared memory is real host shared memory: writes reach the file, and a fork's
+            // child shares it. It needs host-page alignment (guest fds are host fds here).
+            let at = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0).then_some(addr);
+            let file = (!anonymous).then_some((fd, offset));
+            return self.mem.map_shared(at, len, MMAP_TOP, Prot(prot), file).map_err(|e| match e {
+                MapError::Host(e) => e,
+                MapError::Invalid => errno::EINVAL,
+                _ => errno::ENOMEM,
+            });
         }
 
         let in_range = |a: u64| {
@@ -1219,8 +1308,26 @@ mod tests {
         let mut b = [0u8; 12];
         p.mem.read(a, &mut b).unwrap();
         assert_eq!(&b, b"0123456789\0\0", "bytes past EOF are zero");
-        // Writable shared file mappings are refused.
-        assert_eq!(p.mmap(&h, 0, P, RW, 0x01, 3, 0), Err(errno::ENODEV));
+    }
+
+    #[test]
+    fn shared_mappings_reach_the_file() {
+        use std::os::fd::AsRawFd;
+        let (p, _, h) = spawn();
+        let path = std::env::temp_dir().join(format!("rvrun-shared-{}", std::process::id()));
+        std::fs::write(&path, b"hello").unwrap();
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let a = p.mmap(&*h, 0, P, RW, 0x01, file.as_raw_fd(), 0).unwrap();
+        assert!(p.mem.is_shared(a));
+        let mut b = [0u8; 5];
+        p.mem.read(a, &mut b).unwrap();
+        assert_eq!(&b, b"hello");
+        p.mem.write(a, b"J").unwrap();
+        assert_eq!(p.munmap(a, P), Ok(0));
+        assert_eq!(std::fs::read(&path).unwrap(), b"Jello", "the write reached the file");
+        std::fs::remove_file(&path).unwrap();
+        // Host-page alignment is required for a fixed address.
+        assert_eq!(p.mmap(&*h, 0x1000_1000, P, RW, 0x21 | 0x10, -1, 0), Err(errno::EINVAL));
     }
 
     #[test]

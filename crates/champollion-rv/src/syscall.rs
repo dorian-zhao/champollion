@@ -73,7 +73,11 @@ syscalls! {
     IOCTL = 29 "ioctl",
     MKDIRAT = 34 "mkdirat",
     UNLINKAT = 35 "unlinkat",
+    SYMLINKAT = 36 "symlinkat",
+    LINKAT = 37 "linkat",
     RENAMEAT = 38 "renameat",
+    STATFS = 43 "statfs",
+    FSTATFS = 44 "fstatfs",
     FTRUNCATE = 46 "ftruncate",
     FACCESSAT = 48 "faccessat",
     CHDIR = 49 "chdir",
@@ -104,7 +108,10 @@ syscalls! {
     FUTEX = 98 "futex",
     SET_ROBUST_LIST = 99 "set_robust_list",
     NANOSLEEP = 101 "nanosleep",
+    GETITIMER = 102 "getitimer",
+    SETITIMER = 103 "setitimer",
     CLOCK_GETTIME = 113 "clock_gettime",
+    CLOCK_GETRES = 114 "clock_getres",
     CLOCK_NANOSLEEP = 115 "clock_nanosleep",
     SCHED_GETAFFINITY = 123 "sched_getaffinity",
     SCHED_YIELD = 124 "sched_yield",
@@ -169,6 +176,8 @@ syscalls! {
     RENAMEAT2 = 276 "renameat2",
     GETRANDOM = 278 "getrandom",
     RSEQ = 293 "rseq",
+    PIDFD_OPEN = 434 "pidfd_open",
+    MEMBARRIER = 283 "membarrier",
     FACCESSAT2 = 439 "faccessat2",
 }
 
@@ -346,6 +355,49 @@ pub trait HostOs: Send + Sync {
     fn fstat(&self, fd: i32) -> Result<Stat, i32> {
         Err(errno::ENOSYS)
     }
+    /// Futex wait on a word in memory shared with other processes (see
+    /// [`GuestMemory::map_shared`](crate::memory::GuestMemory::map_shared)): sleep while it
+    /// holds `expected` (`EAGAIN` if it does not), up to `timeout`.
+    fn futex_wait_shared(
+        &self,
+        word: GuestBuf,
+        expected: u32,
+        timeout: Option<std::time::Duration>,
+    ) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Wake up to `count` waiters on a shared futex word.
+    fn futex_wake_shared(&self, word: GuestBuf, count: u32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn linkat(
+        &self,
+        olddirfd: i32,
+        old: &CStr,
+        newdirfd: i32,
+        new: &CStr,
+        flags: i32,
+    ) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn symlinkat(&self, target: &CStr, newdirfd: i32, new: &CStr) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// An fd that polls readable once process `pid` has exited.
+    fn pidfd_open(&self, pid: i32, flags: u32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Bytes ready to read from `fd` (`FIONREAD`).
+    fn bytes_readable(&self, fd: i32) -> SysResult {
+        Err(errno::ENOTTY)
+    }
+    /// Linux `struct statfs` (120 bytes) for `path`.
+    fn statfs(&self, path: &CStr) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    fn fstatfs(&self, fd: i32) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
     fn fstatat(&self, dirfd: i32, path: &CStr, flags: i32) -> Result<Stat, i32> {
         Err(errno::ENOSYS)
     }
@@ -478,6 +530,10 @@ pub struct SyscallLog {
 const IOV_MAX: u64 = 1024;
 const PATH_MAX: usize = 4096;
 const TIOCGWINSZ: u64 = 0x5413;
+const FIONREAD: u64 = 0x541b;
+const FIONBIO: u64 = 0x5421;
+const FIONCLEX: u64 = 0x5450;
+const FIOCLEX: u64 = 0x5451;
 /// `dirfd` value meaning "relative to the current directory" in Linux syscalls.
 pub const AT_FDCWD: i32 = -100;
 
@@ -754,7 +810,22 @@ fn futex(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
         }
         Ok(Some(now + d))
     };
-    match op & !(PRIVATE | CLOCK_REALTIME) {
+    let cmd = op & !(PRIVATE | CLOCK_REALTIME);
+    // A word in memory shared with other processes needs a futex they can share too.
+    if matches!(cmd, 0 | 1 | 9 | 10) && p.mem.is_shared(addr) {
+        if !addr.is_multiple_of(4) {
+            return Err(errno::EINVAL);
+        }
+        let word = p.mem.host_buf(addr, 4, Prot::READ).map_err(efault)?;
+        return if cmd == 0 || cmd == 9 {
+            let left =
+                deadline(cmd == 9)?.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+            p.host.futex_wait_shared(word, val as u32, left)
+        } else {
+            p.host.futex_wake_shared(word, count)
+        };
+    }
+    match cmd {
         0 => {
             let who = p.blocked(t);
             p.futexes.wait(&p.mem, addr, val as u32, deadline(false)?, futex::MATCH_ANY, Some(&who))
@@ -909,6 +980,27 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 put(p, a[2], &bytes)?;
                 Ok(0)
             }
+            // Generic fd ioctls, done with fcntl.
+            FIONBIO => {
+                let mut b = [0u8; 4];
+                p.mem.read(a[2], &mut b).map_err(efault)?;
+                const F_GETFL: i32 = 3;
+                const F_SETFL: i32 = 4;
+                const O_NONBLOCK: u64 = 0o4000;
+                let flags = host.fcntl(fd, F_GETFL, 0)?;
+                let on = i32::from_le_bytes(b) != 0;
+                let flags = if on { flags | O_NONBLOCK } else { flags & !O_NONBLOCK };
+                host.fcntl(fd, F_SETFL, flags).map(|_| 0)
+            }
+            FIOCLEX | FIONCLEX => {
+                const F_SETFD: i32 = 2;
+                host.fcntl(fd, F_SETFD, u64::from(a[1] == FIOCLEX)).map(|_| 0)
+            }
+            FIONREAD => {
+                let n = host.bytes_readable(fd)?;
+                put(p, a[2], &(n as i32).to_le_bytes())?;
+                Ok(0)
+            }
             _ => Err(errno::ENOTTY),
         },
         nr::CLOCK_GETTIME => {
@@ -916,6 +1008,60 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             let mut ts = sec.to_le_bytes().to_vec();
             ts.extend(nsec.to_le_bytes());
             put(p, a[1], &ts)?;
+            Ok(0)
+        }
+        nr::CLOCK_GETRES => {
+            host.clock_gettime(a[0] as i32)?; // validate the clock id
+            if a[1] != 0 {
+                let mut ts = 0i64.to_le_bytes().to_vec();
+                ts.extend(1i64.to_le_bytes()); // nanosecond resolution
+                put(p, a[1], &ts)?;
+            }
+            Ok(0)
+        }
+        nr::GETITIMER | nr::SETITIMER => {
+            // Only ITIMER_REAL (SIGALRM on wall-clock time); the CPU-time timers would
+            // need accounting we do not do.
+            const ITIMER_REAL: u64 = 0;
+            if a[0] != ITIMER_REAL {
+                return Err(errno::EINVAL);
+            }
+            // struct itimerval: interval, then value, each a timeval (sec, usec).
+            let timeval = |b: &[u8]| {
+                let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
+                let usec = i64::from_le_bytes(b[8..16].try_into().unwrap());
+                std::time::Duration::new(sec.max(0) as u64, (usec.clamp(0, 999_999) * 1000) as u32)
+            };
+            let to_bytes = |d: std::time::Duration| {
+                let mut b = (d.as_secs() as i64).to_le_bytes().to_vec();
+                b.extend((d.subsec_micros() as i64).to_le_bytes());
+                b
+            };
+            let new = if nr == nr::SETITIMER && a[1] != 0 {
+                let mut b = [0u8; 32];
+                p.mem.read(a[1], &mut b).map_err(efault)?;
+                Some((timeval(&b[16..]), timeval(&b[..16])))
+            } else {
+                None
+            };
+            let (left, interval) = p.itimer(new);
+            let out = if nr == nr::GETITIMER { a[1] } else { a[2] };
+            if out != 0 {
+                put(p, out, &[to_bytes(interval), to_bytes(left)].concat())?;
+            }
+            Ok(0)
+        }
+        nr::MEMBARRIER => {
+            // MEMBARRIER_CMD_QUERY: no commands supported, so callers fall back.
+            if a[0] == 0 { Ok(0) } else { Err(errno::EINVAL) }
+        }
+        nr::STATFS | nr::FSTATFS => {
+            let st = if nr == nr::STATFS {
+                host.statfs(&p.host_path(&cstr(a[0])?, true))?
+            } else {
+                host.fstatfs(fd)?
+            };
+            put(p, a[1], &st)?;
             Ok(0)
         }
         nr::GETRANDOM => host.getrandom(buf(a[0], a[1], Prot::WRITE)?),
@@ -1048,6 +1194,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(ready.len() as u64)
         }
         nr::RISCV_HWPROBE => hwprobe(p, a),
+        nr::PIDFD_OPEN => host.pidfd_open(a[0] as i32, a[1] as u32),
         nr::SOCKET => host.socket(a[0] as i32, a[1] as i32, a[2] as i32),
         nr::SOCKETPAIR => {
             let [s0, s1] = host.socketpair(a[0] as i32, a[1] as i32, a[2] as i32)?;
@@ -1228,10 +1375,32 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         nr::PWRITE64 => host.pwrite(fd, buf(a[1], a[2], Prot::READ)?, a[3] as i64),
-        nr::UNLINKAT => host.unlinkat(fd, &cstr(a[1])?, a[2] as i32),
-        nr::RENAMEAT => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, 0),
-        nr::RENAMEAT2 => host.renameat2(fd, &cstr(a[1])?, a[2] as i32, &cstr(a[3])?, a[4] as u32),
-        nr::MKDIRAT => host.mkdirat(fd, &cstr(a[1])?, a[2] as u32),
+        nr::UNLINKAT => host.unlinkat(fd, &p.host_path(&cstr(a[1])?, false), a[2] as i32),
+        nr::LINKAT => {
+            let (from, to) = (cstr(a[1])?, cstr(a[3])?);
+            let (from, to) = (p.host_path(&from, false), p.host_path(&to, false));
+            host.linkat(fd, &from, a[2] as i32, &to, a[4] as i32)
+        }
+        // The target is stored as given: it is resolved later, in the guest's view.
+        nr::SYMLINKAT => {
+            host.symlinkat(&cstr(a[0])?, a[1] as i32, &p.host_path(&cstr(a[2])?, false))
+        }
+        nr::RENAMEAT => {
+            let (from, to) = (cstr(a[1])?, cstr(a[3])?);
+            host.renameat2(fd, &p.host_path(&from, false), a[2] as i32, &p.host_path(&to, false), 0)
+        }
+        nr::RENAMEAT2 => {
+            let (from, to) = (cstr(a[1])?, cstr(a[3])?);
+            let flags = a[4] as u32;
+            host.renameat2(
+                fd,
+                &p.host_path(&from, false),
+                a[2] as i32,
+                &p.host_path(&to, false),
+                flags,
+            )
+        }
+        nr::MKDIRAT => host.mkdirat(fd, &p.host_path(&cstr(a[1])?, false), a[2] as u32),
         nr::FACCESSAT => host.faccessat(fd, &p.host_path(&cstr(a[1])?, true), a[2] as i32, 0),
         nr::FACCESSAT2 => {
             host.faccessat(fd, &p.host_path(&cstr(a[1])?, true), a[2] as i32, a[3] as i32)
