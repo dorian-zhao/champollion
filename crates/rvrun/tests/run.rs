@@ -31,6 +31,25 @@ fn hello() {
 }
 
 #[test]
+fn threads() {
+    let out = rvrun(&[fixture("threads").as_os_str()], b"");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "atomic 800000 locked 800000 results 280\nping-pong done\n"
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // exit() in another thread ends the process, though main is blocked in pthread_join.
+    let out = rvrun(&[fixture("threads").as_os_str(), "exit-group".as_ref()], b"");
+    assert_eq!(out.status.code(), Some(7));
+
+    // After main's pthread_exit, the process lives on until its last thread exits.
+    let out = rvrun(&[fixture("threads").as_os_str(), "main-exits".as_ref()], b"");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "child outlived main\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
 fn syscalls() {
     let dir = std::env::temp_dir().join(format!("champollion-run-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

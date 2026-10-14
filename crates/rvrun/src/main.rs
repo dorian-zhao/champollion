@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use champollion_rv::gdb::{self, Session};
 use champollion_rv::host::darwin::DarwinHost;
-use champollion_rv::process::{Exit, Process};
+use champollion_rv::process::Process;
 
 const USAGE: &str = "usage: rvrun [-g PORT] <riscv64-linux-elf> [args...]";
 
@@ -76,6 +76,7 @@ fn main() -> ExitCode {
                     cache.restore(&mut jit, &proc.mem);
                 }
                 main_thread.jit = Some(jit);
+                proc.jit.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => eprintln!("rvrun: JIT unavailable ({e}); interpreting"),
         }
@@ -113,19 +114,7 @@ fn main() -> ExitCode {
             eprintln!("[rvrun] {}", jit.stats.report());
         }
     }
-    match exit {
-        Exit::Signal(sig) => {
-            eprintln!("rvrun: guest killed by signal {sig}");
-            ExitCode::from(128 + sig as u8)
-        }
-        Exit::Status(status) => ExitCode::from(status as u8),
-        exit @ Exit::Trap(trap) => {
-            // Match the shell convention for a process killed by a signal.
-            let sig = exit.signal().unwrap();
-            eprintln!("rvrun: guest killed by signal {sig}: {trap:?}\n{:?}", main_thread.cpu);
-            ExitCode::from(128 + sig as u8)
-        }
-    }
+    ExitCode::from(exit.report(&main_thread.cpu))
 }
 
 /// Wait for one debugger connection on 127.0.0.1:`port` and serve it.

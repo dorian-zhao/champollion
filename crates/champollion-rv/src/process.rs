@@ -1,9 +1,15 @@
 //! A guest process and its threads.
 //!
 //! [`Process`] is everything guest threads share: the address space, the program break,
-//! and syscall logging. It is `Sync` and only ever used through `&Process`, so M5 can run
-//! one host thread per guest thread against the same `Process`. [`Thread`] is per-thread:
-//! registers (including the `lr` reservation) and the tid bookkeeping of `clone`.
+//! syscall logging, futexes, and the thread count. It is `Sync`, shared through an `Arc`,
+//! and each guest thread runs on its own host thread against it. [`Thread`] is per-thread:
+//! registers (including the `lr` reservation), the tid bookkeeping of `clone`, and the
+//! thread's own engine and JIT.
+//!
+//! As on Linux, `exit` ends one thread and the process ends with its last thread, while
+//! `exit_group` (or a fatal fault) in any thread ends the whole process. The main thread's
+//! [`Process::run`] returns when the process ends; when another thread ends it, that
+//! thread exits the host process directly, since the main thread may be blocked.
 //!
 //! Guest address-space layout (2^38 bytes, like Sv39 user space):
 //!
@@ -26,9 +32,12 @@ use crate::engine::Engine;
 use crate::interpreter::Trap;
 use crate::jit::Jit;
 use crate::loader::{self, LoadError, StackInit, auxv};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
-use crate::memory::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Prot};
+use crate::futex::{self, Futexes};
+
+use crate::memory::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Memory, Prot};
 use crate::syscall::{self, Flow, HostOs, SysResult, SyscallLog, errno};
 
 pub const STACK_TOP: u64 = GUEST_SIZE;
@@ -72,6 +81,23 @@ pub enum Exit {
 }
 
 impl Exit {
+    /// Tell the user how the guest died (nothing for a normal exit), and return the exit
+    /// code a shell would see: the status, or 128 + the signal that killed it.
+    pub fn report(self, cpu: &CpuState) -> u8 {
+        match self {
+            Exit::Status(status) => status as u8,
+            Exit::Signal(sig) => {
+                eprintln!("rvrun: guest killed by signal {sig}");
+                128 + sig as u8
+            }
+            Exit::Trap(trap) => {
+                let sig = self.signal().unwrap();
+                eprintln!("rvrun: guest killed by signal {sig}: {trap:?}\n{cpu:?}");
+                128 + sig as u8
+            }
+        }
+    }
+
     /// The Linux signal number that would have killed the process, if any.
     pub fn signal(self) -> Option<i32> {
         const SIGILL: i32 = 4;
@@ -96,10 +122,38 @@ pub struct Process {
     pub mem: GuestMemory,
     /// The host the guest's syscalls go to.
     pub host: Arc<dyn HostOs>,
+    /// This process's own `Arc`, for the host threads of new guest threads.
+    this: Weak<Process>,
+    pub futexes: Futexes,
+    threads: Mutex<Threads>,
+    /// Signaled when the last thread exits.
+    all_exited: Condvar,
+    /// Whether new threads get a JIT (set by the embedder, like the main thread's).
+    pub jit: AtomicBool,
     brk: Mutex<Brk>,
     pub log: SyscallLog,
     /// Absolute path of the executable, for `/proc/self/exe`.
     pub exe: Vec<u8>,
+}
+
+struct Threads {
+    /// Guest threads that have not exited.
+    live: u32,
+    next_tid: u32,
+    /// Status of the most recent `exit`, which becomes the process's when it is the last.
+    last_status: i32,
+}
+
+/// How a thread's run loop ended.
+enum End {
+    /// `exit`: this thread only.
+    Thread(i32),
+    /// The whole process ends.
+    Process(Exit),
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 struct Brk {
@@ -178,18 +232,94 @@ impl Process {
                 .map_or_else(|_| execfn.to_vec(), |p| p.into_os_string().into_vec())
         };
         let brk = Mutex::new(Brk { start: brk, cur: brk });
-        let process = Arc::new(Self { mem, host, brk, log: SyscallLog::default(), exe });
+        let threads = Threads { live: 1, next_tid: id.pid + 1, last_status: 0 };
+        let process = Arc::new_cyclic(|this| Self {
+            mem,
+            host,
+            this: this.clone(),
+            futexes: Futexes::default(),
+            threads: Mutex::new(threads),
+            all_exited: Condvar::new(),
+            jit: AtomicBool::new(false),
+            brk,
+            log: SyscallLog::default(),
+            exe,
+        });
         Ok((
             process,
             Thread { cpu, tid: id.pid, clear_child_tid: 0, engine: Engine::new(), jit: None },
         ))
     }
 
-    /// Run `thread` until it exits or dies.
-    ///
-    /// Until `clone` arrives (M5) the main thread is the only one, so `exit` ends the
-    /// process too; afterwards the process ends when its last thread exits.
+    /// Run the main thread until the process ends (see the module docs).
     pub fn run(&self, thread: &mut Thread) -> Exit {
+        match self.run_thread(thread) {
+            End::Process(exit) => exit,
+            End::Thread(status) => {
+                self.thread_exited(thread, status);
+                let mut threads = lock(&self.threads);
+                while threads.live > 0 {
+                    threads = self.all_exited.wait(threads).unwrap_or_else(|e| e.into_inner());
+                }
+                Exit::Status(threads.last_status)
+            }
+        }
+    }
+
+    /// Start a new guest thread (from `clone`) on its own host thread, with tid `tid` from
+    /// [`Process::new_tid`]. Its engine and JIT are made there: they are per-thread.
+    pub fn start_thread(
+        &self,
+        cpu: CpuState,
+        tid: u32,
+        clear_child_tid: u64,
+    ) -> std::io::Result<()> {
+        let this = self.this.upgrade().expect("a running process is alive");
+        std::thread::Builder::new().name(format!("guest thread {tid}")).stack_size(4 << 20).spawn(
+            move || {
+                let jit = if this.jit.load(Ordering::Relaxed) { Jit::new().ok() } else { None };
+                let mut thread = Thread { cpu, tid, clear_child_tid, engine: Engine::new(), jit };
+                match this.run_thread(&mut thread) {
+                    End::Thread(status) => this.thread_exited(&thread, status),
+                    End::Process(exit) => std::process::exit(exit.report(&thread.cpu).into()),
+                }
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Reserve a tid for a thread about to start, counting it as live.
+    pub fn new_tid(&self) -> u32 {
+        let mut threads = lock(&self.threads);
+        threads.live += 1;
+        threads.next_tid += 1;
+        threads.next_tid - 1
+    }
+
+    /// Undo [`Process::new_tid`] for a thread that could not be started.
+    pub fn forget_tid(&self) {
+        lock(&self.threads).live -= 1;
+    }
+
+    /// Bookkeeping for a thread's `exit`: clear and wake its `clear_child_tid` word (how
+    /// `pthread_join` learns of the exit), and end the process if it was the last thread.
+    fn thread_exited(&self, thread: &Thread, status: i32) {
+        if thread.clear_child_tid != 0 {
+            let addr = thread.clear_child_tid;
+            if self.mem.write(addr, &0u32.to_le_bytes()).is_ok() {
+                let _ = self.futexes.wake(addr, 1, futex::MATCH_ANY);
+            }
+        }
+        let mut threads = lock(&self.threads);
+        threads.live -= 1;
+        threads.last_status = status;
+        if threads.live == 0 {
+            self.all_exited.notify_all();
+        }
+    }
+
+    /// Run `thread` until it exits or the process ends.
+    fn run_thread(&self, thread: &mut Thread) -> End {
         loop {
             let trap = match &mut thread.jit {
                 Some(jit) => jit.run(&mut thread.cpu, &self.mem),
@@ -201,12 +331,11 @@ impl Process {
             match trap {
                 Trap::Ecall { .. } => match syscall::dispatch(self, thread) {
                     Flow::Continue => {}
-                    Flow::ExitThread(status) | Flow::ExitGroup(status) => {
-                        return Exit::Status(status);
-                    }
-                    Flow::Killed(sig) => return Exit::Signal(sig),
+                    Flow::ExitThread(status) => return End::Thread(status),
+                    Flow::ExitGroup(status) => return End::Process(Exit::Status(status)),
+                    Flow::Killed(sig) => return End::Process(Exit::Signal(sig)),
                 },
-                trap => return Exit::Trap(trap),
+                trap => return End::Process(Exit::Trap(trap)),
             }
         }
     }

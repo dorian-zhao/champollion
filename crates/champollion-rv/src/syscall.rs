@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::ffi::CStr;
 use std::sync::Mutex;
 
+use crate::futex;
 use crate::memory::{GuestBuf, MemFault, Memory, Prot};
 use crate::process::{Process, Thread};
 
@@ -20,6 +21,7 @@ pub mod errno {
     pub const ENOENT: i32 = 2;
     pub const EIO: i32 = 5;
     pub const EBADF: i32 = 9;
+    pub const EAGAIN: i32 = 11;
     pub const ENOMEM: i32 = 12;
     pub const EFAULT: i32 = 14;
     pub const EEXIST: i32 = 17;
@@ -29,6 +31,7 @@ pub mod errno {
     pub const ESRCH: i32 = 3;
     pub const ERANGE: i32 = 34;
     pub const ENOSYS: i32 = 38;
+    pub const ETIMEDOUT: i32 = 110;
 }
 
 /// Declares the syscall table once: `nr::NAME` constants plus [`name`] for traces and
@@ -452,6 +455,83 @@ fn linux_rusage(ru: &Rusage) -> Vec<u8> {
     b
 }
 
+/// `clone(flags, newsp, parent_tid, tls, child_tid)` (the riscv64 argument order). Only
+/// threads are supported: a new thread in this process, not a new process.
+fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    const CLONE_SETTLS: u64 = 0x8_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+    let [flags, newsp, parent_tid, tls, child_tid, _] = a;
+    let thread = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+    if flags & thread != thread {
+        return Err(errno::ENOSYS); // fork and vfork: new processes come later
+    }
+    let tid = p.new_tid();
+    let mut cpu = t.cpu.clone();
+    // The child returns 0 from this ecall, on its own stack and TLS if given.
+    cpu.pc += 4;
+    cpu.instret += 1;
+    cpu.x[10] = 0;
+    cpu.reserved_addr = crate::cpu::NO_RESERVATION;
+    if newsp != 0 {
+        cpu.x[2] = newsp;
+    }
+    if flags & CLONE_SETTLS != 0 {
+        cpu.x[4] = tls;
+    }
+    let set = |flag, addr| -> Result<(), i32> {
+        if flags & flag != 0 { put(p, addr, &tid.to_le_bytes()) } else { Ok(()) }
+    };
+    let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
+    let started = set(CLONE_PARENT_SETTID, parent_tid)
+        .and_then(|()| set(CLONE_CHILD_SETTID, child_tid))
+        .and_then(|()| p.start_thread(cpu, tid, clear).map_err(|_| errno::EAGAIN));
+    if let Err(e) = started {
+        p.forget_tid();
+        return Err(e);
+    }
+    Ok(tid as u64)
+}
+
+/// `futex(uaddr, op, val, timeout or val2, uaddr2, val3)`: the wait, wake, and requeue
+/// operations, private or not (guest processes never share memory).
+fn futex(p: &Process, a: [u64; 6]) -> SysResult {
+    const PRIVATE: u64 = 128;
+    const CLOCK_REALTIME: u64 = 256;
+    let [addr, op, val, timeout, addr2, val3] = a;
+    let count = (val as i32).max(0) as u32;
+    // A timespec at `timeout`: relative for WAIT, absolute for WAIT_BITSET.
+    let deadline = |absolute: bool| -> Result<Option<std::time::Instant>, i32> {
+        if timeout == 0 {
+            return Ok(None);
+        }
+        let (sec, nsec) = read_timespec(p, timeout)?;
+        let mut d = std::time::Duration::new(sec as u64, nsec as u32);
+        let now = std::time::Instant::now();
+        if absolute {
+            // The guest's clocks, as clock_gettime reports them.
+            let clock = if op & CLOCK_REALTIME != 0 { 0 } else { 1 };
+            let (s, ns) = p.host.clock_gettime(clock)?;
+            let clock_now = std::time::Duration::new(s as u64, ns as u32);
+            d = d.saturating_sub(clock_now);
+        }
+        Ok(Some(now + d))
+    };
+    match op & !(PRIVATE | CLOCK_REALTIME) {
+        0 => p.futexes.wait(&p.mem, addr, val as u32, deadline(false)?, futex::MATCH_ANY),
+        1 => p.futexes.wake(addr, count, futex::MATCH_ANY),
+        3 => p.futexes.requeue(&p.mem, addr, count, addr2, timeout as u32, None),
+        4 => p.futexes.requeue(&p.mem, addr, count, addr2, timeout as u32, Some(val3 as u32)),
+        9 => p.futexes.wait(&p.mem, addr, val as u32, deadline(true)?, val3 as u32),
+        10 => p.futexes.wake(addr, count, val3 as u32),
+        _ => Err(errno::ENOSYS),
+    }
+}
+
 /// Copy a syscall result out to guest memory, which must be writable by the guest.
 fn put(p: &Process, addr: u64, bytes: &[u8]) -> Result<(), i32> {
     p.mem.write(addr, bytes).map_err(efault)
@@ -583,15 +663,21 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         }
         nr::GETRANDOM => host.getrandom(buf(a[0], a[1], Prot::WRITE)?),
         nr::SCHED_GETAFFINITY => {
-            // Until threads arrive in M5, report a single CPU, so programs that size
-            // thread pools by CPU count start one worker. Linux returns the number of
-            // bytes it wrote: one `unsigned long` of mask.
+            // Every host CPU, up to 64. Linux returns the number of bytes it wrote: one
+            // `unsigned long` of mask.
             if a[1] < 8 || !a[1].is_multiple_of(8) {
                 return Err(errno::EINVAL);
             }
-            put(p, a[2], &1u64.to_le_bytes())?;
+            let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
+            let mask = if cpus == 64 { u64::MAX } else { (1u64 << cpus) - 1 };
+            put(p, a[2], &mask.to_le_bytes())?;
             Ok(8)
         }
+        nr::CLONE => clone(p, t, a),
+        nr::FUTEX => futex(p, a),
+        // Robust futex lists only matter when a thread dies holding a lock, which ends the
+        // whole process here anyway.
+        nr::SET_ROBUST_LIST => Ok(0),
         nr::UNAME => {
             // struct utsname: six 65-byte NUL-padded fields.
             let fields: [&[u8]; 6] = [
