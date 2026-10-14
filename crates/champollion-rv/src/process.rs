@@ -38,7 +38,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use crate::futex::{self, Futexes};
 use crate::signal::{self, Action, AltStack, Info, Pending, ThreadSignals};
 
-use crate::memory::{GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, MapError, Memory, Prot};
+use crate::memory::{
+    GUEST_PAGE_SIZE, GUEST_SIZE, GuestBuf, GuestMemory, INTERRUPT_SLOTS, MapError, Memory, Prot,
+};
 use crate::syscall::{self, Flow, HostOs, SysResult, SyscallLog, errno};
 
 pub const STACK_TOP: u64 = GUEST_SIZE;
@@ -140,6 +142,9 @@ pub struct Process {
     pending: Mutex<Pending>,
     /// Every live thread's shared signal state, by tid (for `tgkill`).
     thread_signals: Mutex<std::collections::HashMap<u32, Arc<ThreadSignals>>>,
+    /// Interrupt flag slots in use (see [`GuestMemory::interrupt_flag`]). The main thread
+    /// has slot 0; the last slot is never set, for threads beyond the supply.
+    slots: Mutex<Vec<bool>>,
     brk: Mutex<Brk>,
     pub log: SyscallLog,
     /// Absolute path of the executable, for `/proc/self/exe`.
@@ -269,6 +274,11 @@ impl Process {
                 id.pid,
                 main_signals.clone(),
             )])),
+            slots: Mutex::new({
+                let mut slots = vec![false; INTERRUPT_SLOTS];
+                slots[0] = true;
+                slots
+            }),
             brk,
             log: SyscallLog::default(),
             exe,
@@ -315,12 +325,22 @@ impl Process {
     ) -> std::io::Result<()> {
         let this = self.this.upgrade().expect("a running process is alive");
         // A new thread inherits the signal mask, but not the alternate stack.
-        let signals = Arc::new(ThreadSignals::default());
+        let slot = {
+            let mut slots = lock(&self.slots);
+            let free = slots[..INTERRUPT_SLOTS - 1].iter().position(|used| !used);
+            let slot = free.unwrap_or(INTERRUPT_SLOTS - 1);
+            slots[slot] = true;
+            slot
+        };
+        let signals = Arc::new(ThreadSignals { slot, ..ThreadSignals::default() });
         signals.set_mask(mask);
         lock(&self.thread_signals).insert(tid, signals.clone());
         std::thread::Builder::new().name(format!("guest thread {tid}")).stack_size(4 << 20).spawn(
             move || {
-                let jit = if this.jit.load(Ordering::Relaxed) { Jit::new().ok() } else { None };
+                let mut jit = if this.jit.load(Ordering::Relaxed) { Jit::new().ok() } else { None };
+                if let Some(jit) = &mut jit {
+                    jit.set_interrupt_slot(slot);
+                }
                 let mut thread = Thread {
                     cpu,
                     tid,
@@ -348,9 +368,17 @@ impl Process {
         threads.next_tid - 1
     }
 
+    fn free_slot(&self, slot: usize) {
+        if slot != INTERRUPT_SLOTS - 1 {
+            lock(&self.slots)[slot] = false;
+        }
+    }
+
     /// Undo [`Process::new_tid`] for a thread that could not be started.
     pub fn forget_tid(&self, tid: u32) {
-        lock(&self.thread_signals).remove(&tid);
+        if let Some(t) = lock(&self.thread_signals).remove(&tid) {
+            self.free_slot(t.slot);
+        }
         lock(&self.threads).live -= 1;
     }
 
@@ -358,6 +386,7 @@ impl Process {
     /// `pthread_join` learns of the exit), and end the process if it was the last thread.
     fn thread_exited(&self, thread: &Thread, status: i32) {
         lock(&self.thread_signals).remove(&thread.tid);
+        self.free_slot(thread.signals.slot);
         if thread.clear_child_tid != 0 {
             let addr = thread.clear_child_tid;
             if self.mem.write(addr, &0u32.to_le_bytes()).is_ok() {
@@ -378,13 +407,13 @@ impl Process {
             if let Some(end) = self.deliver_signals(thread) {
                 return end;
             }
+            // Both come back now and then without a trap, to take signals: the JIT when its
+            // interrupt flag is set, the engine after a slice of instructions.
             let trap = match &mut thread.jit {
-                Some(jit) => jit.run(&mut thread.cpu, &self.mem),
-                None => match thread.engine.run(&mut thread.cpu, &self.mem, u64::MAX) {
-                    (Some(trap), _) => trap,
-                    (None, _) => unreachable!("run() with u64::MAX steps returned"),
-                },
+                Some(jit) => jit.run_interruptible(&mut thread.cpu, &self.mem),
+                None => thread.engine.run(&mut thread.cpu, &self.mem, 1 << 20).0,
             };
+            let Some(trap) = trap else { continue };
             match trap {
                 Trap::Ecall { .. } => match syscall::dispatch(self, thread) {
                     Flow::Continue => {}
@@ -425,13 +454,24 @@ impl Process {
     /// Send `sig` to the process (`kill`): any thread that does not block it takes it.
     pub fn send_to_process(&self, sig: i32, info: Info) {
         lock(&self.pending).add(sig, info);
+        for t in lock(&self.thread_signals).values() {
+            self.interrupt(t, sig);
+        }
     }
 
     /// Send `sig` to thread `tid` (`tgkill`). False if there is no such thread.
     pub fn send_to_thread(&self, tid: u32, sig: i32, info: Info) -> bool {
         let Some(t) = lock(&self.thread_signals).get(&tid).cloned() else { return false };
         lock(&t.pending).add(sig, info);
+        self.interrupt(&t, sig);
         true
+    }
+
+    /// Make thread `t` leave generated code soon if it can take `sig`.
+    fn interrupt(&self, t: &ThreadSignals, sig: i32) {
+        if t.mask() & signal::bit(sig) == 0 {
+            self.mem.interrupt_flag(t.slot).store(1, Ordering::SeqCst);
+        }
     }
 
     pub fn thread_exists(&self, tid: u32) -> bool {
@@ -446,6 +486,8 @@ impl Process {
     /// Deliver the signals `thread` can take now. Returns how the process ends if one of
     /// them terminates it.
     fn deliver_signals(&self, thread: &mut Thread) -> Option<End> {
+        // Clear the flag first: a signal sent after this sets it again.
+        self.mem.interrupt_flag(thread.signals.slot).store(0, Ordering::SeqCst);
         loop {
             let blocked = thread.signals.mask();
             let next = lock(&thread.signals.pending).take(blocked);

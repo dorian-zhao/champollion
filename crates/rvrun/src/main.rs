@@ -56,7 +56,8 @@ fn main() -> ExitCode {
         std::env::vars_os().map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat()).collect();
 
     let (proc, mut main_thread) =
-        match Process::spawn(&file, &argv, &envp, path.as_bytes(), Arc::new(DarwinHost)) {
+        match Process::spawn(&file, &argv, &envp, path.as_bytes(), Arc::new(DarwinHost::default()))
+        {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("rvrun: {}: cannot load: {e:?}", path.to_string_lossy());

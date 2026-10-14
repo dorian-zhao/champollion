@@ -7,9 +7,12 @@
 //! (`siginfo`, then `ucontext` with the registers) and enters the handler with `ra` at a
 //! trampoline that calls `rt_sigreturn`, which restores the frame.
 //!
-//! Limitations: a thread running translated code without making syscalls only sees a
-//! signal at its next syscall or trap; realtime signals do not queue (one pending
-//! instance per signal, like standard signals).
+//! A sender also sets the recipient's interrupt flag (in guest memory's control area),
+//! which translated code checks on backward and indirect jumps and the engine between
+//! slices of instructions, so even a thread spinning in a loop takes the signal promptly.
+//!
+//! Limitations: blocked syscalls are not interrupted; realtime signals do not queue (one
+//! pending instance per signal, like standard signals).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -174,6 +177,9 @@ impl Pending {
 pub struct ThreadSignals {
     pub mask: AtomicU64,
     pub pending: Mutex<Pending>,
+    /// The thread's interrupt flag slot in guest memory's control area: senders set the
+    /// flag to make the thread leave generated code and take the signal.
+    pub slot: usize,
 }
 
 impl ThreadSignals {

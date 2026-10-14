@@ -322,6 +322,10 @@ impl Asm {
     pub fn sub_imm(&mut self, rd: Reg, rn: Reg, imm: u32) {
         self.imm12(0xd100_0000, rd, rn, imm);
     }
+    /// `sub rd, rn, #imm, lsl #12`.
+    pub fn sub_imm_lsl12(&mut self, rd: Reg, rn: Reg, imm: u32) {
+        self.imm12(0xd140_0000, rd, rn, imm);
+    }
     pub fn sub_imm_w(&mut self, rd: Reg, rn: Reg, imm: u32) {
         self.imm12(0x5100_0000, rd, rn, imm);
     }

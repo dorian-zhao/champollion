@@ -1,7 +1,7 @@
 // Signals: handlers, siginfo, masks and pending signals, faults caught with
 // siglongjmp, the alternate stack, editing the interrupted context, and signals sent to
 // another thread.
-//   signals        -> prints a line per check
+//   signals        -> prints a line per check (one thread spins without syscalls)
 //   signals term   -> raise(SIGTERM) with the default action: killed (status 143)
 //   signals abort  -> abort(): killed by SIGABRT (status 134)
 #define _GNU_SOURCE
@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -59,6 +60,16 @@ static void on_thread_usr1(int sig) {
 static void *spin(void *arg) {
     (void)arg;
     while (!atomic_load(&thread_hit)) sched_yield();
+    return NULL;
+}
+
+// No syscalls once spinning: only an interrupt of translated code can get the signal in.
+static atomic_int spinning;
+static void *spin_hard(void *arg) {
+    (void)arg;
+    atomic_store(&spinning, 1);
+    while (!atomic_load_explicit(&thread_hit, memory_order_relaxed)) {
+    }
     return NULL;
 }
 
@@ -131,5 +142,14 @@ int main(int argc, char **argv) {
     pthread_kill(target, SIGUSR1);
     pthread_join(target, NULL);
     printf("signal to thread %s\n", atomic_load(&thread_hit) ? "delivered" : "lost");
+
+    atomic_store(&thread_hit, 0);
+    pthread_create(&target, NULL, spin_hard, NULL);
+    while (!atomic_load(&spinning)) sched_yield();
+    struct timespec ts = {0, 20 * 1000000};
+    nanosleep(&ts, NULL);
+    pthread_kill(target, SIGUSR1);
+    pthread_join(target, NULL);
+    printf("signal to spinning thread %s\n", atomic_load(&thread_hit) ? "delivered" : "lost");
     return 0;
 }

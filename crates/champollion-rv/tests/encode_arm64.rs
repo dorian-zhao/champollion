@@ -45,6 +45,7 @@ fn matches_assembler() {
     a.add_imm_w(10, 11, 1);
     a.add_imm(SP, SP, 16);
     a.sub_imm(12, 13, 2048);
+    a.sub_imm_lsl12(16, 27, 20);
     a.sub_imm_w(14, 15, 7);
     a.cmp_imm(16, 0);
     a.cmp_imm_w(17, 5);

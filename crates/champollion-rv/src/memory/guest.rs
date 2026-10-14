@@ -4,7 +4,16 @@
 //! range is reserved `PROT_NONE` up front, which costs no physical memory; pages are
 //! committed as the guest maps them. [`GUARD_SIZE`] bytes on either side stay `PROT_NONE`
 //! forever, so the JIT may add a small offset to an in-range address without masking the
-//! sum: the access either lands in the guest space or faults.
+//! sum: the access either lands in the guest space or faults. Below the lower guard lies a
+//! read/write control area for the runtime: one interrupt flag per thread slot, which
+//! generated code checks at block entry (see [`GuestMemory::interrupt_flag`]).
+//!
+//! ```text
+//! base - CONTROL_OFFSET   interrupt flags (INTERRUPT_SLOTS x u32)
+//! base - GUARD_SIZE       guard
+//! base                    guest address 0
+//! base + GUEST_SIZE       guard
+//! ```
 //!
 //! Guest pages are 4 KiB (what Linux on RISC-V reports in `AT_PAGESZ`), but macOS on arm64
 //! uses 16 KiB host pages, so host protections cannot represent guest permissions exactly.
@@ -28,6 +37,12 @@ pub const GUEST_SIZE: u64 = 1 << 38;
 pub const GUEST_PAGE_SIZE: u64 = 4096;
 /// Inaccessible host memory reserved below and above the guest space.
 pub const GUARD_SIZE: u64 = 64 << 10;
+/// Size of the control area below the lower guard.
+const CONTROL_SIZE: u64 = 16 << 10;
+/// Distance from the guest base down to the control area.
+pub const CONTROL_OFFSET: u64 = GUARD_SIZE + CONTROL_SIZE;
+/// Number of interrupt flags (thread slots) in the control area.
+pub const INTERRUPT_SLOTS: usize = (CONTROL_SIZE / 4) as usize;
 
 /// Guest page permissions, with Linux `PROT_*` bit values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -168,7 +183,7 @@ impl GuestMemory {
         let start = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                (GUEST_SIZE + 2 * GUARD_SIZE) as usize,
+                (CONTROL_OFFSET + GUEST_SIZE + GUARD_SIZE) as usize,
                 libc::PROT_NONE,
                 libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
                 -1,
@@ -178,7 +193,14 @@ impl GuestMemory {
         if start == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        let base = start.cast::<u8>().wrapping_add(GUARD_SIZE as usize);
+        // SAFETY: making our own reservation's control area read/write.
+        if unsafe {
+            libc::mprotect(start, CONTROL_SIZE as usize, libc::PROT_READ | libc::PROT_WRITE)
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = start.cast::<u8>().wrapping_add(CONTROL_OFFSET as usize);
         // SAFETY: sysconf has no preconditions.
         let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         assert!(host_page.is_power_of_two() && host_page >= GUEST_PAGE_SIZE);
@@ -206,6 +228,17 @@ impl GuestMemory {
     /// change). Caches of decoded or translated code follow this one, so data-only `mmap`,
     /// `brk`, and `munmap` traffic leaves them intact.
     #[inline]
+    /// The interrupt flag of thread slot `slot`: nonzero asks the thread to leave generated
+    /// code at the next block entry (for signal delivery).
+    pub fn interrupt_flag(&self, slot: usize) -> &AtomicU32 {
+        assert!(slot < INTERRUPT_SLOTS);
+        // SAFETY: the control area is mapped read/write for the reservation's lifetime and
+        // only ever accessed atomically; slots are 4-byte aligned.
+        unsafe {
+            AtomicU32::from_ptr(self.base.sub(CONTROL_OFFSET as usize).cast::<u32>().add(slot))
+        }
+    }
+
     pub fn code_generation(&self) -> u64 {
         self.code_generation.load(Acquire)
     }
@@ -534,8 +567,8 @@ impl Drop for GuestMemory {
     fn drop(&mut self) {
         // SAFETY: unmapping exactly the reservation created in `new`.
         unsafe {
-            let start = self.base.wrapping_sub(GUARD_SIZE as usize);
-            libc::munmap(start.cast(), (GUEST_SIZE + 2 * GUARD_SIZE) as usize)
+            let start = self.base.wrapping_sub(CONTROL_OFFSET as usize);
+            libc::munmap(start.cast(), (CONTROL_OFFSET + GUEST_SIZE + GUARD_SIZE) as usize)
         };
     }
 }

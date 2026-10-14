@@ -9,7 +9,12 @@ use std::ffi::CStr;
 use crate::memory::GuestBuf;
 use crate::syscall::{AT_FDCWD, Flock, HostOs, Identity, PollFd, Rusage, Stat, SysResult, errno};
 
-pub struct DarwinHost;
+/// The Darwin backend. Guest fds are host fds; the only state kept here is for the Linux
+/// fd types Darwin lacks (eventfd; epoll instances are plain kqueues).
+#[derive(Default)]
+pub struct DarwinHost {
+    eventfds: super::kqueue::EventFds,
+}
 
 /// Linux (asm-generic) `open` flags.
 mod linux_o {
@@ -173,7 +178,7 @@ fn dirfd(linux: i32) -> i32 {
 
 /// Darwin errno -> Linux errno. Values 1–34 agree except 11 (Darwin `EDEADLK`, Linux
 /// `EAGAIN`).
-fn linux_errno(e: i32) -> i32 {
+pub(super) fn linux_errno(e: i32) -> i32 {
     match e {
         libc::EDEADLK => 35,
         libc::EAGAIN => 11,
@@ -218,7 +223,7 @@ fn last_errno() -> i32 {
 }
 
 /// Convert a `-1`-on-error return into a [`SysResult`].
-fn check(ret: isize) -> SysResult {
+pub(super) fn check(ret: isize) -> SysResult {
     if ret < 0 { Err(last_errno()) } else { Ok(ret as u64) }
 }
 
@@ -244,12 +249,34 @@ impl HostOs for DarwinHost {
     // Guest buffers go straight to the kernel, which fails with EFAULT instead of crashing
     // if another guest thread unmaps them mid-call.
 
+    fn epoll_create1(&self, flags: i32) -> SysResult {
+        super::kqueue::epoll_create1(flags)
+    }
+
+    fn epoll_ctl(&self, epfd: i32, op: i32, fd: i32, event: (u32, u64)) -> SysResult {
+        super::kqueue::epoll_ctl(epfd, op, fd, event)
+    }
+
+    fn epoll_wait(&self, epfd: i32, max: usize, timeout_ms: i32) -> Result<Vec<(u32, u64)>, i32> {
+        super::kqueue::epoll_wait(epfd, max, timeout_ms)
+    }
+
+    fn eventfd(&self, initval: u32, flags: i32) -> SysResult {
+        self.eventfds.create(initval, flags)
+    }
+
     fn read(&self, fd: i32, buf: GuestBuf) -> SysResult {
+        if let Some(r) = self.eventfds.read(fd, buf) {
+            return r;
+        }
         // SAFETY: the kernel validates the destination.
         check(unsafe { libc::read(fd, buf.ptr.cast(), buf.len) })
     }
 
     fn write(&self, fd: i32, buf: GuestBuf) -> SysResult {
+        if let Some(r) = self.eventfds.write(fd, buf) {
+            return r;
+        }
         // SAFETY: the kernel validates the source.
         check(unsafe { libc::write(fd, buf.ptr.cast(), buf.len) })
     }
@@ -278,6 +305,7 @@ impl HostOs for DarwinHost {
     }
 
     fn close(&self, fd: i32) -> SysResult {
+        self.eventfds.close(fd);
         // SAFETY: closing an arbitrary fd is memory-safe.
         check(unsafe { libc::close(fd) } as isize)
     }
@@ -298,6 +326,8 @@ impl HostOs for DarwinHost {
             F_GETFD => call(libc::F_GETFD, 0),
             F_SETFD => call(libc::F_SETFD, arg as i32),
             F_GETFL => call(libc::F_GETFL, 0).map(|f| linux_status_flags(f as i32) as u64),
+            // An eventfd's host fd stays nonblocking; only the guest's view changes.
+            F_SETFL if self.eventfds.set_nonblock(fd, arg as i32 & linux_o::NONBLOCK != 0) => Ok(0),
             F_SETFL => call(libc::F_SETFL, open_flags(arg as i32)?),
             _ => Err(errno::EINVAL),
         }
@@ -665,7 +695,7 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        let h = DarwinHost;
+        let h = DarwinHost::default();
         let fd = h.openat(AT_FDCWD, &cpath, 0, 0).unwrap() as i32;
         let st = h.fstat(fd).unwrap();
         assert_eq!(st.size, 5);

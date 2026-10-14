@@ -37,6 +37,7 @@ add x8, x9, #4095
 add w10, w11, #1
 add sp, sp, #16
 sub x12, x13, #2048
+sub x16, x27, #20, lsl #12
 sub w14, w15, #7
 cmp x16, #0
 cmp w17, #5

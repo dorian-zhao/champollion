@@ -67,6 +67,8 @@ pub struct Jit {
     /// Exits waiting for their target to be translated: target pc -> byte offsets of the
     /// exits' `b` instructions, patched to jump straight to the target when it appears.
     unchained: HashMap<u64, Vec<usize>, BuildHasherDefault<PcHasher>>,
+    /// Slot of the interrupt flag generated code checks.
+    interrupt_slot: u32,
     /// Whether translations were never dropped since the JIT started (or restored), so all of
     /// them come from the startup image and may be saved (see [`persist`]).
     pristine: bool,
@@ -91,7 +93,7 @@ pub struct Stats {
     pub resets: u64,
     /// Exits by code (see `translate::exit`), and NEXT exits whose target was already
     /// translated (a missed chain or jump-cache slot rather than new code).
-    pub exits: [u64; 6],
+    pub exits: [u64; 7],
     pub next_known: u64,
     /// Instructions run on the interpreter, by kind (the `Inst` variant name).
     pub interpreted: HashMap<&'static str, u64>,
@@ -105,8 +107,8 @@ impl Stats {
         let top: Vec<String> = top.iter().take(6).map(|(k, v)| format!("{k} {v}")).collect();
         format!(
             "jit: {} entries, {} translations, {} restored, {} resets, exits \
-             next/ecall/interp/fence.i/fault {:?} ({} next to known blocks), {total} interpreted \
-             [{}]",
+             next/ecall/interp/fence.i/fault/interrupt {:?} ({} next to known blocks), {total} \
+             interpreted [{}]",
             self.entries,
             self.translations,
             self.restored,
@@ -156,6 +158,7 @@ impl Jit {
             unchained: HashMap::default(),
             chaining: true,
             pristine: true,
+            interrupt_slot: 0,
             stats: Stats::default(),
             profiler: None,
         };
@@ -202,8 +205,9 @@ impl Jit {
         for attempt in 0..2 {
             let word = (self.code.used() / 4) as i64;
             let cache = self.code.data_offset() as i64;
-            let Some(t) = translate::translate(&block, pc, word, self.stub_word as i64, cache)
-            else {
+            let stub = self.stub_word as i64;
+            let slot = self.interrupt_slot;
+            let Some(t) = translate::translate(&block, pc, word, stub, cache, slot) else {
                 return Ok(None);
             };
             match self.code.append(&t.code) {
@@ -274,6 +278,31 @@ impl Jit {
     /// Run until a trap (including `ecall`), like [`interpreter::run`] with no step limit.
     pub fn run(&mut self, cpu: &mut CpuState, mem: &GuestMemory) -> Trap {
         loop {
+            if let Some(trap) = self.run_interruptible(cpu, mem) {
+                return trap;
+            }
+        }
+    }
+
+    /// Generated code checks this thread's interrupt flag (slot `slot` of
+    /// [`GuestMemory::interrupt_flag`]); slot 0 by default. Set it before running anything.
+    pub fn set_interrupt_slot(&mut self, slot: usize) {
+        assert!(self.blocks.is_empty(), "translations check the old slot");
+        self.interrupt_slot = slot as u32;
+    }
+
+    /// Like [`Jit::run`], but return `None` when generated code sees the interrupt flag set
+    /// (the caller delivers signals and clears it), with `cpu` at the next instruction.
+    pub fn run_interruptible(&mut self, cpu: &mut CpuState, mem: &GuestMemory) -> Option<Trap> {
+        loop {
+            // Loops through the interpreter (untranslated instructions) pass here.
+            if mem
+                .interrupt_flag(self.interrupt_slot as usize)
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0
+            {
+                return None;
+            }
             let generation = mem.code_generation();
             if generation != self.generation {
                 self.reset();
@@ -288,11 +317,11 @@ impl Jit {
                 }
                 Ok(None) => {
                     if let Err(trap) = interpreter::step(cpu, mem) {
-                        return trap;
+                        return Some(trap);
                     }
                     continue;
                 }
-                Err(trap) => return trap,
+                Err(trap) => return Some(trap),
             };
             // SAFETY: `at` holds a translation produced for this guest memory layout; it
             // only touches `cpu`, guest memory below `host_base() + GUEST_SIZE` (addresses
@@ -302,7 +331,7 @@ impl Jit {
             // interpreter.
             let Some(fpcr) = translate::guest_fpcr(cpu.fcsr >> 5 & 0b111) else {
                 if let Err(trap) = interpreter::step(cpu, mem) {
-                    return trap;
+                    return Some(trap);
                 }
                 continue;
             };
@@ -312,13 +341,13 @@ impl Jit {
                 let _active = fault::Active::enter(&self.faults);
                 unsafe { (self.enter)(cpu, mem.host_base(), self.code.ptr(at), fpcr) }
             };
-            self.stats.exits[code.min(5) as usize] += 1;
+            self.stats.exits[code.min(6) as usize] += 1;
             if code == exit::NEXT && self.blocks.contains_key(&cpu.pc) {
                 self.stats.next_known += 1;
             }
             match code {
                 exit::NEXT => {}
-                exit::ECALL => return Trap::Ecall { pc: cpu.pc },
+                exit::ECALL => return Some(Trap::Ecall { pc: cpu.pc }),
                 exit::INTERPRET => {
                     if self.stats.detailed
                         && let Ok(block) = decode_block(mem, cpu.pc, false)
@@ -326,18 +355,19 @@ impl Jit {
                         *self.stats.interpreted.entry(kind(&block[0].0)).or_default() += 1;
                     }
                     if let Err(trap) = interpreter::step(cpu, mem) {
-                        return trap;
+                        return Some(trap);
                     }
                 }
                 exit::FENCE_I => self.reset(),
+                exit::INTERRUPT => return None,
                 exit::FAULT_LOAD | exit::FAULT_STORE => {
                     let fault = MemFault { addr: self.faults.fault_addr.get() };
                     let pc = cpu.pc;
-                    return if code == exit::FAULT_LOAD {
+                    return Some(if code == exit::FAULT_LOAD {
                         Trap::LoadFault { pc, fault }
                     } else {
                         Trap::StoreFault { pc, fault }
-                    };
+                    });
                 }
                 other => panic!("bad exit code {other}"),
             }

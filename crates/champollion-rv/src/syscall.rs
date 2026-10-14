@@ -55,6 +55,10 @@ macro_rules! syscalls {
 
 syscalls! {
     GETCWD = 17 "getcwd",
+    EVENTFD2 = 19 "eventfd2",
+    EPOLL_CREATE1 = 20 "epoll_create1",
+    EPOLL_CTL = 21 "epoll_ctl",
+    EPOLL_PWAIT = 22 "epoll_pwait",
     DUP = 23 "dup",
     DUP3 = 24 "dup3",
     FCNTL = 25 "fcntl",
@@ -139,6 +143,7 @@ syscalls! {
     MPROTECT = 226 "mprotect",
     MADVISE = 233 "madvise",
     WAIT4 = 260 "wait4",
+    RISCV_HWPROBE = 258 "riscv_hwprobe",
     RISCV_FLUSH_ICACHE = 259 "riscv_flush_icache",
     PRLIMIT64 = 261 "prlimit64",
     RENAMEAT2 = 276 "renameat2",
@@ -225,6 +230,21 @@ pub struct Identity {
 #[allow(unused_variables)]
 pub trait HostOs: Send + Sync {
     fn read(&self, fd: i32, buf: GuestBuf) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn epoll_create1(&self, flags: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `event` is `(events, data)`; ignored for `EPOLL_CTL_DEL`.
+    fn epoll_ctl(&self, epfd: i32, op: i32, fd: i32, event: (u32, u64)) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Up to `max` ready `(events, data)` pairs, waiting up to `timeout_ms` (negative:
+    /// forever).
+    fn epoll_wait(&self, epfd: i32, max: usize, timeout_ms: i32) -> Result<Vec<(u32, u64)>, i32> {
+        Err(errno::ENOSYS)
+    }
+    fn eventfd(&self, initval: u32, flags: i32) -> SysResult {
         Err(errno::ENOSYS)
     }
     fn write(&self, fd: i32, buf: GuestBuf) -> SysResult {
@@ -404,6 +424,33 @@ const F_SETLKW: i32 = 7;
 fn signal_number(sig: u64) -> Result<i32, i32> {
     let sig = sig as i32;
     if (0..=signal::NSIG).contains(&sig) { Ok(sig) } else { Err(errno::EINVAL) }
+}
+
+/// `riscv_hwprobe(pairs, count, cpusetsize, cpus, flags)`: describe the hart we emulate.
+/// Each pair is `(key: i64, value: u64)`; unknown keys get key -1.
+fn hwprobe(p: &Process, a: [u64; 6]) -> SysResult {
+    const BASE_BEHAVIOR_IMA: u64 = 1;
+    const IMA_FD: u64 = 1 << 0;
+    const IMA_C: u64 = 1 << 1;
+    if a[4] != 0 {
+        return Err(errno::EINVAL);
+    }
+    for i in 0..a[1] {
+        let at = a[0] + 16 * i;
+        let mut b = [0u8; 8];
+        p.mem.read(at, &mut b).map_err(efault)?;
+        let value = match i64::from_le_bytes(b) {
+            0..=2 => Some(0), // mvendorid, marchid, mimpid
+            3 => Some(BASE_BEHAVIOR_IMA),
+            4 => Some(IMA_FD | IMA_C),
+            _ => None,
+        };
+        match value {
+            Some(v) => put(p, at + 8, &v.to_le_bytes())?,
+            None => put(p, at, &(-1i64).to_le_bytes())?,
+        }
+    }
+    Ok(0)
 }
 
 /// `kill`, `tkill`, `tgkill`. Signals to this process or its threads are queued and
@@ -733,6 +780,35 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::GETGID => Ok(host.identity().gid as u64),
         nr::GETEGID => Ok(host.identity().egid as u64),
         nr::KILL | nr::TKILL | nr::TGKILL => kill(p, nr, a),
+        nr::EVENTFD2 => host.eventfd(a[0] as u32, a[1] as i32),
+        nr::EPOLL_CREATE1 => host.epoll_create1(a[0] as i32),
+        nr::EPOLL_CTL => {
+            const EPOLL_CTL_DEL: i32 = 2;
+            // riscv64 `struct epoll_event` is not packed: events, padding, data.
+            let event = if a[1] as i32 == EPOLL_CTL_DEL || a[3] == 0 {
+                (0, 0)
+            } else {
+                let mut b = [0u8; 16];
+                p.mem.read(a[3], &mut b).map_err(efault)?;
+                let events = u32::from_le_bytes(b[..4].try_into().unwrap());
+                (events, u64::from_le_bytes(b[8..].try_into().unwrap()))
+            };
+            host.epoll_ctl(fd, a[1] as i32, a[2] as i32, event)
+        }
+        nr::EPOLL_PWAIT => {
+            // The signal mask argument is not applied: blocked waits are not interrupted
+            // by signals yet anyway.
+            let ready = host.epoll_wait(fd, a[2] as i32 as usize, a[3] as i32)?;
+            let mut b = Vec::with_capacity(16 * ready.len());
+            for (events, data) in &ready {
+                b.extend(events.to_le_bytes());
+                b.extend([0; 4]);
+                b.extend(data.to_le_bytes());
+            }
+            put(p, a[1], &b)?;
+            Ok(ready.len() as u64)
+        }
+        nr::RISCV_HWPROBE => hwprobe(p, a),
         nr::RT_SIGACTION => {
             let sig = signal_number(a[0])?;
             if sig == 0 || a[3] != 8 {

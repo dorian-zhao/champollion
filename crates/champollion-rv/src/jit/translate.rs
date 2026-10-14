@@ -35,7 +35,8 @@ use crate::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FArithOp, FCmpOp, FWidth, FmaOp, Inst, IntType,
     LoadWidth, RM_DYN, SgnjKind, StoreWidth,
 };
-use crate::memory::{GUARD_SIZE, GUEST_SIZE};
+use crate::memory::{CONTROL_OFFSET, GUARD_SIZE, GUEST_SIZE};
+const _: () = assert!(CONTROL_OFFSET.is_multiple_of(4096) && CONTROL_OFFSET >> 12 < 4096);
 
 pub const CTX: Reg = 28;
 pub const MEMBASE: Reg = 27;
@@ -87,6 +88,8 @@ pub mod exit {
     /// A load or store at `pc` faulted (set by the fault handler, not by generated code).
     pub const FAULT_LOAD: u64 = 4;
     pub const FAULT_STORE: u64 = 5;
+    /// The thread's interrupt flag was set (a signal to deliver); continue at `pc`.
+    pub const INTERRUPT: u64 = 6;
 }
 
 pub fn x_offset(r: u8) -> u32 {
@@ -165,6 +168,7 @@ pub struct Translation {
     pub sites: Vec<(usize, super::fault::Site)>,
 }
 
+#[derive(Clone, Copy)]
 enum Tail {
     /// Continue at a static pc with an exit code.
     Static { pc: u64, code: u64 },
@@ -173,10 +177,11 @@ enum Tail {
     Interpret { pc: u64, retired_before: u32 },
     /// A taken conditional branch in the middle of a block, of which `retired_before`
     /// instructions had retired (including the branch): correct instret, then a chainable
-    /// jump to `pc`.
-    Side { pc: u64, retired_before: u32 },
-    /// Continue at the pc computed into `ADDR` (a jump-cache miss).
-    Dynamic,
+    /// jump to `pc`, after an interrupt check if it jumps `back`.
+    Side { pc: u64, retired_before: u32, back: bool },
+    /// Continue at the pc computed into `ADDR` with an exit code (a jump-cache miss, or an
+    /// interrupt before an indirect jump).
+    Dynamic { code: u64 },
 }
 
 /// Number of entries in the jump cache (a power of two): `(guest pc, host code address)`
@@ -210,6 +215,8 @@ struct Tx {
     addr_base: Option<u8>,
     /// Whether the access being translated has its base register reused by a later one.
     base_reused: bool,
+    /// The interrupt flag this thread's code checks (see [`Tx::interrupt_check`]).
+    interrupt_slot: u32,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -312,7 +319,11 @@ impl Tx {
 
     /// Jump to the guest pc in `ADDR` through the jump cache: on a hit, straight to the
     /// cached host code; on a miss, exit to the dispatcher (which fills the slot).
-    fn indirect(&mut self) {
+    /// `check` adds an interrupt check (see [`Tx::interrupt_check`]).
+    fn indirect(&mut self, check: bool) {
+        if check {
+            self.interrupt_check(None);
+        }
         self.a.ubfm(DST, ADDR, 1, JUMP_CACHE_BITS); // index = pc[16:1]
         // The jump cache is page-aligned in the code buffer's data area.
         let here = (self.block_word + self.a.pos() as i64) * 4;
@@ -323,8 +334,26 @@ impl Tx {
         self.a.cmp(SRC0, ADDR);
         let miss = self.a.pos();
         self.a.b_cond(Cond::Ne, miss); // patched once the tail exists
-        self.tails.push((miss, Tail::Dynamic));
+        self.tails.push((miss, Tail::Dynamic { code: exit::NEXT }));
         self.a.br(SRC1);
+    }
+
+    /// Leave with `exit::INTERRUPT` (continuing at `target`) if another thread asked this
+    /// one to (a signal to deliver). Emitted before backward direct jumps and before
+    /// indirect jumps other than returns: a cycle of forward jumps is impossible, and a
+    /// return only closes a cycle together with a call, which is a backward jump (recursion)
+    /// or an indirect one. So every loop passes a check, even a tight one, while forward
+    /// edges and returns stay free.
+    fn interrupt_check(&mut self, target: Option<u64>) {
+        self.a.sub_imm_lsl12(DST, MEMBASE, (CONTROL_OFFSET >> 12) as u32);
+        self.a.ldr_off_w(DST, DST, self.interrupt_slot * 4);
+        let check = self.a.pos();
+        self.a.cbnz(DST, check); // patched once the tail exists
+        let tail = match target {
+            Some(pc) => Tail::Static { pc, code: exit::INTERRUPT },
+            None => Tail::Dynamic { code: exit::INTERRUPT }, // target in ADDR
+        };
+        self.tails.push((check, tail));
     }
 
     /// Translate one non-control-flow instruction. Returns false if unsupported.
@@ -927,8 +956,11 @@ impl Tx {
     }
 
     fn emit_tails(&mut self) {
-        let tails = std::mem::take(&mut self.tails);
-        for (branch, tail) in tails {
+        // Tails may add tails (a side exit's interrupt check), so iterate by index.
+        let mut i = 0;
+        while i < self.tails.len() {
+            let (branch, tail) = self.tails[i];
+            i += 1;
             let here = self.a.pos();
             self.a.patch(branch, here);
             match tail {
@@ -937,10 +969,13 @@ impl Tx {
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, code as u16, 0);
                 }
-                Tail::Side { pc, retired_before } => {
+                Tail::Side { pc, retired_before, back } => {
                     let undo = self.retired - retired_before;
                     if undo > 0 {
                         self.a.sub_imm(INSTRET_REG, INSTRET_REG, undo);
+                    }
+                    if back {
+                        self.interrupt_check(Some(pc));
                     }
                     // Chained later; until then it falls through into the exit below.
                     let b = self.a.pos();
@@ -957,9 +992,9 @@ impl Tx {
                     self.a.str_off(ADDR, CTX, PC);
                     self.a.movz(EXIT_CODE, exit::INTERPRET as u16, 0);
                 }
-                Tail::Dynamic => {
+                Tail::Dynamic { code } => {
                     self.a.str_off(ADDR, CTX, PC);
-                    self.a.movz(EXIT_CODE, exit::NEXT as u16, 0);
+                    self.a.movz(EXIT_CODE, code as u16, 0);
                 }
             }
             // Branch to the shared exit stub; its offset is fixed up by `translate`.
@@ -1038,13 +1073,17 @@ fn base_reuse(block: &[(Inst, u8)]) -> Vec<bool> {
 /// Translate `block` (as decoded at `pc`) into code that will live at word index
 /// `block_word` of the code buffer, whose exit stub is at word index `stub_word`. Returns
 /// `None` if not even the first instruction can be translated. Indirect jumps probe the
-/// jump cache at byte offset `jump_cache` in the code buffer.
+/// jump cache at byte offset `jump_cache` in the code buffer. Backward and indirect jumps
+/// check interrupt flag `interrupt_slot` (see [`GuestMemory::interrupt_flag`]).
+///
+/// [`GuestMemory::interrupt_flag`]: crate::memory::GuestMemory::interrupt_flag
 pub fn translate(
     block: &[(Inst, u8)],
     pc: u64,
     block_word: i64,
     stub_word: i64,
     jump_cache: i64,
+    interrupt_slot: u32,
 ) -> Option<Translation> {
     let mut tx = Tx {
         a: Asm::new(),
@@ -1057,6 +1096,7 @@ pub fn translate(
         tail_exits: Vec::new(),
         addr_base: None,
         base_reused: false,
+        interrupt_slot,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
@@ -1079,6 +1119,9 @@ pub fn translate(
                 tx.link(rd, next);
                 retired += 1;
                 let target = at.wrapping_add(sext(offset));
+                if target <= at {
+                    tx.interrupt_check(Some(target));
+                }
                 exits.push((tx.a.pos(), Some(target)));
                 tx.exit(Tail::Static { pc: target, code: exit::NEXT });
                 ended = true;
@@ -1091,6 +1134,9 @@ pub fn translate(
                     let target = base.wrapping_add(sext(offset)) & !1;
                     tx.link(rd, next);
                     retired += 1;
+                    if target <= at {
+                        tx.interrupt_check(Some(target));
+                    }
                     exits.push((tx.a.pos(), Some(target)));
                     tx.exit(Tail::Static { pc: target, code: exit::NEXT });
                     ended = true;
@@ -1106,7 +1152,7 @@ pub fn translate(
                 }
                 tx.link(rd, next);
                 retired += 1;
-                tx.indirect();
+                tx.indirect(!(rd == 0 && rs1 == 1)); // no check on `ret`
                 ended = true;
                 break;
             }
@@ -1129,7 +1175,9 @@ pub fn translate(
                     // leave through a side exit when taken.
                     let bcond = tx.a.pos();
                     tx.a.b_cond(c, bcond); // patched once the tail exists
-                    tx.tails.push((bcond, Tail::Side { pc: target, retired_before: retired }));
+                    let side =
+                        Tail::Side { pc: target, retired_before: retired, back: target <= at };
+                    tx.tails.push((bcond, side));
                     tx.retired = retired;
                     known = None;
                     at = next;
@@ -1140,6 +1188,9 @@ pub fn translate(
                 tx.a.b_cond(c, bcond + 2);
                 exits.push((tx.a.pos(), Some(next)));
                 tx.exit(Tail::Static { pc: next, code: exit::NEXT });
+                if target <= at {
+                    tx.interrupt_check(Some(target));
+                }
                 exits.push((tx.a.pos(), Some(target)));
                 tx.exit(Tail::Static { pc: target, code: exit::NEXT });
                 ended = true;
