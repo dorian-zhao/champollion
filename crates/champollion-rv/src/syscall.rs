@@ -111,6 +111,16 @@ syscalls! {
     RT_SIGPROCMASK = 135 "rt_sigprocmask",
     RT_SIGPENDING = 136 "rt_sigpending",
     RT_SIGRETURN = 139 "rt_sigreturn",
+    SETREGID = 143 "setregid",
+    SETGID = 144 "setgid",
+    SETREUID = 145 "setreuid",
+    SETUID = 146 "setuid",
+    SETRESUID = 147 "setresuid",
+    GETRESUID = 148 "getresuid",
+    SETRESGID = 149 "setresgid",
+    GETRESGID = 150 "getresgid",
+    GETGROUPS = 158 "getgroups",
+    SETGROUPS = 159 "setgroups",
     UNAME = 160 "uname",
     GETRUSAGE = 165 "getrusage",
     UMASK = 166 "umask",
@@ -845,6 +855,41 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::GETEUID => Ok(host.identity().euid as u64),
         nr::GETGID => Ok(host.identity().gid as u64),
         nr::GETEGID => Ok(host.identity().egid as u64),
+        // The guest cannot change its credentials: setting them to what they are succeeds
+        // (programs do that to drop privileges they never had), anything else is EPERM.
+        nr::SETUID | nr::SETGID | nr::SETREUID | nr::SETREGID | nr::SETRESUID | nr::SETRESGID => {
+            let id = host.identity();
+            let (real, effective) = match nr {
+                nr::SETUID | nr::SETREUID | nr::SETRESUID => (id.uid, id.euid),
+                _ => (id.gid, id.egid),
+            };
+            let n = match nr {
+                nr::SETUID | nr::SETGID => 1,
+                nr::SETREUID | nr::SETREGID => 2,
+                _ => 3,
+            };
+            let ok = a[..n]
+                .iter()
+                .all(|&v| v as u32 == u32::MAX || v as u32 == real || v as u32 == effective);
+            if ok { Ok(0) } else { Err(errno::EPERM) }
+        }
+        nr::GETRESUID | nr::GETRESGID => {
+            let id = host.identity();
+            let (real, effective) =
+                if nr == nr::GETRESUID { (id.uid, id.euid) } else { (id.gid, id.egid) };
+            for (addr, v) in [(a[0], real), (a[1], effective), (a[2], effective)] {
+                put(p, addr, &v.to_le_bytes())?;
+            }
+            Ok(0)
+        }
+        // Supplementary groups: just the primary one.
+        nr::GETGROUPS => {
+            if a[0] > 0 {
+                put(p, a[1], &host.identity().gid.to_le_bytes())?;
+            }
+            Ok(1)
+        }
+        nr::SETGROUPS => Err(errno::EPERM),
         nr::KILL | nr::TKILL | nr::TGKILL => kill(p, nr, a),
         nr::EVENTFD2 => host.eventfd(a[0] as u32, a[1] as i32),
         nr::EPOLL_CREATE1 => host.epoll_create1(a[0] as i32),
