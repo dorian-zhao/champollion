@@ -23,6 +23,7 @@ impl Session {
         // Port 0: rvrun picks a free port and reports it on stderr.
         let mut child = Command::new(env!("CARGO_BIN_EXE_rvrun"))
             .args(["-g", "0"])
+            .env("RVRUN_CACHE", "0")
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

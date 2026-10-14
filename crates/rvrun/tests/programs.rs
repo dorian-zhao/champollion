@@ -10,8 +10,13 @@ fn path(rel: &str) -> PathBuf {
 }
 
 fn rvrun(args: &[&std::ffi::OsStr], stdin: &[u8]) -> Output {
+    rvrun_with(args, stdin, &[("RVRUN_CACHE", "0".as_ref())])
+}
+
+fn rvrun_with(args: &[&std::ffi::OsStr], stdin: &[u8], env: &[(&str, &std::ffi::OsStr)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rvrun"))
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -30,6 +35,30 @@ fn assert_matches_native(out: &Output, expected: &str) {
         assert_eq!(g, e, "line {}", i + 1);
     }
     assert_eq!(got.lines().count(), expected.lines().count(), "stderr: {stderr}");
+}
+
+#[test]
+fn code_cache_reuses_translations() {
+    let dir = std::env::temp_dir().join(format!("rvrun-cache-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let env = [("RVRUN_CACHE_DIR", dir.as_os_str()), ("RVRUN_STATS", "1".as_ref())];
+    let lua = path("fixtures/programs/lua");
+    let script = path("programs/basics.lua");
+    let sqlite = path("fixtures/programs/sqlite3");
+    let sql = std::fs::read(path("programs/basics.sql")).unwrap();
+    for run in ["cold", "warm"] {
+        let out = rvrun_with(&[lua.as_os_str(), script.as_os_str()], b"", &env);
+        assert_matches_native(&out, "programs/basics.lua.expected");
+        let stats = String::from_utf8_lossy(&out.stderr);
+        if run == "warm" {
+            // The same run again: everything comes from the cache.
+            assert!(stats.contains(" 0 translations,"), "{stats}");
+            assert!(!stats.contains(" 0 restored,"), "{stats}");
+        }
+        let out = rvrun_with(&[sqlite.as_os_str()], &sql, &env);
+        assert_matches_native(&out, "programs/basics.sql.expected");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

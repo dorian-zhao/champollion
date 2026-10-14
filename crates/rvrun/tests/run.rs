@@ -12,6 +12,7 @@ fn rvrun(args: &[&std::ffi::OsStr], stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rvrun"))
         .args(args)
         .env("CHAMPOLLION_TEST", "yes")
+        .env("RVRUN_CACHE", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

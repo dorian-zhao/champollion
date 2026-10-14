@@ -106,6 +106,17 @@ impl CodeBuffer {
         self.dirty.push((at, at + len));
     }
 
+    /// Bytes of code space.
+    pub fn capacity(&self) -> usize {
+        self.size
+    }
+
+    /// The generated code so far.
+    pub fn code(&self) -> &[u8] {
+        // SAFETY: the first `used` bytes are initialized code; the mapping is always readable.
+        unsafe { std::slice::from_raw_parts(self.base, self.used) }
+    }
+
     /// Byte offset of the data area from the start of the buffer.
     pub fn data_offset(&self) -> usize {
         self.size

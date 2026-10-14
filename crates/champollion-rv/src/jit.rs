@@ -13,6 +13,7 @@
 pub mod arm64;
 pub mod code;
 pub mod fault;
+mod persist;
 pub mod profile;
 pub mod translate;
 
@@ -66,6 +67,9 @@ pub struct Jit {
     /// Exits waiting for their target to be translated: target pc -> byte offsets of the
     /// exits' `b` instructions, patched to jump straight to the target when it appears.
     unchained: HashMap<u64, Vec<usize>, BuildHasherDefault<PcHasher>>,
+    /// Whether translations were never dropped since the JIT started (or restored), so all of
+    /// them come from the startup image and may be saved (see [`persist`]).
+    pristine: bool,
     /// Set to disable chaining (every block returns to the dispatcher), for comparison.
     pub chaining: bool,
     pub stats: Stats,
@@ -82,6 +86,8 @@ pub struct Stats {
     /// Calls into generated code (each one a full save/restore round trip).
     pub entries: u64,
     pub translations: u64,
+    /// Blocks loaded from a persistent code cache.
+    pub restored: u64,
     pub resets: u64,
     /// Exits by code (see `translate::exit`), and NEXT exits whose target was already
     /// translated (a missed chain or jump-cache slot rather than new code).
@@ -98,10 +104,12 @@ impl Stats {
         top.sort_by(|a, b| b.1.cmp(a.1));
         let top: Vec<String> = top.iter().take(6).map(|(k, v)| format!("{k} {v}")).collect();
         format!(
-            "jit: {} entries, {} translations, {} resets, exits next/ecall/interp/fence.i/fault \
-             {:?} ({} next to known blocks), {total} interpreted [{}]",
+            "jit: {} entries, {} translations, {} restored, {} resets, exits \
+             next/ecall/interp/fence.i/fault {:?} ({} next to known blocks), {total} interpreted \
+             [{}]",
             self.entries,
             self.translations,
+            self.restored,
             self.resets,
             self.exits,
             self.next_known,
@@ -147,6 +155,7 @@ impl Jit {
             faults,
             unchained: HashMap::default(),
             chaining: true,
+            pristine: true,
             stats: Stats::default(),
             profiler: None,
         };
@@ -156,6 +165,9 @@ impl Jit {
 
     /// Drop every translation and regenerate the trampoline at the start of the buffer.
     fn reset(&mut self) {
+        if !self.blocks.is_empty() {
+            self.pristine = false;
+        }
         self.code.reset();
         self.stats.resets += 1;
         if let Some(p) = &mut self.profiler {
@@ -428,6 +440,44 @@ mod tests {
     }
 
     #[test]
+    fn restored_translations_run_like_fresh_ones() {
+        let prog = [
+            addi(10, 10, 1),      // 0x00: a0 += 1
+            op_imm(7, 12, 10, 1), // 0x04: andi a2, a0, 1
+            beq(12, 0, 8),        // 0x08: even -> 0x10
+            store(3, 11, 10, 0),  // 0x0c: sd a0, 0(a1)
+            addi(14, 0, 5),       // 0x10: a4 = 5
+            b(4, 10, 14, -0x14),  // 0x14: blt a0, a4, 0x00
+            load(3, 12, 0, 0x40), // 0x18: faults
+        ];
+        let run = |jit: &mut Jit, mem: &GuestMemory| {
+            let mut cpu = CpuState::new(CODE);
+            cpu.x[11] = DATA;
+            (jit.run(&mut cpu, mem), cpu)
+        };
+        let mem = setup(&prog);
+        let mut first = Jit::new().unwrap();
+        let want = run(&mut first, &mem);
+        assert!(first.cacheable());
+        let saved = first.save(42).unwrap();
+
+        let mem = setup(&prog);
+        let mut second = Jit::new().unwrap();
+        assert_eq!(second.restore(&saved, 42, &mem), Ok(first.blocks.len()));
+        assert_eq!(run(&mut second, &mem), want, "restored code, chains, and fault sites work");
+        assert_eq!(second.stats.translations, 0);
+
+        // Snapshots for another key, truncated, or padded are refused, leaving the JIT empty
+        // but working.
+        let mut third = Jit::new().unwrap();
+        assert!(third.restore(&saved, 7, &mem).is_err());
+        assert!(third.restore(&saved[..saved.len() - 1], 42, &mem).is_err());
+        assert!(third.restore(&[&saved[..], &[0]].concat(), 42, &mem).is_err());
+        assert!(third.blocks.is_empty());
+        assert_eq!(run(&mut third, &setup(&prog)), want);
+    }
+
+    #[test]
     fn side_exits_match_the_interpreter() {
         // One block with two mid-block branches; the loop takes each both ways, so side
         // exits (with their instret correction) and fall-through paths both run.
@@ -633,8 +683,9 @@ mod tests {
         assert_eq!((cpu.x[12], cpu.x[13], cpu.x[14]), (4, 1, 3));
     }
 
-    /// Differential fuzzing: random programs must leave the JIT and the interpreter in
-    /// exactly the same state (registers, fcsr, reservation, instret, trap, and memory).
+    /// Differential fuzzing: random programs must leave the JIT (fresh, and restored from a
+    /// saved snapshot) and the interpreter in exactly the same state (registers, fcsr,
+    /// reservation, instret, trap, and memory).
     mod fuzz {
         use super::*;
 
@@ -894,13 +945,42 @@ mod tests {
         /// code too (a guest page sharing a host page with a mapped one does not fault).
         const DATA_SIZE: u64 = 0x4000;
 
-        fn run(prog: &[u32], init: &CpuState, data: &[u8], jit: bool) -> (Trap, CpuState, Vec<u8>) {
-            let mem = setup(prog);
-            mem.map(DATA + 0x1000, DATA_SIZE - 0x1000, Prot::RW).unwrap();
-            mem.write_privileged(DATA, data).unwrap();
+        /// How [`run`] executes a program.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mode {
+            Interpreter,
+            Jit,
+            /// On translations saved by an earlier JIT run and restored into a fresh JIT.
+            Restored,
+        }
+
+        fn run(
+            prog: &[u32],
+            init: &CpuState,
+            data: &[u8],
+            mode: Mode,
+        ) -> (Trap, CpuState, Vec<u8>) {
+            let memory = || {
+                let mem = setup(prog);
+                mem.map(DATA + 0x1000, DATA_SIZE - 0x1000, Prot::RW).unwrap();
+                mem.write_privileged(DATA, data).unwrap();
+                mem
+            };
+            let mut mem = memory();
             let mut cpu = init.clone();
-            let trap = if jit {
-                Jit::new().unwrap().run(&mut cpu, &mem)
+            let trap = if mode != Mode::Interpreter {
+                let mut jit = Jit::new().unwrap();
+                let trap = jit.run(&mut cpu, &mem);
+                // (Nothing to save if the program ended before a block was translated.)
+                if let (Mode::Restored, Some(saved)) = (mode, jit.save(1)) {
+                    let mut jit = Jit::new().unwrap();
+                    mem = memory();
+                    cpu = init.clone();
+                    jit.restore(&saved, 1, &mem).unwrap();
+                    jit.run(&mut cpu, &mem)
+                } else {
+                    trap
+                }
             } else {
                 let mut steps = 0;
                 loop {
@@ -961,11 +1041,14 @@ mod tests {
                 init.x[COUNTER as usize] = 1 + rng.below(3);
                 init.fcsr = (rng.below(5) as u32) << 5;
                 let data: Vec<u8> = (0..DATA_SIZE).map(|_| rng.next() as u8).collect();
-                let want = run(&prog, &init, &data, false);
-                let got = run(&prog, &init, &data, true);
-                assert_eq!(got.0, want.0, "case {case} (seed {seed:#x}): trap");
-                assert_eq!(got.1, want.1, "case {case} (seed {seed:#x}): state");
-                assert!(got.2 == want.2, "case {case} (seed {seed:#x}): memory");
+                let want = run(&prog, &init, &data, Mode::Interpreter);
+                for mode in [Mode::Jit, Mode::Restored] {
+                    let got = run(&prog, &init, &data, mode);
+                    let which = if mode == Mode::Jit { "jit" } else { "restored" };
+                    assert_eq!(got.0, want.0, "case {case} (seed {seed:#x}): {which} trap");
+                    assert_eq!(got.1, want.1, "case {case} (seed {seed:#x}): {which} state");
+                    assert!(got.2 == want.2, "case {case} (seed {seed:#x}): {which} memory");
+                }
             }
         }
     }
