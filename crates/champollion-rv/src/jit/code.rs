@@ -27,6 +27,7 @@ pub struct CodeBuffer {
     /// Byte ranges written since the last commit.
     dirty: Vec<(usize, usize)>,
     /// Whether this thread has the region writable (macOS).
+    #[cfg(target_os = "macos")]
     writable: bool,
 }
 
@@ -60,7 +61,15 @@ impl CodeBuffer {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { base: base.cast(), size, data_size, used: 0, dirty: Vec::new(), writable: false })
+        Ok(Self {
+            base: base.cast(),
+            size,
+            data_size,
+            used: 0,
+            dirty: Vec::new(),
+            #[cfg(target_os = "macos")]
+            writable: false,
+        })
     }
 
     pub fn base(&self) -> *const u8 {

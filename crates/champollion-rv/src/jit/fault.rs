@@ -133,9 +133,32 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+/// The same as the macOS handler, for the Linux layout of the interrupted context.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
-    // TODO(M6): Linux ucontext layout for route A.
+    let table = ACTIVE.with(|a| a.get());
+    // SAFETY: the kernel passes a valid ucontext; `table` is live while ACTIVE is set.
+    unsafe {
+        let mc = &mut (*(ctx as *mut libc::ucontext_t)).uc_mcontext;
+        let pc = mc.pc as usize;
+        let site = table.as_ref().and_then(|t| {
+            let off = pc.checked_sub(t.code_base).filter(|&o| o < t.code_len)?;
+            t.sites.get(&off).map(|s| (t, *s))
+        });
+        let Some((t, site)) = site else {
+            return chain(sig, info, ctx);
+        };
+        let cpu = mc.regs[CTX as usize] as *mut CpuState;
+        (*cpu).pc = site.guest_pc;
+        mc.regs[INSTRET_REG as usize] -= site.instret_undo as u64;
+        t.fault_addr.set(mc.fault_address.wrapping_sub(mc.regs[MEMBASE as usize]));
+        mc.regs[EXIT_CODE as usize] = if site.store { exit::FAULT_STORE } else { exit::FAULT_LOAD };
+        mc.pc = t.stub as u64;
+    }
+}
+
+#[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
+extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     // SAFETY: forwarding the handler's own arguments.
     unsafe { chain(sig, info, ctx) }
 }
