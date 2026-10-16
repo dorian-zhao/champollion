@@ -303,6 +303,62 @@ pub enum Inst {
         src: VSel,
         mask: bool,
     },
+    /// Float vector arithmetic (`vfadd` ... `vfsgnjx`, `.vv` or `.vf`).
+    VFArith {
+        op: VFArithOp,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+        mask: bool,
+    },
+    /// The fused multiply-add family (`vfmacc` and its seven siblings).
+    VFMa {
+        op: VFMaOp,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+        mask: bool,
+    },
+    /// Single-source float ops: `vfsqrt.v`, `vfclass.v`, and the `vfcvt` family.
+    VFUnary {
+        op: VFUnaryOp,
+        vd: u8,
+        vs2: u8,
+        mask: bool,
+    },
+    /// Mask-producing float comparisons (`vmfeq` and friends).
+    VFCmp {
+        op: VFCmpOp,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+        mask: bool,
+    },
+    /// Float reductions (`vfredusum` and friends); always unmasked.
+    VFRed {
+        op: VFRedOp,
+        vd: u8,
+        vs1: u8,
+        vs2: u8,
+    },
+    /// `vfmv.s.f`: one float scalar into element 0.
+    VFmvSF {
+        vd: u8,
+        rs1: u8,
+    },
+    /// `vfmv.f.s`: element 0 into an `f` register.
+    VFmvFS {
+        rd: u8,
+        vs2: u8,
+    },
+    /// `vfslide1up.vf` / `vfslide1down.vf`.
+    VFSlide1 {
+        down: bool,
+        vd: u8,
+        vs2: u8,
+        rs1: u8,
+        mask: bool,
+    },
     VCmp {
         op: VCmpOp,
         vd: u8,
@@ -457,6 +513,79 @@ pub enum VWidth {
     E64,
 }
 
+/// Float vector arithmetic (OPFVV/OPFVF `funct6` 0x00..0x27). Semantics mirror the
+/// scalar F extension per element; `Rsub` is `vfrsub`'s operand swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VFArithOp {
+    Add,
+    /// `vfrsub`: the operand is subtracted from vs2.
+    Rsub,
+    Sub,
+    Min,
+    Max,
+    Sgnj,
+    Sgnjn,
+    Sgnjx,
+    Mul,
+    Div,
+}
+
+/// The eight fused multiply-adds. The `add` group reads the accumulator as `vd`; the
+/// `sub` group keeps the subtracted operand in vs2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VFMaOp {
+    Macc,
+    Nmacc,
+    Msac,
+    Nmsac,
+    Madd,
+    Nmadd,
+    Msub,
+    Nmsub,
+}
+
+/// Single-source float ops: `vfsqrt.v`, `vfclass.v`, and the six `vfcvt` conversions
+/// between a float and the same-width signed or unsigned integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VFUnaryOp {
+    Sqrt,
+    Class,
+    /// `vfcvt.xu.f.v` (unsigned, per `frm`).
+    XuF,
+    /// `vfcvt.x.f.v` (signed, per `frm`).
+    XF,
+    /// `vfcvt.f.xu.v`.
+    FXu,
+    /// `vfcvt.f.x.v`.
+    FX,
+    /// `vfcvt.rtz.xu.f.v`.
+    RtzXuF,
+    /// `vfcvt.rtz.x.f.v`.
+    RtzXF,
+}
+
+/// Mask-producing float compares (`vmfeq.vv` 0x18 ... `vmfge.vf` 0x1f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VFCmpOp {
+    Eq,
+    Le,
+    Lt,
+    Ne,
+    Gt,
+    Ge,
+}
+
+/// Float reductions, `vd[0] = vs1[0] op vs2[0] … vs2[vl-1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VFRedOp {
+    /// `vfredusum.vs`: unordered, so any evaluation order is legal.
+    Usum,
+    /// `vfredosum.vs`: ordered, left to right.
+    Osum,
+    Min,
+    Max,
+}
+
 impl VWidth {
     /// Element size in bytes.
     #[inline]
@@ -537,6 +666,9 @@ pub enum VSel {
     V(u8),
     X(u8),
     I(u8),
+    /// An `f` register read as a scalar float of the current SEW (`F` extension
+    /// boxing applies: an unboxed single reads as the canonical NaN).
+    F(u8),
 }
 
 /// Mask-producing comparisons (`vmseq`, `vmslt[u]`, `vmsle[u]`, `vmsgt[u]`).
@@ -864,6 +996,9 @@ pub use compressed::decode_compressed;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     Illegal(u32),
+    /// An encoding that is legal on its own but reserved under the current runtime
+    /// state, e.g. a float vector op with `SEW` narrower than 32.
+    Reserved,
 }
 
 const LOAD: u32 = 0b000_0011;

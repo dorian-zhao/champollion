@@ -8,8 +8,8 @@
 //! 26.04's baseline (RVA23U64) compiles them into libc without a runtime check.
 
 use super::{
-    DecodeError, Inst, VArithOp, VCmpOp, VMaskOp, VMemKind, VRedOp, VSel, VSetKind, VStoreKind,
-    VUnaryOp, VWidth,
+    DecodeError, Inst, VArithOp, VCmpOp, VFArithOp, VFCmpOp, VFMaOp, VFRedOp, VFUnaryOp, VMaskOp,
+    VMemKind, VRedOp, VSel, VSetKind, VStoreKind, VUnaryOp, VWidth,
 };
 
 fn illegal(w: u32) -> DecodeError {
@@ -335,6 +335,88 @@ pub fn decode_op(w: u32) -> Result<Inst, DecodeError> {
             0b001111 => arith(VArithOp::Slide1Down, VSel::X(vs1)),
             0b101001 => Ok(Inst::VMacc { add: false, vd, vs2, src: VSel::X(vs1) }),
             0b101101 => Ok(Inst::VMacc { add: true, vd, vs2, src: VSel::X(vs1) }),
+            _ => Err(illegal(w)),
+        },
+        0b001 => decode_fp(w, f6, vd, vs2, vs1, mask, false),
+        0b101 => decode_fp(w, f6, vd, vs2, vs1, mask, true),
+        _ => Err(illegal(w)),
+    }
+}
+
+/// The OPFVV (`funct3` 001) and OPFVF (101) float groups. They share a `funct6` table;
+/// `scalar` selects whether the third operand is an `f` register (`...vf`) or a vector
+/// register (`...vv`), and a few encodings exist in only one of the two groups.
+fn decode_fp(
+    w: u32,
+    f6: u32,
+    vd: u8,
+    vs2: u8,
+    vs1: u8,
+    mask: bool,
+    scalar: bool,
+) -> Result<Inst, DecodeError> {
+    let src = if scalar { VSel::F(vs1) } else { VSel::V(vs1) };
+    let arith = |op| Ok(Inst::VFArith { op, vd, vs2, src, mask });
+    let fma = |op| Ok(Inst::VFMa { op, vd, vs2, src, mask });
+    let cmp = |op| Ok(Inst::VFCmp { op, vd, vs2, src, mask });
+    match f6 {
+        0b000000 => arith(VFArithOp::Add),
+        0b000010 => arith(VFArithOp::Sub),
+        // vfrsub exists only as .vf (like vfrdiv).
+        0b100111 if scalar => arith(VFArithOp::Rsub),
+        0b000100 => arith(VFArithOp::Min),
+        0b000110 => arith(VFArithOp::Max),
+        0b001000 => arith(VFArithOp::Sgnj),
+        0b001001 => arith(VFArithOp::Sgnjn),
+        0b001010 => arith(VFArithOp::Sgnjx),
+        0b100000 => arith(VFArithOp::Div),
+        0b100100 => arith(VFArithOp::Mul),
+        0b101000 => fma(VFMaOp::Madd),
+        0b101001 => fma(VFMaOp::Nmadd),
+        0b101010 => fma(VFMaOp::Msub),
+        0b101011 => fma(VFMaOp::Nmsub),
+        0b101100 => fma(VFMaOp::Macc),
+        0b101101 => fma(VFMaOp::Nmacc),
+        0b101110 => fma(VFMaOp::Msac),
+        0b101111 => fma(VFMaOp::Nmsac),
+        0b011000 => cmp(VFCmpOp::Eq),
+        0b011001 => cmp(VFCmpOp::Le),
+        0b011011 => cmp(VFCmpOp::Lt),
+        0b011100 => cmp(VFCmpOp::Ne),
+        0b011101 => cmp(VFCmpOp::Gt),
+        0b011111 => cmp(VFCmpOp::Ge),
+        // Reductions are OPFVV-only and always unmasked.
+        0b000001 if !scalar && !mask => Ok(Inst::VFRed { op: VFRedOp::Usum, vd, vs1, vs2 }),
+        0b000011 if !scalar && !mask => Ok(Inst::VFRed { op: VFRedOp::Osum, vd, vs1, vs2 }),
+        0b000101 if !scalar && !mask => Ok(Inst::VFRed { op: VFRedOp::Min, vd, vs1, vs2 }),
+        0b000111 if !scalar && !mask => Ok(Inst::VFRed { op: VFRedOp::Max, vd, vs1, vs2 }),
+        // vfsqrt.v / vfclass.v (OPFVV, selector in the vs1 field).
+        0b010011 if !scalar && vs1 == 0x00 => {
+            Ok(Inst::VFUnary { op: VFUnaryOp::Sqrt, vd, vs2, mask })
+        }
+        0b010011 if !scalar && vs1 == 0x10 => {
+            Ok(Inst::VFUnary { op: VFUnaryOp::Class, vd, vs2, mask })
+        }
+        // vfcvt.* (OPFVV, selector in the vs1 field).
+        0b010010 if !scalar => match vs1 {
+            0x00 => Ok(Inst::VFUnary { op: VFUnaryOp::XuF, vd, vs2, mask }),
+            0x01 => Ok(Inst::VFUnary { op: VFUnaryOp::XF, vd, vs2, mask }),
+            0x02 => Ok(Inst::VFUnary { op: VFUnaryOp::FXu, vd, vs2, mask }),
+            0x03 => Ok(Inst::VFUnary { op: VFUnaryOp::FX, vd, vs2, mask }),
+            0x06 => Ok(Inst::VFUnary { op: VFUnaryOp::RtzXuF, vd, vs2, mask }),
+            0x07 => Ok(Inst::VFUnary { op: VFUnaryOp::RtzXF, vd, vs2, mask }),
+            _ => Err(illegal(w)),
+        },
+        // vfmv.f.s: element 0 into f[rd].
+        0b010000 if !scalar && vs1 == 0 => Ok(Inst::VFmvFS { rd: vd, vs2 }),
+        _ if scalar => match f6 {
+            // vfmv.s.f: f[rs1] into element 0.
+            0b010000 if vs2 == 0 => Ok(Inst::VFmvSF { vd, rs1: vs1 }),
+            // vfmv.v.f (vm = 1, vs2 = 0) and vfmerge.vfm (vm = 0) share funct6.
+            0b010111 if !mask && vs2 == 0 => Ok(Inst::Vmv { vd, src: VSel::F(vs1) }),
+            0b010111 if mask => Ok(Inst::Vmerge { vd, vs2, src: VSel::F(vs1) }),
+            0b001110 => Ok(Inst::VFSlide1 { down: false, vd, vs2, rs1: vs1, mask }),
+            0b001111 => Ok(Inst::VFSlide1 { down: true, vd, vs2, rs1: vs1, mask }),
             _ => Err(illegal(w)),
         },
         _ => Err(illegal(w)),

@@ -127,3 +127,21 @@ vsuxei64.v v2, (a0), v4
 vl2r.v v4, (a1)
 vl4r.v v12, (a1)
 vs4r.v v12, (a1)
+vfadd.vv v1, v2, v3
+vfadd.vf v1, v2, fa0
+vfmacc.vv v1, v2, v3
+vfmacc.vf v1, fa0, v2
+vfmin.vv v1, v2, v3
+vfsqrt.v v1, v2
+vfclass.v v1, v2
+vfcvt.x.f.v v1, v2
+vfcvt.rtz.xu.f.v v1, v2
+vmfeq.vv v1, v2, v3
+vmflt.vf v1, v2, fa0
+vfredosum.vs v1, v2, v3
+vfmv.v.f v1, fa0
+vfmv.s.f v1, fa0
+vfmv.f.s fa0, v1
+vfmerge.vfm v1, v2, fa0, v0
+vfslide1down.vf v1, v2, fa0
+vfslide1up.vf v1, v2, fa0

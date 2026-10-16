@@ -10,7 +10,12 @@
 //! scanning is handled explicitly and does not trap).
 
 use crate::cpu::CpuState;
-use crate::decoder::{VArithOp, VCmpOp, VMaskOp, VRedOp, VSel, VUnaryOp};
+use crate::decoder::{
+    SgnjKind, VArithOp, VCmpOp, VFArithOp, VFCmpOp, VFMaOp, VFRedOp, VFUnaryOp, VMaskOp, VRedOp,
+    VSel, VUnaryOp,
+};
+use crate::fpu::{self, BinOp as FBinOp, CmpOp as FCmpOp, FmaOp, IntType, Rm, Width};
+use crate::interpreter::{nan_box, sign_inject};
 use crate::memory::{MemFault, Memory};
 
 /// VLEN in bytes. The minimum the vector spec allows, and enough for the RVA23
@@ -148,6 +153,7 @@ fn src_value(cpu: &CpuState, src: VSel, i: u64, sew_b: u64, imm_unsigned: bool) 
     match src {
         VSel::V(reg) => get_elem(cpu, reg, i, sew_b),
         VSel::X(reg) => cpu.x(reg),
+        VSel::F(reg) => fscalar(cpu, reg, sew_b),
         VSel::I(imm) => {
             if imm_unsigned {
                 u64::from(imm)
@@ -155,6 +161,21 @@ fn src_value(cpu: &CpuState, src: VSel, i: u64, sew_b: u64, imm_unsigned: bool) 
                 sext5(imm)
             }
         }
+    }
+}
+
+/// An `f` register read as a scalar float of `sew_b` bytes, with the F extension's
+/// boxing rule: an unboxed single is the canonical NaN. (`sew_b` is 4 or 8 for every
+/// instruction that carries a `VSel::F`; narrower widths are rejected before this.)
+#[inline]
+pub fn fscalar(cpu: &CpuState, reg: u8, sew_b: u64) -> u64 {
+    let v = cpu.f[reg as usize & 31];
+    if sew_b == 4 && v >> 32 != 0xffff_ffff {
+        0x7fc0_0000
+    } else if sew_b >= 8 {
+        v
+    } else {
+        v & ((1 << (8 * sew_b)) - 1)
     }
 }
 
@@ -249,7 +270,7 @@ pub fn exec_arith(cpu: &mut CpuState, op: VArithOp, vd: u8, vs2: u8, src: VSel, 
                 let off = u64::from(match src {
                     VSel::I(v) => v,
                     VSel::X(r) => cpu.x(r) as u8,
-                    VSel::V(_) => unreachable!("vslideup has no vector form"),
+                    VSel::V(_) | VSel::F(_) => unreachable!("vslideup has no vector form"),
                 });
                 if i < off {
                     continue; // undisturbed
@@ -260,7 +281,7 @@ pub fn exec_arith(cpu: &mut CpuState, op: VArithOp, vd: u8, vs2: u8, src: VSel, 
                 let off = u64::from(match src {
                     VSel::I(v) => v,
                     VSel::X(r) => cpu.x(r) as u8,
-                    VSel::V(_) => unreachable!("vslidedown has no vector form"),
+                    VSel::V(_) | VSel::F(_) => unreachable!("vslidedown has no vector form"),
                 });
                 // The source read is bounded by VLMAX, not vl (spec: "0 <= i+OFFSET <
                 // VLMAX: src[i] = vs2[i+OFFSET]"). Compilers lean on this: clang's
@@ -284,7 +305,7 @@ pub fn exec_arith(cpu: &mut CpuState, op: VArithOp, vd: u8, vs2: u8, src: VSel, 
                 let index = match src {
                     VSel::V(reg) => lens(cpu, &old_src, reg, i, sew_b),
                     VSel::I(imm) => u64::from(imm),
-                    VSel::X(_) => unreachable!("vrgather has no vx form"),
+                    VSel::X(_) | VSel::F(_) => unreachable!("vrgather has no vx form"),
                 };
                 if index < vlmax { lens(cpu, &old_vs2, vs2, index, sew_b) } else { 0 }
             }
@@ -525,7 +546,7 @@ pub fn exec_widen(cpu: &mut CpuState, mask: bool, vd: u8, vs2: u8, src: VSel) {
         let b = match src {
             VSel::V(reg) => get_elem(cpu, reg, i, sew_b),
             VSel::X(reg) => cpu.x(reg),
-            VSel::I(_) => unreachable!("vwaddu has no immediate form"),
+            VSel::I(_) | VSel::F(_) => unreachable!("vwaddu has no immediate form"),
         };
         set_elem(cpu, vd, i, sew_b * 2, a.wrapping_add(b));
     }
@@ -556,6 +577,216 @@ pub fn exec_index_load(
         set_elem(cpu, vd, i, sew_b, u64::from_le_bytes(b));
     }
     Ok(())
+}
+
+/// Float element width for the vector FP ops (the caller rejected SEW < 32 already).
+#[inline]
+fn fp_width(sew_b: u64) -> Width {
+    if sew_b == 4 { Width::S } else { Width::D }
+}
+
+/// The float source of element `i`: `vv` reads a register, `vf` the scalar `f` register
+/// (same value every element).
+#[inline]
+fn fp_src(cpu: &CpuState, src: VSel, i: u64, sew_b: u64) -> u64 {
+    match src {
+        VSel::V(reg) => get_elem(cpu, reg, i, sew_b),
+        VSel::F(reg) => fscalar(cpu, reg, sew_b),
+        _ => unreachable!("float vector sources are vv or vf"),
+    }
+}
+
+/// Float vector arithmetic (`vfadd` ... `vfsgnjx`), one element at a time on the host FPU.
+pub fn exec_farith(
+    cpu: &mut CpuState,
+    op: VFArithOp,
+    vd: u8,
+    vs2: u8,
+    src: VSel,
+    mask: bool,
+    rm: Rm,
+) {
+    let vl = cpu.vl;
+    let sew_b = sew_bytes(cpu);
+    let w = fp_width(sew_b);
+    for i in 0..vl {
+        if mask && !mask_get(cpu, 0, i) {
+            continue;
+        }
+        let a = get_elem(cpu, vs2, i, sew_b);
+        let b = fp_src(cpu, src, i, sew_b);
+        let (r, fl) = match op {
+            VFArithOp::Add => fpu::binop(FBinOp::Add, w, a, b, rm),
+            VFArithOp::Sub => fpu::binop(FBinOp::Sub, w, a, b, rm),
+            VFArithOp::Rsub => fpu::binop(FBinOp::Sub, w, b, a, rm),
+            VFArithOp::Mul => fpu::binop(FBinOp::Mul, w, a, b, rm),
+            VFArithOp::Div => fpu::binop(FBinOp::Div, w, a, b, rm),
+            VFArithOp::Min => fpu::min_max(false, w, a, b),
+            VFArithOp::Max => fpu::min_max(true, w, a, b),
+            VFArithOp::Sgnj | VFArithOp::Sgnjn | VFArithOp::Sgnjx => {
+                let kind = match op {
+                    VFArithOp::Sgnj => SgnjKind::Sgnj,
+                    VFArithOp::Sgnjn => SgnjKind::Sgnjn,
+                    _ => SgnjKind::Sgnjx,
+                };
+                (sign_inject(kind, a, b, 8 * sew_b as u32 - 1), 0)
+            }
+        };
+        cpu.fcsr |= u32::from(fl);
+        set_elem(cpu, vd, i, sew_b, r);
+    }
+}
+
+/// The eight fused multiply-adds. The spec's formulas map onto the scalar FMA shapes
+/// plus operand choice: the `macc` family accumulates in `vd`, the `madd` family
+/// multiplies `vd` and adds `vs2`.
+pub fn exec_fma(cpu: &mut CpuState, op: VFMaOp, vd: u8, vs2: u8, src: VSel, mask: bool, rm: Rm) {
+    let vl = cpu.vl;
+    let sew_b = sew_bytes(cpu);
+    let w = fp_width(sew_b);
+    for i in 0..vl {
+        if mask && !mask_get(cpu, 0, i) {
+            continue;
+        }
+        let a = get_elem(cpu, vs2, i, sew_b);
+        let b = fp_src(cpu, src, i, sew_b);
+        let d = get_elem(cpu, vd, i, sew_b);
+        let (r, fl) = match op {
+            // vd = vs2*vs1 + vd and friends: the accumulator is the addend.
+            VFMaOp::Macc => fpu::fma(FmaOp::Madd, w, a, b, d, rm),
+            VFMaOp::Nmacc => fpu::fma(FmaOp::Nmadd, w, a, b, d, rm),
+            VFMaOp::Msac => fpu::fma(FmaOp::Msub, w, a, b, d, rm),
+            VFMaOp::Nmsac => fpu::fma(FmaOp::Nmsub, w, a, b, d, rm),
+            // vd = vd*vs1 + vs2 and friends: vs2 is the addend.
+            VFMaOp::Madd => fpu::fma(FmaOp::Madd, w, d, b, a, rm),
+            VFMaOp::Nmadd => fpu::fma(FmaOp::Nmadd, w, d, b, a, rm),
+            VFMaOp::Msub => fpu::fma(FmaOp::Msub, w, d, b, a, rm),
+            VFMaOp::Nmsub => fpu::fma(FmaOp::Nmsub, w, d, b, a, rm),
+        };
+        cpu.fcsr |= u32::from(fl);
+        set_elem(cpu, vd, i, sew_b, r);
+    }
+}
+
+/// `vfsqrt.v`, `vfclass.v`, and the `vfcvt` conversions.
+pub fn exec_funary(cpu: &mut CpuState, op: VFUnaryOp, vd: u8, vs2: u8, mask: bool, rm: Rm) {
+    let vl = cpu.vl;
+    let sew_b = sew_bytes(cpu);
+    let w = fp_width(sew_b);
+    let wide = sew_b == 8;
+    for i in 0..vl {
+        if mask && !mask_get(cpu, 0, i) {
+            continue;
+        }
+        let a = get_elem(cpu, vs2, i, sew_b);
+        let (r, fl) = match op {
+            VFUnaryOp::Sqrt => fpu::sqrt(w, a, rm),
+            VFUnaryOp::Class => (fpu::classify(w, a), 0),
+            VFUnaryOp::XuF | VFUnaryOp::RtzXuF => {
+                let t = if wide { IntType::Lu } else { IntType::Wu };
+                let rm = if op == VFUnaryOp::RtzXuF { Rm::Rtz } else { rm };
+                fpu::to_int(w, t, a, rm)
+            }
+            VFUnaryOp::XF | VFUnaryOp::RtzXF => {
+                let t = if wide { IntType::L } else { IntType::W };
+                let rm = if op == VFUnaryOp::RtzXF { Rm::Rtz } else { rm };
+                fpu::to_int(w, t, a, rm)
+            }
+            VFUnaryOp::FXu => {
+                let t = if wide { IntType::Lu } else { IntType::Wu };
+                fpu::from_int(w, t, a, rm)
+            }
+            VFUnaryOp::FX => {
+                let t = if wide { IntType::L } else { IntType::W };
+                let x = if wide { a } else { sign_extend(a, 4) };
+                fpu::from_int(w, t, x, rm)
+            }
+        };
+        cpu.fcsr |= u32::from(fl);
+        set_elem(cpu, vd, i, sew_b, r);
+    }
+}
+
+/// Mask-producing float compares. Like the integer form, masked-off bits clear.
+pub fn exec_fcmp(cpu: &mut CpuState, op: VFCmpOp, vd: u8, vs2: u8, src: VSel, mask: bool) {
+    let vl = cpu.vl;
+    let sew_b = sew_bytes(cpu);
+    let w = fp_width(sew_b);
+    for i in 0..vl {
+        let a = get_elem(cpu, vs2, i, sew_b);
+        let b = fp_src(cpu, src, i, sew_b);
+        let (r, fl) = match op {
+            VFCmpOp::Eq => fpu::compare(FCmpOp::Eq, w, a, b),
+            VFCmpOp::Le => fpu::compare(FCmpOp::Le, w, a, b),
+            VFCmpOp::Lt => fpu::compare(FCmpOp::Lt, w, a, b),
+            VFCmpOp::Ne => {
+                let (r, fl) = fpu::compare(FCmpOp::Eq, w, a, b);
+                (!r, fl)
+            }
+            VFCmpOp::Gt => fpu::compare(FCmpOp::Lt, w, b, a),
+            VFCmpOp::Ge => fpu::compare(FCmpOp::Le, w, b, a),
+        };
+        cpu.fcsr |= u32::from(fl);
+        let bit = !mask || mask_get(cpu, 0, i);
+        mask_set(cpu, vd, i, bit && r);
+    }
+}
+
+/// Float reductions: element 0 of `vd` becomes `vs1[0] op vs2[0] op ... vs2[vl-1]`,
+/// folded left to right (the only order `vfredosum` allows, and a legal one for
+/// `vfredusum`).
+pub fn exec_fred(cpu: &mut CpuState, op: VFRedOp, vd: u8, vs1: u8, vs2: u8, rm: Rm) {
+    let vl = cpu.vl;
+    let sew_b = sew_bytes(cpu);
+    let w = fp_width(sew_b);
+    let mut acc = get_elem(cpu, vs1, 0, sew_b);
+    let mut flags = 0u8;
+    for i in 0..vl {
+        let x = get_elem(cpu, vs2, i, sew_b);
+        let (r, fl) = match op {
+            VFRedOp::Usum | VFRedOp::Osum => fpu::binop(FBinOp::Add, w, acc, x, rm),
+            VFRedOp::Min => fpu::min_max(false, w, acc, x),
+            VFRedOp::Max => fpu::min_max(true, w, acc, x),
+        };
+        acc = r;
+        flags |= fl;
+    }
+    cpu.fcsr |= u32::from(flags);
+    set_elem(cpu, vd, 0, sew_b, acc);
+}
+
+/// `vfmv.s.f`: the scalar into element 0 (the tail stays undisturbed).
+pub fn exec_fmv_sf(cpu: &mut CpuState, vd: u8, rs1: u8) {
+    let sew_b = sew_bytes(cpu);
+    set_elem(cpu, vd, 0, sew_b, fscalar(cpu, rs1, sew_b));
+}
+
+/// `vfmv.f.s`: element 0 into an `f` register, boxed for singles.
+pub fn exec_fmv_fs(cpu: &mut CpuState, rd: u8, vs2: u8) {
+    let sew_b = sew_bytes(cpu);
+    let v = get_elem(cpu, vs2, 0, sew_b);
+    cpu.f[rd as usize & 31] = if sew_b == 4 { nan_box(v) } else { v };
+}
+
+/// `vfslide1up.vf` / `vfslide1down.vf`: like the integer pair, with the scalar in the
+/// freed slot and the other elements moving one position.
+pub fn exec_fslide1(cpu: &mut CpuState, down: bool, vd: u8, vs2: u8, rs1: u8, mask: bool) {
+    let vl = cpu.vl;
+    let sew_b = sew_bytes(cpu);
+    let scalar = fscalar(cpu, rs1, sew_b);
+    for i in 0..vl {
+        if mask && !mask_get(cpu, 0, i) {
+            continue;
+        }
+        let v = if down {
+            if i + 1 < vl { get_elem(cpu, vs2, i + 1, sew_b) } else { scalar }
+        } else if i == 0 {
+            scalar
+        } else {
+            get_elem(cpu, vs2, i - 1, sew_b)
+        };
+        set_elem(cpu, vd, i, sew_b, v);
+    }
 }
 
 #[cfg(test)]

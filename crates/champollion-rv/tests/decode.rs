@@ -8,7 +8,8 @@ use champollion_rv::decoder::{
     LoadWidth, RM_DYN, SgnjKind, StoreWidth, VUnaryOp,
 };
 use champollion_rv::decoder::{
-    VArithOp, VCmpOp, VMaskOp, VMemKind, VRedOp, VSel, VSetKind, VStoreKind, VWidth,
+    VArithOp, VCmpOp, VFArithOp, VFCmpOp, VFMaOp, VFRedOp, VFUnaryOp, VMaskOp, VMemKind, VRedOp,
+    VSel, VSetKind, VStoreKind, VWidth,
 };
 use champollion_rv::{Inst, decode};
 
@@ -547,6 +548,11 @@ fn rv64zb() {
 fn rv64v() {
     use Inst::*;
     use VCmpOp as C;
+    use VFArithOp as FOp;
+    use VFCmpOp as FCm;
+    use VFMaOp as FMa;
+    use VFRedOp as FRed;
+    use VFUnaryOp as FUn;
     use VMemKind as M;
     use VSel::*;
     use VSetKind as K;
@@ -953,6 +959,33 @@ fn rv64v() {
                 mask: false,
                 nf: 3,
             },
+        ),
+        // The float group: OPFVV (`vv`), OPFVF (`vf`, an f register), and the unary,
+        // compare, reduction, move, merge, and slide forms.
+        ("vfadd.vv v1, v2, v3", VFArith { op: FOp::Add, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vfadd.vf v1, v2, fa0", VFArith { op: FOp::Add, vd: 1, vs2: 2, src: F(10), mask: false }),
+        // The FMA family's syntax names vs1 first (`vd, vs1, vs2`).
+        ("vfmacc.vv v1, v2, v3", VFMa { op: FMa::Macc, vd: 1, vs2: 3, src: V(2), mask: false }),
+        ("vfmacc.vf v1, fa0, v2", VFMa { op: FMa::Macc, vd: 1, vs2: 2, src: F(10), mask: false }),
+        ("vfmin.vv v1, v2, v3", VFArith { op: FOp::Min, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vfsqrt.v v1, v2", VFUnary { op: FUn::Sqrt, vd: 1, vs2: 2, mask: false }),
+        ("vfclass.v v1, v2", VFUnary { op: FUn::Class, vd: 1, vs2: 2, mask: false }),
+        ("vfcvt.x.f.v v1, v2", VFUnary { op: FUn::XF, vd: 1, vs2: 2, mask: false }),
+        ("vfcvt.rtz.xu.f.v v1, v2", VFUnary { op: FUn::RtzXuF, vd: 1, vs2: 2, mask: false }),
+        ("vmfeq.vv v1, v2, v3", VFCmp { op: FCm::Eq, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vmflt.vf v1, v2, fa0", VFCmp { op: FCm::Lt, vd: 1, vs2: 2, src: F(10), mask: false }),
+        ("vfredosum.vs v1, v2, v3", VFRed { op: FRed::Osum, vd: 1, vs1: 3, vs2: 2 }),
+        ("vfmv.v.f v1, fa0", Vmv { vd: 1, src: F(10) }),
+        ("vfmv.s.f v1, fa0", VFmvSF { vd: 1, rs1: 10 }),
+        ("vfmv.f.s fa0, v1", VFmvFS { rd: 10, vs2: 1 }),
+        ("vfmerge.vfm v1, v2, fa0, v0", Vmerge { vd: 1, vs2: 2, src: F(10) }),
+        (
+            "vfslide1down.vf v1, v2, fa0",
+            VFSlide1 { down: true, vd: 1, vs2: 2, rs1: 10, mask: false },
+        ),
+        (
+            "vfslide1up.vf v1, v2, fa0",
+            VFSlide1 { down: false, vd: 1, vs2: 2, rs1: 10, mask: false },
         ),
     ];
     check(

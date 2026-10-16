@@ -1645,6 +1645,8 @@ impl Tx {
                 let x = self.src(rs1, SRC0);
                 self.a.vec_dup(dst, x, bytes);
             }
+            // Float scalars stay on the interpreter for now.
+            VSel::F(_) => return false,
             VSel::I(imm) => {
                 self.a.mov_imm(ADDR, crate::vector::sext5(imm));
                 self.a.vec_dup(dst, ADDR, bytes);

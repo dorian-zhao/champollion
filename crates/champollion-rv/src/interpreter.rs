@@ -444,6 +444,7 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                     VSel::V(reg) => vector::get_elem(cpu, reg, i, sew_b),
                     VSel::X(reg) => cpu.x(reg),
                     VSel::I(imm) => u64::from(imm),
+                    VSel::F(_) => unreachable!("vmacc has no float operand"),
                 };
                 let old = vector::get_elem(cpu, vd, i, sew_b);
                 let el = vector::get_elem(cpu, vs2, i, sew_b);
@@ -456,6 +457,42 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                 };
                 vector::set_elem(cpu, vd, i, sew_b, v);
             }
+        }
+        Inst::VFArith { op, vd, vs2, src, mask } => {
+            fp_sew(cpu, pc)?;
+            let rm = rounding(cpu, decoder::RM_DYN)?;
+            vector::exec_farith(cpu, op, vd, vs2, src, mask, rm);
+        }
+        Inst::VFMa { op, vd, vs2, src, mask } => {
+            fp_sew(cpu, pc)?;
+            let rm = rounding(cpu, decoder::RM_DYN)?;
+            vector::exec_fma(cpu, op, vd, vs2, src, mask, rm);
+        }
+        Inst::VFUnary { op, vd, vs2, mask } => {
+            fp_sew(cpu, pc)?;
+            let rm = rounding(cpu, decoder::RM_DYN)?;
+            vector::exec_funary(cpu, op, vd, vs2, mask, rm);
+        }
+        Inst::VFCmp { op, vd, vs2, src, mask } => {
+            fp_sew(cpu, pc)?;
+            vector::exec_fcmp(cpu, op, vd, vs2, src, mask);
+        }
+        Inst::VFRed { op, vd, vs1, vs2 } => {
+            fp_sew(cpu, pc)?;
+            let rm = rounding(cpu, decoder::RM_DYN)?;
+            vector::exec_fred(cpu, op, vd, vs1, vs2, rm);
+        }
+        Inst::VFmvSF { vd, rs1 } => {
+            fp_sew(cpu, pc)?;
+            vector::exec_fmv_sf(cpu, vd, rs1);
+        }
+        Inst::VFmvFS { rd, vs2 } => {
+            fp_sew(cpu, pc)?;
+            vector::exec_fmv_fs(cpu, rd, vs2);
+        }
+        Inst::VFSlide1 { down, vd, vs2, rs1, mask } => {
+            fp_sew(cpu, pc)?;
+            vector::exec_fslide1(cpu, down, vd, vs2, rs1, mask);
         }
         Inst::VNarrow { sra, mask, vd, vs2, src } => {
             vector::exec_narrow(cpu, sra, mask, vd, vs2, src)
@@ -642,6 +679,17 @@ fn rounding(cpu: &CpuState, rm: u8) -> Result<fpu::Rm, Trap> {
     fpu::Rm::from_bits(bits).ok_or(Trap::ReservedRoundingMode { pc: cpu.pc })
 }
 
+/// Element width in bytes for a float vector op: the e8 and e16 encodings are reserved
+/// (no F16 vector extension here), which qemu also reports as an illegal instruction.
+fn fp_sew(cpu: &CpuState, pc: u64) -> Result<u64, Trap> {
+    let bytes = vector::sew_bytes(cpu);
+    if bytes >= 4 {
+        Ok(bytes)
+    } else {
+        Err(Trap::IllegalInstruction { pc, err: DecodeError::Reserved })
+    }
+}
+
 /// Read an FP operand as raw bits: doubles as-is, singles unboxed into the low 32 bits.
 #[inline]
 fn fget(cpu: &CpuState, w: FWidth, r: u8) -> u64 {
@@ -737,7 +785,7 @@ const FLI_D: [u64; 32] = [
 ];
 
 /// NaN-box a single-precision value (in the low 32 bits) for an `f` register.
-fn nan_box(v: u64) -> u64 {
+pub(crate) fn nan_box(v: u64) -> u64 {
     0xffff_ffff_0000_0000 | (v & 0xffff_ffff)
 }
 
@@ -748,7 +796,7 @@ fn unbox(v: u64) -> u32 {
 }
 
 /// Sign injection on raw bits; `sign` is the sign bit position (31 or 63).
-fn sign_inject(kind: SgnjKind, a: u64, b: u64, sign: u32) -> u64 {
+pub(crate) fn sign_inject(kind: SgnjKind, a: u64, b: u64, sign: u32) -> u64 {
     let mask = 1u64 << sign;
     let s = match kind {
         SgnjKind::Sgnj => b & mask,
@@ -2162,6 +2210,91 @@ mod tests {
         mem.read(DATA + 144, &mut b).unwrap();
         assert_eq!(b, [0xfe, 0x00], "vsm.v stores ceil(3/8) = one byte");
         assert_eq!(cpu.vl, 3, "vsetivli pinned vl for the tail case");
+    }
+
+    #[test]
+    fn float_vector_ops_run_on_the_fpu() {
+        // Hand-assembled helpers (e32/m1 gives VLMAX = 4).
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle32 = |vd: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse32 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (0b001 << 12) | (vd << 7) | 0x57
+        };
+        let vf = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (rs1 << 15) | (0b101 << 12) | (vd << 7) | 0x57
+        };
+        const VT: u32 = 0xd0; // e32, m1, ta, ma
+        let prog = [
+            vsetivli(0, 4, VT),
+            vle32(1, 11),          // v1 = [1.5, 2.0, -0.0, NaN]
+            vle32(2, 12),          // v2 = [0.5, -0.5, 1.0, 2.0]
+            vv(0b000000, 3, 1, 2), // vfadd.vv v3, v1, v2
+            vse32(3, 13),
+            vf(0b101100, 4, 2, 0), // vfmacc.vf v4, f0, v2: v4 = f0 × v2
+            vse32(4, 14),
+            vv(0b010010, 5, 1, 0x01), // vfcvt.x.f.v v5, v1
+            vse32(5, 15),
+        ];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        let put = |off: u64, v: f32| mem.write(DATA + off, &v.to_bits().to_le_bytes()).unwrap();
+        put(0, 1.5);
+        put(4, 2.0);
+        put(8, -0.0);
+        put(12, f32::NAN);
+        put(16, 0.5);
+        put(20, -0.5);
+        put(24, 1.0);
+        put(28, 2.0);
+        let mut cpu = CpuState::new(BASE);
+        for (r, off) in [(11u8, 0u64), (12, 16), (13, 32), (14, 48), (15, 64)] {
+            cpu.set_x(r, DATA + off);
+        }
+        cpu.f[0] = nan_box(2.5f32.to_bits() as u64);
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        let get = |off: u64| {
+            let mut b = [0u8; 4];
+            mem.read(DATA + off, &mut b).unwrap();
+            f32::from_bits(u32::from_le_bytes(b))
+        };
+        assert_eq!(get(32), 2.0, "1.5 + 0.5");
+        assert_eq!(get(36), 1.5, "2.0 + -0.5");
+        assert_eq!(get(40), 1.0, "-0.0 + 1.0");
+        assert!(get(44).is_nan(), "NaN + 2.0");
+        assert_eq!(get(48), 1.25, "2.5 × 0.5");
+        assert_eq!(get(52), -1.25, "2.5 × -0.5");
+        let mut b = [0u8; 4];
+        mem.read(DATA + 64, &mut b).unwrap();
+        assert_eq!(i32::from_le_bytes(b), 2, "1.5 rounds to 2");
+        mem.read(DATA + 68, &mut b).unwrap();
+        assert_eq!(i32::from_le_bytes(b), 2, "2.0 stays 2");
+        mem.read(DATA + 76, &mut b).unwrap();
+        assert_eq!(i32::from_le_bytes(b), i32::MAX, "NaN converts to the maximum");
+        assert_eq!(cpu.fcsr, 0x11, "NX from rounding, NV from the NaN");
+
+        // An unboxed scalar operand reads as the canonical NaN, without NV.
+        let prog = [vsetivli(0, 4, VT), vle32(1, 11), vf(0b000000, 3, 1, 0), vse32(3, 13)];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        mem.write(DATA, &[0u8; 16]).unwrap();
+        let mut cpu = CpuState::new(BASE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(13, DATA + 32);
+        cpu.f[0] = 1.5f64.to_bits(); // a plain double: not a boxed single
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        mem.read(DATA + 32, &mut b).unwrap();
+        assert_eq!(u32::from_le_bytes(b), 0x7fc0_0000, "canonical NaN, quiet");
+        assert_eq!(cpu.fcsr, 0, "unboxing does not signal");
     }
 
     #[test]
