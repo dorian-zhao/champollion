@@ -4,8 +4,7 @@
 //! reductions those routines use.
 //!
 //! Everything outside that subset is illegal here, as RVA23 code is not expected to
-//! reach it. `vmv1r.v` only handles `nf = 1`; segmented and indexed memory forms are
-//! rejected.
+//! reach it. Segmented and indexed memory forms are rejected.
 
 use super::{
     DecodeError, Inst, VArithOp, VCmpOp, VMaskOp, VMemKind, VRedOp, VSel, VSetKind, VStoreKind,
@@ -65,7 +64,7 @@ pub fn decode_mem(w: u32) -> Result<Inst, DecodeError> {
         let kind = match (mop, rs2) {
             (0b00, 0b00000) if nf == 0 => VMemKind::Unit,
             (0b00, 0b10000) if nf == 0 => VMemKind::FaultOnlyFirst,
-            (0b00, 0b01000) if !mask && nf <= 2 => VMemKind::WholeRegister,
+            (0b00, 0b01000) if !mask => VMemKind::WholeRegister,
             (0b00, 0b01011) if !mask && nf == 0 && vd == 0 => VMemKind::Mask,
             (0b10, _) if nf == 0 => VMemKind::Stride,
             _ => return Err(illegal(w)),
@@ -76,7 +75,7 @@ pub fn decode_mem(w: u32) -> Result<Inst, DecodeError> {
     } else {
         let kind = match (mop, rs2) {
             (0b00, 0b00000) if nf == 0 => VStoreKind::Unit,
-            (0b00, 0b01000) if !mask && nf <= 2 => VStoreKind::WholeRegister,
+            (0b00, 0b01000) if !mask => VStoreKind::WholeRegister,
             (0b10, _) if nf == 0 => VStoreKind::Stride,
             _ => return Err(illegal(w)),
         };
@@ -140,7 +139,11 @@ pub fn decode_op(w: u32) -> Result<Inst, DecodeError> {
                 0b011100 => cmp(VCmpOp::LeU, i),
                 0b011110 => cmp(VCmpOp::GtU, i),
                 0b010111 if vm == 1 && vs2 == 0 => Ok(Inst::Vmv { vd, src: i }),
-                0b100111 if vm == 1 && vs1 == 0 => Ok(Inst::VmvNr { vd, vs2 }),
+                // vmv<n>r.v moves 1, 2, 4, or 8 registers: the count code sits in
+                // the vs1 field (0, 1, 3, 7), though the move ignores vs1 otherwise.
+                0b100111 if vm == 1 && matches!(vs1, 0 | 1 | 3 | 7) => {
+                    Ok(Inst::VmvNr { vd, vs2, nf: vs1 })
+                }
                 _ => Err(illegal(w)),
             }
         }
@@ -164,6 +167,7 @@ pub fn decode_op(w: u32) -> Result<Inst, DecodeError> {
             }
         }
         0b010 => match f6 {
+            0b000000 => Ok(Inst::VRed { op: VRedOp::Sum, vd, vs1, vs2 }),
             0b000001 => Ok(Inst::VRed { op: VRedOp::And, vd, vs1, vs2 }),
             0b000010 => Ok(Inst::VRed { op: VRedOp::Or, vd, vs1, vs2 }),
             0b011010 => Ok(Inst::VMask { op: VMaskOp::Or, vd, vs1, vs2 }),

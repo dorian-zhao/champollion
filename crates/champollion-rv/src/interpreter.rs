@@ -336,7 +336,7 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         Inst::VCmp { op, vd, vs2, src, mask } => vector::exec_cmp(cpu, op, vd, vs2, src, mask),
         Inst::VMask { op: VMaskOp::Or, vd, vs1, vs2 } => vector::exec_mask_or(cpu, vd, vs1, vs2),
         Inst::Vmv { vd, src } => vector::exec_mv(cpu, vd, src),
-        Inst::VmvNr { vd, vs2 } => vector::exec_mv_nr(cpu, vd, vs2),
+        Inst::VmvNr { vd, vs2, nf } => vector::exec_mv_nr(cpu, vd, vs2, nf),
         Inst::Vmerge { vd, vs1, vs2 } => vector::exec_merge(cpu, vd, vs1, vs2),
         Inst::VRed { op, vd, vs1, vs2 } => vector::exec_red(cpu, op, vd, vs1, vs2),
         Inst::VmvXs { rd, vs2 } => {
@@ -1610,6 +1610,89 @@ mod tests {
         assert_eq!(one(op_32(0b101, 0b011_0000, 10, 11, 12), 1, 1), 0xffff_ffff_8000_0000);
         assert_eq!(one(op_32(0b101, 0b011_0000, 10, 11, 12), 1, 33), 0xffff_ffff_8000_0000);
         assert_eq!(one(op_imm_32(0b101, 10, 11, 0b011_000 << 6 | 31), 1, 0), 2);
+    }
+
+    #[test]
+    fn vredsum_wraps_within_the_element_width() {
+        // [1, 2, 3, 40000] as e16 sums to 40006 = 0x9C46, which is negative when read
+        // through vmv.x.s (the SEW-wide result sign-extends on the way out).
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle16 = |vd: u32, rs1: u32| (1 << 25) | (0b101 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vredsum = |vd: u32, vs2: u32, vs1: u32| {
+            (1 << 25) | (vs2 << 20) | (vs1 << 15) | (0b010 << 12) | (vd << 7) | 0x57
+        };
+        let vmv_x_s = |rd: u32, vs2: u32| {
+            (0b010000 << 26) | (1 << 25) | (vs2 << 20) | (0b010 << 12) | (rd << 7) | 0x57
+        };
+        let prog = [
+            vsetivli(0, 4, 0xc8), // e16, m1, ta, ma
+            vle16(1, 11),         // v1 = [a1]
+            vle16(2, 12),         // v2 = zeros (the reduction seed)
+            vredsum(3, 1, 2),
+            vmv_x_s(10, 3),
+        ];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        for (i, v) in [1u16, 2, 3, 40000].iter().enumerate() {
+            mem.write(DATA + 2 * i as u64, &v.to_le_bytes()).unwrap();
+        }
+        mem.write(DATA + 8, &[0u8; 8]).unwrap();
+        let mut cpu = CpuState::new(BASE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 8);
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        assert_eq!(cpu.x[10], 0xffff_ffff_ffff_9c46, "sign-extended sum");
+        assert_eq!(u16::from_le_bytes([cpu.v[3][0], cpu.v[3][1]]), 0x9c46, "element 0");
+    }
+
+    #[test]
+    fn whole_register_moves_cover_eight_registers() {
+        // The toolchain's assembler refuses nf = 7, but real musl code uses it (its
+        // memcpy contains `vs8r.v v8, (a1)` = 0xE2858427) and qemu's decode table
+        // agrees with the encoding: the count code sits in bits 31:29.
+        let vl8r = |vd: u32, rs1: u32| {
+            (7 << 29) | (1 << 25) | (0b01000 << 20) | (rs1 << 15) | (vd << 7) | 0x07
+        };
+        let vs8r = |vs3: u32, rs1: u32| {
+            (7 << 29) | (1 << 25) | (0b01000 << 20) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        // vmv4r.v encodes its count in the vs1 field (3 = four registers).
+        let vmv4r = |vd: u32, vs2: u32| {
+            (0b100111 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (3 << 15)
+                | (0b011 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let prog = [
+            vl8r(8, 11),  // v8..v15 = [a1]
+            vs8r(8, 12),  // [a2] = v8..v15
+            vmv4r(20, 8), // v20..v23 = v8..v11
+        ];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        let bytes: Vec<u8> = (0..128u8).collect();
+        mem.write(DATA, &bytes).unwrap();
+        let mut cpu = CpuState::new(BASE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 128);
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        let mut round = vec![0u8; 128];
+        mem.read(DATA + 128, &mut round).unwrap();
+        assert_eq!(round, bytes, "the eight-register round trip");
+        for k in 0..4 {
+            assert_eq!(cpu.v[20 + k], cpu.v[8 + k], "vmv4r register {k}");
+        }
     }
 
     #[test]

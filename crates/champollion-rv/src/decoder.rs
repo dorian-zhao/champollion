@@ -274,6 +274,8 @@ pub enum Inst {
     VmvNr {
         vd: u8,
         vs2: u8,
+        /// Registers moved: `nf` extra (vmv1r = 0 .. vmv8r = 7).
+        nf: u8,
     },
     Vmerge {
         vd: u8,
@@ -430,6 +432,8 @@ pub enum VMaskOp {
 pub enum VRedOp {
     And,
     Or,
+    /// `vredsum.vs`: the elements summed modulo the element width.
+    Sum,
 }
 
 /// `rm` value meaning "use `frm`". Instructions store `rm` raw (0–4 or 7); reserved values

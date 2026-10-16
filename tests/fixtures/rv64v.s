@@ -68,3 +68,7 @@ vrgather.vv v1, v2, v3
 vmerge.vvm v1, v2, v3, v0
 vredor.vs v1, v2, v3
 vredand.vs v1, v2, v3
+vredsum.vs v1, v2, v3
+vl2r.v v4, (a1)
+vl4r.v v12, (a1)
+vs4r.v v12, (a1)

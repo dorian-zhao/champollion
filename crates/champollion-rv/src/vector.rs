@@ -291,8 +291,10 @@ pub fn exec_mv(cpu: &mut CpuState, vd: u8, src: VSel) {
     }
 }
 
-pub fn exec_mv_nr(cpu: &mut CpuState, vd: u8, vs2: u8) {
-    cpu.v[vd as usize & 31] = cpu.v[vs2 as usize & 31];
+pub fn exec_mv_nr(cpu: &mut CpuState, vd: u8, vs2: u8, nf: u8) {
+    for k in 0..=nf {
+        cpu.v[(vd as usize + k as usize) & 31] = cpu.v[(vs2 as usize + k as usize) & 31];
+    }
 }
 
 pub fn exec_merge(cpu: &mut CpuState, vd: u8, vs1: u8, vs2: u8) {
@@ -320,14 +322,25 @@ pub fn exec_red(cpu: &mut CpuState, op: VRedOp, vd: u8, vs1: u8, vs2: u8) {
         acc = match op {
             VRedOp::And => acc & el,
             VRedOp::Or => acc | el,
+            // The sum wraps within the element width; the sign extension the spec
+            // gives the result happens on reads of the SEW-wide element (as in
+            // vmv.x.s), so only element 0 is written here.
+            VRedOp::Sum => acc.wrapping_add(el),
         };
     }
-    set_elem(cpu, vd, 0, sew_b * 2, acc);
+    if op == VRedOp::Sum {
+        let keep = if sew_b >= 8 { u64::MAX } else { (1u64 << (8 * sew_b)) - 1 };
+        set_elem(cpu, vd, 0, sew_b, acc & keep);
+    } else {
+        set_elem(cpu, vd, 0, sew_b * 2, acc);
+    }
 }
 
-/// `vmv.x.s`: element 0 to a scalar register.
+/// `vmv.x.s`: element 0 to a scalar register, sign-extended to XLEN (the spec's
+/// widening on the way out of a reduction, which qemu-riscv64 confirms).
 pub fn elem0(cpu: &CpuState, vs2: u8) -> u64 {
-    get_elem(cpu, vs2, 0, sew_bytes(cpu))
+    let sew_b = sew_bytes(cpu);
+    sign_extend(get_elem(cpu, vs2, 0, sew_b), sew_b)
 }
 
 /// `vmv.s.x`: scalar to element 0 (the rest is undisturbed).

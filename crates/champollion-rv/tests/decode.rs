@@ -650,7 +650,7 @@ fn rv64v() {
         ("vmv.v.x v1, a0", Vmv { vd: 1, src: X(10) }),
         ("vmv.s.x v1, a0", VmvSx { vd: 1, rs1: 10 }),
         ("vmv.x.s a0, v1", VmvXs { rd: 10, vs2: 1 }),
-        ("vmv1r.v v2, v3", VmvNr { vd: 2, vs2: 3 }),
+        ("vmv1r.v v2, v3", VmvNr { vd: 2, vs2: 3, nf: 0 }),
         ("vid.v v1", Vid { vd: 1 }),
         ("vmseq.vi v1, v2, 3", VCmp { op: C::Eq, vd: 1, vs2: 2, src: I(3), mask: false }),
         ("vmseq.vx v1, v2, a0", VCmp { op: C::Eq, vd: 1, vs2: 2, src: X(10), mask: false }),
@@ -717,6 +717,43 @@ fn rv64v() {
         ("vmerge.vvm v1, v2, v3, v0", Vmerge { vd: 1, vs1: 3, vs2: 2 }),
         ("vredor.vs v1, v2, v3", VRed { op: VRedOp::Or, vd: 1, vs1: 3, vs2: 2 }),
         ("vredand.vs v1, v2, v3", VRed { op: VRedOp::And, vd: 1, vs1: 3, vs2: 2 }),
+        ("vredsum.vs v1, v2, v3", VRed { op: VRedOp::Sum, vd: 1, vs1: 3, vs2: 2 }),
+        (
+            "vl2r.v v4, (a1)",
+            VLoad {
+                width: VWidth::E8,
+                kind: VMemKind::WholeRegister,
+                vd: 4,
+                rs1: A1,
+                rs2: 0,
+                mask: false,
+                nf: 1,
+            },
+        ),
+        (
+            "vl4r.v v12, (a1)",
+            VLoad {
+                width: VWidth::E8,
+                kind: VMemKind::WholeRegister,
+                vd: 12,
+                rs1: A1,
+                rs2: 0,
+                mask: false,
+                nf: 3,
+            },
+        ),
+        (
+            "vs4r.v v12, (a1)",
+            VStore {
+                width: VWidth::E8,
+                kind: VStoreKind::WholeRegister,
+                vs3: 12,
+                rs1: A1,
+                rs2: 0,
+                mask: false,
+                nf: 3,
+            },
+        ),
     ];
     check(
         include_str!("../../../tests/fixtures/rv64v.s"),
