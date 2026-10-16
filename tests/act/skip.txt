@@ -1,0 +1,4 @@
+# dir/test (relative to third_party/riscv-arch-test/tests/rv64i) that the user-mode
+# configuration cannot build, with the reason.
+Misalign/MisalignD-fld-00 # references FP failure handlers that need F_SUPPORTED
+Misalign/MisalignF-flw-00 # references FP failure handlers that need F_SUPPORTED

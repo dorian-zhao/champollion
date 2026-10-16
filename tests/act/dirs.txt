@@ -1,0 +1,24 @@
+# Directories under third_party/riscv-arch-test/tests/rv64i whose tests are built as
+# committed fixtures (every *.S in the directory except tests/act/skip.txt). Keep this
+# to tests that run as plain user-mode programs: no expected traps, no M-mode CSRs,
+# no counters whose value is implementation-defined (Zicntr), and no Zcmop (we NOP
+# them, but qemu 8.2 cannot execute them, so it cannot produce the baseline).
+I
+M
+Misalign
+Zaamo
+Zalrsc
+Zba
+Zbb
+Zbc
+Zbkb
+Zbkc
+Zbkx
+Zbs
+Zca
+Zcb
+Zicond
+Zihintntl
+Zihintpause
+Zihpm
+Zmmul
