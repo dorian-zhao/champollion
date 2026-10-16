@@ -878,6 +878,22 @@ fn rv64v() {
             },
         ),
         (
+            "vsuxei8.v v2, (a0), v4",
+            VIndexStore { width: VWidth::E8, mask: false, vs3: 2, rs1: A0, vs2: 4 },
+        ),
+        (
+            "vsuxei16.v v2, (a0), v4",
+            VIndexStore { width: VWidth::E16, mask: false, vs3: 2, rs1: A0, vs2: 4 },
+        ),
+        (
+            "vsuxei32.v v2, (a0), v4",
+            VIndexStore { width: VWidth::E32, mask: false, vs3: 2, rs1: A0, vs2: 4 },
+        ),
+        (
+            "vsuxei64.v v2, (a0), v4",
+            VIndexStore { width: VWidth::E64, mask: false, vs3: 2, rs1: A0, vs2: 4 },
+        ),
+        (
             "vl2r.v v4, (a1)",
             VLoad {
                 width: VWidth::E8,

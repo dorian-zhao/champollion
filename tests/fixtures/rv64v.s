@@ -111,6 +111,10 @@ vlseg3e8.v v6, (a0)
 vlseg8e16.v v8, (a0)
 vlsseg8e32.v v16, (a0), a2
 vssseg4e16.v v20, (a1), a3
+vsuxei8.v v2, (a0), v4
+vsuxei16.v v2, (a0), v4
+vsuxei32.v v2, (a0), v4
+vsuxei64.v v2, (a0), v4
 vl2r.v v4, (a1)
 vl4r.v v12, (a1)
 vs4r.v v12, (a1)

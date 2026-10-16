@@ -394,6 +394,15 @@ pub enum Inst {
         rs1: u8,
         rs2: u8,
     },
+    /// Indexed store (`vsuxeiN.v`): element `i` goes to `x[rs1] + index[i]`; `vs2`
+    /// (the field named for the index in the encoding) holds the indices.
+    VIndexStore {
+        width: VWidth,
+        mask: bool,
+        vs3: u8,
+        rs1: u8,
+        vs2: u8,
+    },
     /// Widening unsigned add (`vwaddu.wv`/`vwaddu.wx`): `vs2` is read 2×SEW wide and
     /// the source is zero-extended from SEW.
     VWiden {

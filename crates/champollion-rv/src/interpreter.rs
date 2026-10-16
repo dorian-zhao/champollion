@@ -452,6 +452,21 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                 }
             }
         }
+        Inst::VIndexStore { width, mask, vs3, rs1, vs2 } => {
+            let base = cpu.x(rs1);
+            let idx_b = width.bytes();
+            let sew_b = vector::sew_bytes(cpu);
+            for i in 0..cpu.vl {
+                if mask && !vector::mask_get(cpu, 0, i) {
+                    continue; // masked-off elements are never accessed
+                }
+                let off = vector::get_elem(cpu, vs2, i, idx_b);
+                let addr = base.wrapping_add(off);
+                let bytes = vector::get_elem(cpu, vs3, i, sew_b).to_le_bytes();
+                mem.write(addr, &bytes[..sew_b as usize])
+                    .map_err(|fault| Trap::StoreFault { pc, fault })?;
+            }
+        }
         Inst::Cbo { op: CboOp::Zero, rs1 } => {
             // Zicboz: zero the 64-byte block containing the address.
             let addr = cpu.x(rs1) & !63;
@@ -1832,6 +1847,27 @@ mod tests {
         assert_eq!(out, [0xa0, 0xb1, 0xc2, 0xd3, 0xe4, 0xf5, 0x16, 0x27]);
         assert_eq!(&cpu.v[2][..4], &[0xa0, 0xc2, 0xe4, 0x16], "field 0 collects the evens");
         assert_eq!(&cpu.v[3][..4], &[0xb1, 0xd3, 0xf5, 0x27], "field 1 the odds");
+
+        // Indexed store: v3's bytes land at DATA + 32 + each byte of v2.
+        let vsuxei8 = |vs3: u32, rs1: u32, vs2: u32| {
+            (0b01 << 26) | (1 << 25) | (vs2 << 20) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let store = [vsetivli(0, 4, 0xc0), vsuxei8(3, 12, 2)];
+        let mem2 = FlatMemory::new(BASE, 4096);
+        mem2.load_words(BASE, &store).unwrap();
+        let mut cpu2 = CpuState::new(BASE);
+        cpu2.set_x(12, DATA + 32);
+        cpu2.v[2][..4].copy_from_slice(&cpu.v[2][..4]);
+        cpu2.v[3][..4].copy_from_slice(&cpu.v[3][..4]);
+        let end = BASE + 4 * store.len() as u64;
+        while cpu2.pc != end {
+            step(&mut cpu2, &mem2).unwrap_or_else(|t| panic!("{t:?}\n{cpu2:?}"));
+        }
+        let mut one = [0u8; 1];
+        for (idx, expect) in [(0xa0u64, 0xb1u8), (0xc2, 0xd3), (0xe4, 0xf5), (0x16, 0x27)] {
+            mem2.read(DATA + 32 + idx, &mut one).unwrap();
+            assert_eq!(one[0], expect, "indexed store at {idx:#x}");
+        }
     }
 
     #[test]

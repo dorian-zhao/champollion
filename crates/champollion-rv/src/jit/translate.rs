@@ -1671,6 +1671,7 @@ fn is_vector(inst: Inst) -> bool {
             | Inst::VIndexLoad { .. }
             | Inst::VSegLoad { .. }
             | Inst::VSegStore { .. }
+            | Inst::VIndexStore { .. }
             | Inst::VWiden { .. }
     )
 }

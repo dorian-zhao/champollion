@@ -110,6 +110,10 @@ pub fn decode_mem(w: u32) -> Result<Inst, DecodeError> {
         let rs2 = if kind == VMemKind::Stride { rs2 } else { 0 };
         Ok(Inst::VLoad { width, kind, vd, rs1, rs2, mask, nf })
     } else {
+        // Indexed-unordered stores (`vsuxeiN.v`), the mirror of the load above.
+        if mop == 0b01 && nf == 0 {
+            return Ok(Inst::VIndexStore { width, mask, vs3: vd, rs1, vs2: rs2 });
+        }
         if nf > 0 {
             match (mop, rs2) {
                 (0b00, 0b00000) => {
