@@ -67,6 +67,20 @@ fn processes() {
 }
 
 #[test]
+fn vfork() {
+    // A vfork (CLONE_VM | CLONE_VFORK) child that fails to exec reports the errno to its
+    // waiting parent, the way glibc's posix_spawn needs it (issue #8).
+    let out = rvrun(&[fixture("vfork").as_os_str()], b"");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "vfork exec missing: ENOENT\n\
+         vfork exec: exited 7\n\
+         vfork exit: exited 5\n"
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
 fn signals() {
     let out = rvrun(&[fixture("signals").as_os_str()], b"");
     assert_eq!(

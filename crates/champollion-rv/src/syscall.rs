@@ -720,23 +720,56 @@ fn linux_rusage(ru: &Rusage) -> Vec<u8> {
     b
 }
 
-/// `clone(flags, newsp, parent_tid, tls, child_tid)` (the riscv64 argument order). Only
-/// threads are supported: a new thread in this process, not a new process.
+/// `clone(flags, newsp, parent_tid, tls, child_tid)` (the riscv64 argument order):
+/// threads, and new processes (fork, and vfork, whose parent waits for the child).
 fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
     const CLONE_VM: u64 = 0x100;
+    const CLONE_VFORK: u64 = 0x4000;
     const CLONE_SIGHAND: u64 = 0x800;
     const CLONE_THREAD: u64 = 0x1_0000;
     const CLONE_SETTLS: u64 = 0x8_0000;
     const CLONE_PARENT_SETTID: u64 = 0x10_0000;
     const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
     const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+    const O_CLOEXEC: i32 = 0o2000000;
     let [flags, newsp, parent_tid, tls, child_tid, _] = a;
     let thread = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
     if flags & CLONE_THREAD == 0 {
-        // A new process: fork, or vfork (CLONE_VM | CLONE_VFORK), which may copy memory
-        // instead of sharing it, since its child only runs until execve or _exit.
-        let pid = p.fork(t)?;
+        // A new process: fork, or vfork, whose parent must not resume until the child
+        // has execed or exited. glibc's posix_spawn relies on that wait to report a
+        // failed exec to its caller, which needs the error to travel from the child
+        // (native glibc shares memory and reads an error slot; the child here writes
+        // the errno into a pipe instead). A successful exec closes the CLOEXEC write
+        // end too, which the parent reads as EOF and takes as the child running.
+        let pipe = if flags & CLONE_VFORK != 0 { Some(p.host.pipe2(O_CLOEXEC)?) } else { None };
+        if let Some([_, write]) = pipe
+            && let Some(stale) = t.vfork_pipe.replace(write)
+        {
+            // An earlier vfork child of this thread that never reported; it is not
+            // this call's concern.
+            unsafe { libc::close(stale) };
+        }
+        let pid = match p.fork(t) {
+            Ok(pid) => pid,
+            Err(e) => {
+                if let Some([read, write]) = pipe {
+                    t.vfork_pipe = None;
+                    // SAFETY: both fds are open in this process here, and taken from use.
+                    unsafe {
+                        libc::close(read);
+                        libc::close(write);
+                    }
+                }
+                return Err(e);
+            }
+        };
         if pid == 0 {
+            // The child: keep the write end for a failed `execve`; the read end is the
+            // parent's.
+            if let Some([read, _]) = pipe {
+                // SAFETY: inherited across the fork; the child never reads it.
+                unsafe { libc::close(read) };
+            }
             if flags & CLONE_VM != 0 && newsp != 0 {
                 t.cpu.x[2] = newsp;
             }
@@ -749,8 +782,27 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
             if flags & CLONE_CHILD_CLEARTID != 0 {
                 t.clear_child_tid = child_tid;
             }
-        } else if flags & CLONE_PARENT_SETTID != 0 {
-            put(p, parent_tid, &pid.to_le_bytes())?;
+        } else {
+            if let Some([read, write]) = pipe {
+                // The parent holds no copy of the write end while it waits, or the EOF
+                // that ends the wait would never come.
+                t.vfork_pipe = None;
+                // SAFETY: the write end was just inherited; this is the parent's copy.
+                unsafe { libc::close(write) };
+                let outcome = wait_for_vfork(read);
+                // SAFETY: the read end is open in this process; the wait is over.
+                unsafe { libc::close(read) };
+                if let Err(errno) = outcome {
+                    // The child's spawn helper exits right after reporting; reap it, as
+                    // glibc's posix_spawn reaps its own, or it would linger as a zombie
+                    // that its caller never waits for.
+                    reap_vfork_child(pid);
+                    return Err(errno);
+                }
+            }
+            if flags & CLONE_PARENT_SETTID != 0 {
+                put(p, parent_tid, &pid.to_le_bytes())?;
+            }
         }
         return Ok(pid as u64);
     }
@@ -786,6 +838,44 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
     Ok(tid as u64)
 }
 
+/// Wait for the vfork child to exec or exit — the `CLOEXEC` write end closes, an EOF the
+/// caller takes as the child running the new program — or to report a failed `execve`'s
+/// errno through the pipe, which the caller returns from the `clone`.
+fn wait_for_vfork(read: i32) -> Result<(), i32> {
+    let mut buf = [0u8; 4];
+    let mut got = 0;
+    loop {
+        // SAFETY: `read` is a pipe fd open in this process; buf has room from `got` on.
+        let n = unsafe { libc::read(read, buf[got..].as_mut_ptr().cast(), 4 - got) };
+        if n < 0 {
+            // A signal for the guest: it runs once the wait ends (vfork semantics leave
+            // no other choice), so keep waiting.
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Ok(()); // a read error: treat as the child moving on
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        got += n as usize;
+        if got == 4 {
+            return Err(i32::from_le_bytes(buf));
+        }
+    }
+}
+
+/// Reap a vfork child whose exec failed (it exits right after reporting); ECHILD is fine,
+/// a guest `wait` may have taken it first.
+fn reap_vfork_child(pid: u32) {
+    let mut status = 0;
+    while unsafe { libc::waitpid(pid as i32, &mut status, 0) } < 0 {
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break;
+        }
+    }
+}
+
 /// A NULL-terminated array of C strings in guest memory (`argv`, `envp`).
 fn read_cstr_array(p: &Process, mut addr: u64) -> Result<Vec<Vec<u8>>, i32> {
     const MAX: usize = 1 << 16;
@@ -809,15 +899,26 @@ fn read_cstr_array(p: &Process, mut addr: u64) -> Result<Vec<Vec<u8>>, i32> {
 }
 
 /// `execve(path, argv, envp)`: the embedder starts the new program (see
-/// [`Process::exec`]); this only returns on failure.
-fn execve(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
+/// [`Process::exec`]); this only returns on failure, which a vfork child reports to its
+/// waiting parent first.
+fn execve(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
+    match exec(p, t, a) {
+        Err(errno) => {
+            report_failed_exec(t, errno);
+            Err(errno)
+        }
+        ok => ok,
+    }
+}
+
+/// The `execve` itself: refuse what cannot run here before giving up this process: only
+/// riscv64 ELF files and scripts (the embedder handles `#!`).
+fn exec(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
     let path = p.mem.read_cstr(a[0], PATH_MAX).map_err(efault)?;
     let argv = read_cstr_array(p, a[1])?;
     let envp = read_cstr_array(p, a[2])?;
     let host =
         std::path::PathBuf::from(std::ffi::OsStr::from_bytes(p.host_path(&path, true).to_bytes()));
-    // Refuse what cannot run here before giving up this process: only riscv64 ELF files
-    // and scripts (the embedder handles `#!`).
     let mut head = [0u8; 20];
     let n = std::fs::File::open(&host)
         .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
@@ -840,6 +941,28 @@ fn execve(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
     }
     let ignored = p.ignored_signals();
     Err(p.exec(&crate::process::Exec { path: host, argv, envp, ignored, mask: t.signals.mask() }))
+}
+
+/// A vfork child reporting a failed `execve` to the parent waiting in [`clone`]. The
+/// write end is `CLOEXEC`, so a successful exec closes the pipe instead and the parent
+/// reads EOF.
+fn report_failed_exec(t: &mut Thread, errno: i32) {
+    let Some(fd) = t.vfork_pipe.take() else { return };
+    let bytes = errno.to_le_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        // SAFETY: the fd is this child's inherited pipe write end; bytes is four long.
+        let n = unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if n < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        written += n as usize;
+    }
+    // SAFETY: closed exactly once: the field was taken.
+    unsafe { libc::close(fd) };
 }
 
 /// `futex(uaddr, op, val, timeout or val2, uaddr2, val3)`: the wait, wake, and requeue

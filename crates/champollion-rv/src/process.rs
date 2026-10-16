@@ -269,6 +269,10 @@ pub struct Thread {
     pub engine: Engine,
     /// This thread's JIT, if enabled (the default); otherwise `engine` runs everything.
     pub jit: Option<Jit>,
+    /// The write end of the pipe a vfork parent waits on (see `clone` in the `syscall`
+    /// module): set in a vfork child until it execs, to report a failed `execve`'s errno.
+    /// `CLOEXEC`, so a successful exec closes it instead and the parent reads EOF.
+    pub vfork_pipe: Option<i32>,
 }
 
 /// The host signal that interrupts a guest thread's blocking host syscall (EINTR) when a
@@ -510,6 +514,7 @@ impl Process {
                 clear_child_tid: 0,
                 engine: Engine::new(),
                 jit: None,
+                vfork_pipe: None,
             },
         ))
     }
@@ -567,6 +572,7 @@ impl Process {
                     clear_child_tid,
                     engine: Engine::new(),
                     jit,
+                    vfork_pipe: None,
                 };
                 match this.run_thread(&mut thread) {
                     End::Thread(status) => this.thread_exited(&thread, status),
