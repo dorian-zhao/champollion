@@ -308,6 +308,7 @@ fn rv64fd() {
     const FS3: u8 = 19;
     const FA3: u8 = 13;
     const FA4: u8 = 14;
+    const FA6: u8 = 16;
 
     const T2: u8 = 7;
     let expected = [
@@ -369,8 +370,14 @@ fn rv64fd() {
             "fnmadd.d fs0, fs1, fs2, fs3",
             FFma { op: FmaOp::Nmadd, width: D, rd: FS0, rs1: FS1, rs2: FS2, rs3: FS3, rm: RM_DYN },
         ),
-        ("fmin.s fa0, fa1, fa2", FMinMax { max: false, width: S, rd: FA0, rs1: FA1, rs2: FA2 }),
-        ("fmax.d fa0, fa1, fa2", FMinMax { max: true, width: D, rd: FA0, rs1: FA1, rs2: FA2 }),
+        (
+            "fmin.s fa0, fa1, fa2",
+            FMinMax { max: false, canonical_nan: false, width: S, rd: FA0, rs1: FA1, rs2: FA2 },
+        ),
+        (
+            "fmax.d fa0, fa1, fa2",
+            FMinMax { max: true, canonical_nan: false, width: D, rd: FA0, rs1: FA1, rs2: FA2 },
+        ),
         ("feq.s a0, fa1, fa2", FCmp { op: FCmpOp::Eq, width: S, rd: A0, rs1: FA1, rs2: FA2 }),
         ("flt.d a1, ft0, ft1", FCmp { op: FCmpOp::Lt, width: D, rd: A1, rs1: FT0, rs2: FT1 }),
         ("fle.s a2, fs0, fs1", FCmp { op: FCmpOp::Le, width: S, rd: A2, rs1: FS0, rs2: FS1 }),
@@ -388,6 +395,20 @@ fn rv64fd() {
         ),
         ("fcvt.s.d fa0, fa1", FCvtFloat { to: S, rd: FA0, rs1: FA1, rm: RM_DYN }),
         ("fcvt.d.s fa2, fa3", FCvtFloat { to: D, rd: FA2, rs1: FA3, rm: 0 }),
+        // Zfa, past the constant loads and moves at the top of the fixture.
+        ("fround.s fa0, fa1, rtz", FRound { width: S, rd: FA0, rs1: FA1, rm: 1, exact: false }),
+        ("froundnx.d fa2, fa3, rne", FRound { width: D, rd: FA2, rs1: FA3, rm: 0, exact: true }),
+        (
+            "fminm.d fa4, fa5, fa6",
+            FMinMax { max: false, canonical_nan: true, width: D, rd: FA4, rs1: FA5, rs2: FA6 },
+        ),
+        (
+            "fmaxm.s fa7, fs0, fs1",
+            FMinMax { max: true, canonical_nan: true, width: S, rd: FA7, rs1: FS0, rs2: FS1 },
+        ),
+        ("fleq.s a0, fa1, fa2", FCmp { op: FCmpOp::Leq, width: S, rd: A0, rs1: FA1, rs2: FA2 }),
+        ("fltq.d a1, fa3, fa4", FCmp { op: FCmpOp::Ltq, width: D, rd: A1, rs1: FA3, rs2: FA4 }),
+        ("fcvtmod.w.d a2, fa5, rtz", FCvtMod { rd: A2, rs1: FA5 }),
     ];
     check(
         include_str!("../../../tests/fixtures/rv64fd.s"),

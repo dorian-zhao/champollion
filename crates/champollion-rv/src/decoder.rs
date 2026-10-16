@@ -181,6 +181,8 @@ pub enum Inst {
     },
     FMinMax {
         max: bool,
+        /// Zfa `fminm`/`fmaxm`: a NaN input makes the result the canonical NaN.
+        canonical_nan: bool,
         width: FWidth,
         rd: u8,
         rs1: u8,
@@ -217,6 +219,20 @@ pub enum Inst {
         rd: u8,
         rs1: u8,
         rm: u8,
+    },
+    /// Zfa `fround.s`/`fround.d` (and `froundnx...` when `exact`): fcvt.s.d/fcvt.d.s
+    /// with rs2 = 4/5, rounding to an integral value in the same format.
+    FRound {
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        rm: u8,
+        exact: bool,
+    },
+    /// Zfa `fcvtmod.w.d`: the low 32 bits of the RTZ-rounded value, sign-extended.
+    FCvtMod {
+        rd: u8,
+        rs1: u8,
     },
     /// `vsetvli`/`vsetivli`/`vsetvl`: sets `vl` and `vtype`. `rs2` carries the 10-bit
     /// vtype value for the immediate forms and the vtype register number for `vsetvl`;
@@ -458,12 +474,15 @@ pub enum FmaOp {
     Nmadd,
 }
 
-/// `feq` is a quiet comparison; `flt` and `fle` are signaling.
+/// `feq` is a quiet comparison; `flt` and `fle` are signaling. Zfa's `fleq`/`fltq`
+/// compare like `fle`/`flt` but stay quiet for quiet NaN inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FCmpOp {
     Eq,
     Lt,
     Le,
+    Ltq,
+    Leq,
 }
 
 /// Integer side of `fcvt`: 32-bit (`w`/`wu`) or 64-bit (`l`/`lu`), signed or unsigned.
@@ -1039,8 +1058,18 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b00100, 0b000, _) => Inst::FSgnj { kind: SgnjKind::Sgnj, width, rd, rs1, rs2 },
                 (0b00100, 0b001, _) => Inst::FSgnj { kind: SgnjKind::Sgnjn, width, rd, rs1, rs2 },
                 (0b00100, 0b010, _) => Inst::FSgnj { kind: SgnjKind::Sgnjx, width, rd, rs1, rs2 },
-                (0b00101, 0b000, _) => Inst::FMinMax { max: false, width, rd, rs1, rs2 },
-                (0b00101, 0b001, _) => Inst::FMinMax { max: true, width, rd, rs1, rs2 },
+                (0b00101, 0b000, _) => {
+                    Inst::FMinMax { max: false, canonical_nan: false, width, rd, rs1, rs2 }
+                }
+                (0b00101, 0b001, _) => {
+                    Inst::FMinMax { max: true, canonical_nan: false, width, rd, rs1, rs2 }
+                }
+                (0b00101, 0b010, _) => {
+                    Inst::FMinMax { max: false, canonical_nan: true, width, rd, rs1, rs2 }
+                }
+                (0b00101, 0b011, _) => {
+                    Inst::FMinMax { max: true, canonical_nan: true, width, rd, rs1, rs2 }
+                }
                 // fcvt.s.d (fmt S, source D = 1) and fcvt.d.s (fmt D, source S = 0).
                 (0b01000, _, 1) if rm_ok && width == FWidth::S => {
                     Inst::FCvtFloat { to: FWidth::S, rd, rs1, rm }
@@ -1048,9 +1077,16 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b01000, _, 0) if rm_ok && width == FWidth::D => {
                     Inst::FCvtFloat { to: FWidth::D, rd, rs1, rm }
                 }
+                // Zfa: fround/froundnx are fcvt.s.d/fcvt.d.s with rs2 = 4 and 5.
+                (0b01000, _, 4) if rm_ok => Inst::FRound { width, rd, rs1, rm, exact: false },
+                (0b01000, _, 5) if rm_ok => Inst::FRound { width, rd, rs1, rm, exact: true },
                 (0b10100, 0b010, _) => Inst::FCmp { op: FCmpOp::Eq, width, rd, rs1, rs2 },
                 (0b10100, 0b001, _) => Inst::FCmp { op: FCmpOp::Lt, width, rd, rs1, rs2 },
                 (0b10100, 0b000, _) => Inst::FCmp { op: FCmpOp::Le, width, rd, rs1, rs2 },
+                (0b10100, 0b100, _) => Inst::FCmp { op: FCmpOp::Leq, width, rd, rs1, rs2 },
+                (0b10100, 0b101, _) => Inst::FCmp { op: FCmpOp::Ltq, width, rd, rs1, rs2 },
+                // Zfa: fcvtmod.w.d is fcvt.w.d with rs2 = 8, fixed to RTZ.
+                (0b11000, 0b001, 8) if width == FWidth::D => Inst::FCvtMod { rd, rs1 },
                 (0b11000, _, n) if rm_ok => match int(n) {
                     Some(to) => Inst::FCvtToInt { from: width, to, rd, rs1, rm },
                     None => return illegal,

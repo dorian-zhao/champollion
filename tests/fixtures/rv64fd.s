@@ -46,3 +46,10 @@ fcvt.s.l fa2, a2, rdn
 fcvt.d.lu fa3, a3
 fcvt.s.d fa0, fa1
 fcvt.d.s fa2, fa3
+fround.s fa0, fa1, rtz
+froundnx.d fa2, fa3, rne
+fminm.d fa4, fa5, fa6
+fmaxm.s fa7, fs0, fs1
+fleq.s a0, fa1, fa2
+fltq.d a1, fa3, fa4
+fcvtmod.w.d a2, fa5, rtz

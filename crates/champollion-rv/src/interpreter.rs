@@ -198,8 +198,13 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             let (r, fl) = fpu::fma(op, width, a, b, c, rm);
             fset(cpu, width, rd, r, fl);
         }
-        Inst::FMinMax { max, width, rd, rs1, rs2 } => {
-            let (r, fl) = fpu::min_max(max, width, fget(cpu, width, rs1), fget(cpu, width, rs2));
+        Inst::FMinMax { max, canonical_nan, width, rd, rs1, rs2 } => {
+            let (a, b) = (fget(cpu, width, rs1), fget(cpu, width, rs2));
+            let (r, fl) = if canonical_nan {
+                fpu::min_max_zfa(max, width, a, b)
+            } else {
+                fpu::min_max(max, width, a, b)
+            };
             fset(cpu, width, rd, r, fl);
         }
         Inst::FCmp { op, width, rd, rs1, rs2 } => {
@@ -226,6 +231,16 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             let from = if to == FWidth::S { FWidth::D } else { FWidth::S };
             let (r, fl) = fpu::convert(to, fget(cpu, from, rs1), rm);
             fset(cpu, to, rd, r, fl);
+        }
+        Inst::FRound { width, rd, rs1, rm, exact } => {
+            let rm = rounding(cpu, rm)?;
+            let (r, fl) = fpu::round_to_int(width, fget(cpu, width, rs1), rm, exact);
+            fset(cpu, width, rd, r, fl);
+        }
+        Inst::FCvtMod { rd, rs1 } => {
+            let (r, fl) = fpu::fcvtmod_w_d(cpu.f[rs1 as usize]);
+            cpu.fcsr |= fl as u32;
+            cpu.set_x(rd, r);
         }
         Inst::FSgnj { kind, width, rd, rs1, rs2 } => {
             cpu.f[rd as usize] = match width {
@@ -1221,6 +1236,90 @@ mod tests {
         assert_eq!(cpu.f[4], 0x3ef0_0000_0000_0000);
         assert_eq!(cpu.f[5], 0x3f80_0000_0000_0000);
         assert_eq!(cpu.f[6], 1.5f64.to_bits());
+    }
+
+    #[test]
+    fn zfa_rounds_compares_and_converts() {
+        // One instruction per case; the expected values and flags were taken from a
+        // probe run under qemu-riscv64 8.2 (see the Zfa notes in the repository's
+        // working notes), which follows the ISA manual's Zfa chapter.
+        let run = |prog: &[u32], fregs: &[(u8, u64)]| {
+            let (mut cpu, mem) = setup(prog);
+            for &(r, v) in fregs {
+                cpu.f[r as usize] = v;
+            }
+            let end = BASE + 4 * prog.len() as u64;
+            while cpu.pc != end {
+                step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+            }
+            cpu
+        };
+        let nan = 0x7ff8_0000_0000_0000u64;
+        let snan = 0x7ff0_0000_0000_0001u64;
+        let flags = |cpu: &CpuState| (cpu.fcsr & 0x1f) as u8;
+        // fround.d: rs2 = 4; froundnx.d: rs2 = 5.
+        let round = |rm: u32, rd: u32, rs1: u32, exact: bool| {
+            op_fp(0b01000, 0b01, rm, rd, rs1, if exact { 5 } else { 4 })
+        };
+
+        let cpu = run(&[round(0b000, 10, 1, false)], &[(1, 1.5f64.to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (2.0f64.to_bits(), 0), "rne of 1.5");
+        let cpu = run(&[round(0b001, 10, 1, false)], &[(1, (-0.75f64).to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), ((-0.0f64).to_bits(), 0), "rtz keeps -0");
+        let cpu = run(&[round(0b100, 10, 1, false)], &[(1, 2.5f64.to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (3.0f64.to_bits(), 0), "RMM ties away");
+        let cpu = run(&[round(0b000, 10, 1, true)], &[(1, 1.5f64.to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (2.0f64.to_bits(), fpu::NX), "froundnx");
+        let cpu = run(&[round(0b100, 10, 1, true)], &[(1, 2.5f64.to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (3.0f64.to_bits(), fpu::NX), "RMM + NX");
+        let cpu = run(&[round(0b000, 10, 1, true)], &[(1, 2.0f64.to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (2.0f64.to_bits(), 0), "already integral");
+        let cpu = run(&[round(0b000, 10, 1, false)], &[(1, snan)]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (nan, fpu::NV), "signaling NaN");
+
+        // fminm/fmaxm: any NaN input makes the canonical NaN.
+        let cpu = run(&[op_fp(0b00101, 0b01, 0b010, 10, 1, 2)], &[(1, nan), (2, 1.0f64.to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (nan, 0), "fminm of NaN");
+        let cpu =
+            run(&[op_fp(0b00101, 0b01, 0b010, 10, 1, 2)], &[(1, snan), (2, 1.0f64.to_bits())]);
+        assert_eq!((cpu.f[10], flags(&cpu)), (nan, fpu::NV), "fminm of sNaN");
+        let cpu = run(
+            &[op_fp(0b00101, 0b01, 0b011, 10, 1, 2)],
+            &[(1, 1.0f64.to_bits()), (2, 2.0f64.to_bits())],
+        );
+        assert_eq!((cpu.f[10], flags(&cpu)), (2.0f64.to_bits(), 0), "fmaxm picks the max");
+        let cpu = run(
+            &[op_fp(0b00101, 0b01, 0b011, 10, 1, 2)],
+            &[(1, (-0.0f64).to_bits()), (2, 0.0f64.to_bits())],
+        );
+        assert_eq!((cpu.f[10], flags(&cpu)), (0.0f64.to_bits(), 0), "fmaxm +0 over -0");
+
+        // fleq/fltq: quiet for quiet NaNs, NV only for signaling ones.
+        let cpu = run(&[op_fp(0b10100, 0b01, 0b100, 10, 1, 2)], &[(1, nan), (2, 1.0f64.to_bits())]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (0, 0), "fleq of qNaN is quiet");
+        let cpu =
+            run(&[op_fp(0b10100, 0b01, 0b101, 10, 1, 2)], &[(1, snan), (2, 1.0f64.to_bits())]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (0, fpu::NV), "fltq of sNaN signals");
+        let cpu = run(
+            &[op_fp(0b10100, 0b01, 0b100, 10, 1, 2)],
+            &[(1, 1.0f64.to_bits()), (2, 1.0f64.to_bits())],
+        );
+        assert_eq!((cpu.x[10], flags(&cpu)), (1, 0), "fleq of equal values");
+
+        // fcvtmod.w.d: modulo 2^32, sign-extended; flags like fcvt.w.d in RTZ.
+        let cvtmod = |rd: u32, rs1: u32| op_fp(0b11000, 0b01, 0b001, rd, rs1, 8);
+        let cpu = run(&[cvtmod(10, 1)], &[(1, 1.5f64.to_bits())]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (1, fpu::NX));
+        let cpu = run(&[cvtmod(10, 1)], &[(1, (-0.5f64).to_bits())]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (0, fpu::NX), "toward zero");
+        let cpu = run(&[cvtmod(10, 1)], &[(1, 2_147_483_648.0f64.to_bits())]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (0xffff_ffff_8000_0000, fpu::NV), "+2^31");
+        let cpu = run(&[cvtmod(10, 1)], &[(1, (-2_147_483_648.0f64).to_bits())]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (0xffff_ffff_8000_0000, 0), "-2^31 fits");
+        let cpu = run(&[cvtmod(10, 1)], &[(1, 4_294_967_296.0f64.to_bits())]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (0, fpu::NV), "2^32 wraps to zero");
+        let cpu = run(&[cvtmod(10, 1)], &[(1, nan)]);
+        assert_eq!((cpu.x[10], flags(&cpu)), (0, fpu::NV), "NaN");
     }
 
     #[test]

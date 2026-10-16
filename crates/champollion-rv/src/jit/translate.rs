@@ -670,6 +670,9 @@ impl Tx {
                 self.a.fma(kind, fp(width), d, a, b, c);
                 self.fcommit(width, rd, d);
             }
+            // fleq/fltq stay quiet for quiet NaNs but still signal for signaling ones;
+            // that fix-up is not emitted here yet, so the engine handles them.
+            Inst::FCmp { op: FCmpOp::Ltq | FCmpOp::Leq, .. } => return false,
             Inst::FCmp { op, width, rd, rs1, rs2 } => {
                 let a = self.fsrc(width, rs1, FA);
                 let b = self.fsrc(width, rs2, FB);
@@ -681,6 +684,7 @@ impl Tx {
                         FCmpOp::Eq => Cond::Eq,
                         FCmpOp::Lt => Cond::Mi,
                         FCmpOp::Le => Cond::Ls,
+                        FCmpOp::Ltq | FCmpOp::Leq => unreachable!("refused above"),
                     };
                     self.a.cset(d, cond);
                     self.commit(rd, d);

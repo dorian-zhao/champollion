@@ -304,6 +304,21 @@ pub fn fma(op: FmaOp, w: Width, a: u64, b: u64, c: u64, rm: Rm) -> (u64, Fflags)
     (r, flags)
 }
 
+/// `fminm`/`fmaxm` (Zfa): IEEE 754-2019 minimum/maximum — if either input is NaN the
+/// result is the canonical NaN, and a signaling input also raises NV.
+pub fn min_max_zfa(max: bool, w: Width, a: u64, b: u64) -> (u64, Fflags) {
+    if is_nan(w, a) || is_nan(w, b) {
+        let flags = if is_snan(w, a) || is_snan(w, b) { NV } else { 0 };
+        let quiet = match w {
+            Width::S => f32::NAN.to_bits() as u64,
+            Width::D => f64::NAN.to_bits(),
+        };
+        return (quiet, flags);
+    }
+    // No NaN input, so the hardware path below is exact.
+    min_max(max, w, a, b)
+}
+
 /// `fmin`/`fmax` (IEEE 754-2019 minimumNumber/maximumNumber, with -0 < +0).
 pub fn min_max(max: bool, w: Width, a: u64, b: u64) -> (u64, Fflags) {
     // RISC-V: a NaN operand is ignored in favor of a number, and a signaling NaN also raises
@@ -335,8 +350,10 @@ pub fn min_max(max: bool, w: Width, a: u64, b: u64) -> (u64, Fflags) {
     }
 }
 
-/// `feq` (quiet: NV only for signaling NaNs), `flt`/`fle` (signaling: NV for any NaN).
-/// ARM's `fcmp` and `fcmpe` have exactly these exception semantics.
+/// `feq` (quiet: NV only for signaling NaNs), `flt`/`fle` (signaling: NV for any NaN),
+/// and Zfa's `fleq`/`fltq` (quiet for quiet NaNs, NV only for signaling ones).
+/// ARM's `fcmp` (raises nothing) and `fcmpe` (raises for any NaN) cover the first two;
+/// the quiet pair uses `fcmp` plus the signaling-NaN fix-up.
 pub fn compare(op: CmpOp, w: Width, a: u64, b: u64) -> (bool, Fflags) {
     let r: u64;
     let fpsr: u64;
@@ -370,11 +387,121 @@ pub fn compare(op: CmpOp, w: Width, a: u64, b: u64) -> (bool, Fflags) {
         (Width::S, CmpOp::Le) => {
             cmp!("fcmpe", "ls", s, f32, f32::from_bits(a as u32), f32::from_bits(b as u32))
         }
+        (Width::S, CmpOp::Ltq) => {
+            cmp!("fcmp", "mi", s, f32, f32::from_bits(a as u32), f32::from_bits(b as u32))
+        }
+        (Width::S, CmpOp::Leq) => {
+            cmp!("fcmp", "ls", s, f32, f32::from_bits(a as u32), f32::from_bits(b as u32))
+        }
         (Width::D, CmpOp::Eq) => cmp!("fcmp", "eq", d, f64, f64::from_bits(a), f64::from_bits(b)),
         (Width::D, CmpOp::Lt) => cmp!("fcmpe", "mi", d, f64, f64::from_bits(a), f64::from_bits(b)),
         (Width::D, CmpOp::Le) => cmp!("fcmpe", "ls", d, f64, f64::from_bits(a), f64::from_bits(b)),
+        (Width::D, CmpOp::Ltq) => cmp!("fcmp", "mi", d, f64, f64::from_bits(a), f64::from_bits(b)),
+        (Width::D, CmpOp::Leq) => cmp!("fcmp", "ls", d, f64, f64::from_bits(a), f64::from_bits(b)),
     }
-    (r != 0, fflags(fpsr))
+    let mut flags = fflags(fpsr);
+    if matches!(op, CmpOp::Ltq | CmpOp::Leq) && (is_snan(w, a) || is_snan(w, b)) {
+        flags |= NV;
+    }
+    (r != 0, flags)
+}
+
+/// Zfa `fround.s`/`fround.d`: round to an integral value in the same format. Zero and
+/// infinite inputs pass through, NaN inputs give the canonical NaN (NV for signaling
+/// NaN), and `exact` (`froundnx`) raises NX when the input was not already integral.
+/// `Rmm` (round-to-nearest, ties-away) maps onto ARM's `frinta`, which the FPCR
+/// cannot express.
+pub fn round_to_int(w: Width, a: u64, rm: Rm, exact: bool) -> (u64, Fflags) {
+    if rm == Rm::Rmm {
+        // frinta rounds ties away but never reports inexact; froundnx compares.
+        let fpcr = Rm::Rne.fpcr().unwrap();
+        let (r, fl) = match w {
+            Width::S => {
+                let (r, fl): (f32, _) = fp_asm!(fpcr, "frinta {r:s}, {a:s}", f32, r;
+                    a = f32::from_bits(a as u32));
+                (r.to_bits() as u64, fl)
+            }
+            Width::D => {
+                let (r, fl): (f64, _) = fp_asm!(fpcr, "frinta {r:d}, {a:d}", f64, r;
+                    a = f64::from_bits(a));
+                (r.to_bits(), fl)
+            }
+        };
+        let flags = if exact && !is_nan(w, a) && r != a { fl | NX } else { fl };
+        return (r, flags);
+    }
+    let fpcr = rm.fpcr().expect("Rmm was handled above");
+    match (w, exact) {
+        (Width::S, false) => {
+            let (r, fl): (f32, _) = fp_asm!(fpcr, "frinti {r:s}, {a:s}", f32, r;
+                a = f32::from_bits(a as u32));
+            (r.to_bits() as u64, fl)
+        }
+        (Width::S, true) => {
+            let (r, fl): (f32, _) = fp_asm!(fpcr, "frintx {r:s}, {a:s}", f32, r;
+                a = f32::from_bits(a as u32));
+            (r.to_bits() as u64, fl)
+        }
+        (Width::D, false) => {
+            let (r, fl): (f64, _) = fp_asm!(fpcr, "frinti {r:d}, {a:d}", f64, r;
+                a = f64::from_bits(a));
+            (r.to_bits(), fl)
+        }
+        (Width::D, true) => {
+            let (r, fl): (f64, _) = fp_asm!(fpcr, "frintx {r:d}, {a:d}", f64, r;
+                a = f64::from_bits(a));
+            (r.to_bits(), fl)
+        }
+    }
+}
+
+/// Zfa `fcvtmod.w.d`: `fcvt.w.d` in RTZ with the range check replaced by arithmetic
+/// modulo 2^32 — bits 31:0 of the unbounded two's-complement result, sign-extended;
+/// NaN and the infinities convert to zero. The flags are what `fcvt.w.d` raises:
+/// NV alone when the rounded value leaves the `i32` range or the input is not a
+/// number, NX when an in-range input had a fractional part.
+pub fn fcvtmod_w_d(a: u64) -> (u64, Fflags) {
+    let sign = a >> 63;
+    let exp = (a >> 52 & 0x7ff) as i32;
+    let frac = a & ((1u64 << 52) - 1);
+    if exp == 0x7ff {
+        return (0, NV); // NaN and ±inf both convert to zero
+    }
+    if exp == 0 {
+        return (0, if frac == 0 { 0 } else { NX }); // zero or subnormal: |x| < 1
+    }
+    let e = exp - 1023;
+    if e < 0 {
+        return (0, NX); // |x| < 1, x != 0
+    }
+    let m = frac | 1u64 << 52;
+    let inexact: bool;
+    let mag: u32;
+    let out_of_range: bool;
+    if e < 52 {
+        let drop = (52 - e) as u32;
+        inexact = m & ((1u64 << drop) - 1) != 0;
+        let trunc = m >> drop;
+        mag = trunc as u32;
+        // The truncated value decides the range: anything past 2^31 is out, +2^31
+        // itself does not fit an `i32`, and -2^31 does.
+        out_of_range = trunc > 1u64 << 31 || (trunc == 1u64 << 31 && sign == 0);
+    } else {
+        // Already integral; the low bits of the magnitude come from a shift.
+        inexact = false;
+        let up = (e - 52) as u32;
+        mag = if up >= 32 { 0 } else { ((m << up) & 0xffff_ffff) as u32 };
+        out_of_range = true; // |x| >= 2^63 > i32::MAX
+    }
+    let flags = if out_of_range {
+        NV
+    } else if inexact {
+        NX
+    } else {
+        0
+    };
+    let low = if sign == 1 { mag.wrapping_neg() } else { mag };
+    ((low as i32) as i64 as u64, flags)
 }
 
 /// `fclass`: a one-hot classification mask. Pure bit inspection, no flags.
