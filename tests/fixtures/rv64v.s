@@ -105,6 +105,12 @@ vror.vi v1, v2, 40
 vrev8.v v1, v2
 vbrev8.v v1, v2
 vandn.vx v1, v2, a0
+vlseg2e8.v v2, (a0)
+vsseg2e64.v v4, (a1)
+vlseg3e8.v v6, (a0)
+vlseg8e16.v v8, (a0)
+vlsseg8e32.v v16, (a0), a2
+vssseg4e16.v v20, (a1), a3
 vl2r.v v4, (a1)
 vl4r.v v12, (a1)
 vs4r.v v12, (a1)

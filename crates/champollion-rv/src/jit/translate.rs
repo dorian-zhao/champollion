@@ -1669,6 +1669,8 @@ fn is_vector(inst: Inst) -> bool {
             | Inst::VUnary { .. }
             | Inst::VCompress { .. }
             | Inst::VIndexLoad { .. }
+            | Inst::VSegLoad { .. }
+            | Inst::VSegStore { .. }
             | Inst::VWiden { .. }
     )
 }

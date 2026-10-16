@@ -411,6 +411,47 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             vector::exec_index_load(cpu, mem, width.bytes(), mask, vd, rs1, vs2)
                 .map_err(|fault| Trap::LoadFault { pc, fault })?;
         }
+        Inst::VSegLoad { width, stride, mask, fields, vd, rs1, rs2 } => {
+            let base = cpu.x(rs1);
+            let ew = width.bytes();
+            // Unit-stride segments pack `fields` elements per run; the strided form
+            // uses the register operand as the run-to-run distance.
+            let step = if stride { cpu.x(rs2) } else { u64::from(fields) * ew };
+            let span = vector::lmul_regs(cpu);
+            for i in 0..cpu.vl {
+                if mask && !vector::mask_get(cpu, 0, i) {
+                    continue; // masked-off elements are never accessed
+                }
+                let at = base.wrapping_add(i.wrapping_mul(step));
+                for f in 0..u64::from(fields) {
+                    let addr = at.wrapping_add(f * ew);
+                    let mut b = [0u8; 8];
+                    mem.read(addr, &mut b[..ew as usize])
+                        .map_err(|fault| Trap::LoadFault { pc, fault })?;
+                    let reg = ((u64::from(vd) + f * span) % 32) as u8;
+                    vector::set_elem(cpu, reg, i, ew, u64::from_le_bytes(b));
+                }
+            }
+        }
+        Inst::VSegStore { width, stride, mask, fields, vs3, rs1, rs2 } => {
+            let base = cpu.x(rs1);
+            let ew = width.bytes();
+            let step = if stride { cpu.x(rs2) } else { u64::from(fields) * ew };
+            let span = vector::lmul_regs(cpu);
+            for i in 0..cpu.vl {
+                if mask && !vector::mask_get(cpu, 0, i) {
+                    continue;
+                }
+                let at = base.wrapping_add(i.wrapping_mul(step));
+                for f in 0..u64::from(fields) {
+                    let addr = at.wrapping_add(f * ew);
+                    let reg = ((u64::from(vs3) + f * span) % 32) as u8;
+                    let bytes = vector::get_elem(cpu, reg, i, ew).to_le_bytes();
+                    mem.write(addr, &bytes[..ew as usize])
+                        .map_err(|fault| Trap::StoreFault { pc, fault })?;
+                }
+            }
+        }
         Inst::Cbo { op: CboOp::Zero, rs1 } => {
             // Zicboz: zero the 64-byte block containing the address.
             let addr = cpu.x(rs1) & !63;
@@ -1765,6 +1806,32 @@ mod tests {
         }
         assert_eq!(cpu.x[10], 0xffff_ffff_ffff_9c46, "sign-extended sum");
         assert_eq!(u16::from_le_bytes([cpu.v[3][0], cpu.v[3][1]]), 0x9c46, "element 0");
+    }
+
+    #[test]
+    fn segmented_loads_and_stores_interleave_fields() {
+        // Two interleaved streams in and back out again.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vlseg2e8 = |vd: u32, rs1: u32| (1 << 29) | (1 << 25) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vsseg2e8 = |vs3: u32, rs1: u32| (1 << 29) | (1 << 25) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let prog = [vsetivli(0, 4, 0xc0), vlseg2e8(2, 11), vsseg2e8(2, 12)];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        mem.write(DATA, &[0xa0, 0xb1, 0xc2, 0xd3, 0xe4, 0xf5, 0x16, 0x27]).unwrap();
+        let mut cpu = CpuState::new(BASE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 16);
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        let mut out = [0u8; 8];
+        mem.read(DATA + 16, &mut out).unwrap();
+        assert_eq!(out, [0xa0, 0xb1, 0xc2, 0xd3, 0xe4, 0xf5, 0x16, 0x27]);
+        assert_eq!(&cpu.v[2][..4], &[0xa0, 0xc2, 0xe4, 0x16], "field 0 collects the evens");
+        assert_eq!(&cpu.v[3][..4], &[0xb1, 0xd3, 0xf5, 0x27], "field 1 the odds");
     }
 
     #[test]

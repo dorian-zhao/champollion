@@ -59,6 +59,19 @@ pub fn sew_bytes(cpu: &CpuState) -> u64 {
     1u64 << ((cpu.vtype >> 3) & 7)
 }
 
+/// Registers per field group at the current LMUL: 1/2/4/8 for m1..m8, and 1 for the
+/// fractional LMULs (a segment's fields each occupy the same fractional slice).
+#[inline]
+pub fn lmul_regs(cpu: &CpuState) -> u64 {
+    match cpu.vtype & 7 {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => 1,
+    }
+}
+
 /// `vlmax` for the current `vtype` (0 after a reserved `vset*`).
 #[inline]
 pub fn vlmax(cpu: &CpuState) -> u64 {

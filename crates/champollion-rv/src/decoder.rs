@@ -372,6 +372,28 @@ pub enum Inst {
         rs1: u8,
         vs2: u8,
     },
+    /// Segment load (`vlseg`/`vlsseg`): `fields` interleaved streams, one destination
+    /// register each. Unit-stride fields sit `fields` elements apart; the strided form
+    /// (`stride`) places each element run at `x[rs2]` strides.
+    VSegLoad {
+        width: VWidth,
+        stride: bool,
+        mask: bool,
+        fields: u8,
+        vd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    /// Segment store (`vsseg`/`vssseg`), the mirror image of [`Inst::VSegLoad`].
+    VSegStore {
+        width: VWidth,
+        stride: bool,
+        mask: bool,
+        fields: u8,
+        vs3: u8,
+        rs1: u8,
+        rs2: u8,
+    },
     /// Widening unsigned add (`vwaddu.wv`/`vwaddu.wx`): `vs2` is read 2×SEW wide and
     /// the source is zero-extended from SEW.
     VWiden {

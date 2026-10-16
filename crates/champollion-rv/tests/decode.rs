@@ -806,6 +806,78 @@ fn rv64v() {
             VArith { op: VArithOp::Andn, vd: 1, vs2: 2, src: X(10), mask: false },
         ),
         (
+            "vlseg2e8.v v2, (a0)",
+            VSegLoad {
+                width: VWidth::E8,
+                stride: false,
+                mask: false,
+                fields: 2,
+                vd: 2,
+                rs1: A0,
+                rs2: 0,
+            },
+        ),
+        (
+            "vsseg2e64.v v4, (a1)",
+            VSegStore {
+                width: VWidth::E64,
+                stride: false,
+                mask: false,
+                fields: 2,
+                vs3: 4,
+                rs1: A1,
+                rs2: 0,
+            },
+        ),
+        (
+            "vlseg3e8.v v6, (a0)",
+            VSegLoad {
+                width: VWidth::E8,
+                stride: false,
+                mask: false,
+                fields: 3,
+                vd: 6,
+                rs1: A0,
+                rs2: 0,
+            },
+        ),
+        (
+            "vlseg8e16.v v8, (a0)",
+            VSegLoad {
+                width: VWidth::E16,
+                stride: false,
+                mask: false,
+                fields: 8,
+                vd: 8,
+                rs1: A0,
+                rs2: 0,
+            },
+        ),
+        (
+            "vlsseg8e32.v v16, (a0), a2",
+            VSegLoad {
+                width: VWidth::E32,
+                stride: true,
+                mask: false,
+                fields: 8,
+                vd: 16,
+                rs1: A0,
+                rs2: A2,
+            },
+        ),
+        (
+            "vssseg4e16.v v20, (a1), a3",
+            VSegStore {
+                width: VWidth::E16,
+                stride: true,
+                mask: false,
+                fields: 4,
+                vs3: 20,
+                rs1: A1,
+                rs2: A3,
+            },
+        ),
+        (
             "vl2r.v v4, (a1)",
             VLoad {
                 width: VWidth::E8,

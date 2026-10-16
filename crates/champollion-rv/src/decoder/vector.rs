@@ -67,6 +67,37 @@ pub fn decode_mem(w: u32) -> Result<Inst, DecodeError> {
         if mop == 0b01 && nf == 0 {
             return Ok(Inst::VIndexLoad { width, mask, vd, rs1, vs2: rs2 });
         }
+        // Segments: `nf` counts fields beyond the first. The unit form keeps the
+        // packed layout, the strided form takes the run-to-run distance from rs2.
+        if nf > 0 {
+            // The whole-register forms also set `nf`, so only the two segment layouts
+            // are claimed here and anything else falls through below.
+            match (mop, rs2) {
+                (0b00, 0b00000) => {
+                    return Ok(Inst::VSegLoad {
+                        width,
+                        stride: false,
+                        mask,
+                        fields: nf + 1,
+                        vd,
+                        rs1,
+                        rs2,
+                    });
+                }
+                (0b10, _) => {
+                    return Ok(Inst::VSegLoad {
+                        width,
+                        stride: true,
+                        mask,
+                        fields: nf + 1,
+                        vd,
+                        rs1,
+                        rs2,
+                    });
+                }
+                _ => {}
+            }
+        }
         let kind = match (mop, rs2) {
             (0b00, 0b00000) if nf == 0 => VMemKind::Unit,
             (0b00, 0b10000) if nf == 0 => VMemKind::FaultOnlyFirst,
@@ -79,6 +110,33 @@ pub fn decode_mem(w: u32) -> Result<Inst, DecodeError> {
         let rs2 = if kind == VMemKind::Stride { rs2 } else { 0 };
         Ok(Inst::VLoad { width, kind, vd, rs1, rs2, mask, nf })
     } else {
+        if nf > 0 {
+            match (mop, rs2) {
+                (0b00, 0b00000) => {
+                    return Ok(Inst::VSegStore {
+                        width,
+                        stride: false,
+                        mask,
+                        fields: nf + 1,
+                        vs3: vd,
+                        rs1,
+                        rs2,
+                    });
+                }
+                (0b10, _) => {
+                    return Ok(Inst::VSegStore {
+                        width,
+                        stride: true,
+                        mask,
+                        fields: nf + 1,
+                        vs3: vd,
+                        rs1,
+                        rs2,
+                    });
+                }
+                _ => {}
+            }
+        }
         let kind = match (mop, rs2) {
             (0b00, 0b00000) if nf == 0 => VStoreKind::Unit,
             (0b00, 0b01000) if !mask => VStoreKind::WholeRegister,
