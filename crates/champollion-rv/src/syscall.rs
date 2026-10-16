@@ -71,6 +71,7 @@ syscalls! {
     DUP3 = 24 "dup3",
     FCNTL = 25 "fcntl",
     IOCTL = 29 "ioctl",
+    FLOCK = 32 "flock",
     MKDIRAT = 34 "mkdirat",
     UNLINKAT = 35 "unlinkat",
     SYMLINKAT = 36 "symlinkat",
@@ -485,6 +486,10 @@ pub trait HostOs: Send + Sync {
     /// Record locks: `F_GETLK`/`F_SETLK`/`F_SETLKW` (Linux command numbers 5/6/7) with the
     /// lock in host-neutral form. `F_GETLK` updates `lock` in place.
     fn lock(&self, fd: i32, cmd: i32, lock: &mut Flock) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `flock`: whole-file locks (`LOCK_SH`/`LOCK_EX`, with `LOCK_NB`, `LOCK_UN`).
+    fn flock(&self, fd: i32, op: i32) -> SysResult {
         Err(errno::ENOSYS)
     }
     /// Sleep for `(seconds, nanoseconds)` on the host.
@@ -1583,6 +1588,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         nr::FTRUNCATE => host.ftruncate(fd, a[1] as i64),
+        nr::FLOCK => host.flock(fd, a[1] as i32),
         nr::FSYNC => host.fsync(fd, false),
         nr::FDATASYNC => host.fsync(fd, true),
         nr::FCHMOD => host.fchmod(fd, a[1] as u32),

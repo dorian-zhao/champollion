@@ -823,6 +823,12 @@ impl HostOs for DarwinHost {
         unsafe { libc::umask(mask as libc::mode_t) as u32 }
     }
 
+    fn flock(&self, fd: i32, op: i32) -> SysResult {
+        // `LOCK_SH`/`LOCK_EX`/`LOCK_NB`/`LOCK_UN` agree between Linux and Darwin.
+        // SAFETY: no pointers.
+        check(unsafe { libc::flock(fd, op) } as isize)
+    }
+
     fn lock(&self, fd: i32, cmd: i32, lock: &mut Flock) -> SysResult {
         let dcmd = match cmd {
             5 => libc::F_GETLK,
@@ -1036,6 +1042,26 @@ mod tests {
         assert_eq!(linux_errno(libc::ENOTEMPTY), 39);
     }
 
+    #[test]
+    fn flock_conflicts_across_open_descriptions() {
+        use std::os::fd::AsRawFd;
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        const LOCK_UN: i32 = 8;
+        let dir = std::env::temp_dir().join(format!("champollion-flock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock");
+        let f1 = std::fs::File::create(&path).unwrap();
+        let f2 = std::fs::File::open(&path).unwrap();
+        let h = DarwinHost::default();
+        assert_eq!(h.flock(f1.as_raw_fd(), LOCK_EX | LOCK_NB), Ok(0));
+        assert_eq!(h.flock(f2.as_raw_fd(), LOCK_EX | LOCK_NB), Err(errno::EAGAIN));
+        assert_eq!(h.flock(f1.as_raw_fd(), LOCK_UN), Ok(0));
+        assert_eq!(h.flock(f2.as_raw_fd(), LOCK_EX | LOCK_NB), Ok(0));
+        drop((f1, f2));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
     #[test]
     fn opens_reads_and_stats_files() {
         let dir = std::env::temp_dir().join(format!("champollion-host-{}", std::process::id()));
