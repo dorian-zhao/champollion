@@ -711,6 +711,110 @@ pub fn convert(to: Width, a: u64, rm: Rm) -> (u64, Fflags) {
     (r, flags)
 }
 
+/// Zfhmin `fcvt.s.h`: widening a half to a single is exact. A signaling NaN raises
+/// NV, and every NaN becomes the positive canonical NaN (qemu agrees on the sign).
+pub fn f16_to_f32(a: u16) -> (u32, Fflags) {
+    let sign = u32::from(a >> 15) << 31;
+    let exp = u32::from(a >> 10 & 0x1f);
+    let frac = u32::from(a & 0x3ff);
+    if exp == 0x1f {
+        if frac == 0 {
+            return (sign | 0x7f80_0000, 0); // ±inf
+        }
+        let flags = if frac & 0x200 == 0 { NV } else { 0 };
+        return (0x7fc0_0000, flags); // canonical NaN, positive
+    }
+    if exp == 0 {
+        if frac == 0 {
+            return (sign, 0); // ±0
+        }
+        // Subnormal half: normalize frac·2^-24 into IEEE single.
+        let n = 31 - frac.leading_zeros();
+        return (sign | ((103 + n) << 23) | (frac << (23 - n) & 0x7f_ffff), 0);
+    }
+    (sign | ((exp + 112) << 23) | (frac << 13), 0) // normal: rebias 15 -> 127
+}
+
+/// Zfhmin `fcvt.h.s`: narrow a single to half under `rm`, with the RISC-V flag
+/// rules: overflow gives ±inf and OF|NX, a subnormal (or rounded-to-zero) result
+/// that lost bits gives NX|UF (tininess after rounding, so rounding up to the
+/// smallest normal drops UF), exact subnormals stay silent, and NaNs come out
+/// canonical with NV only for signaling inputs.
+pub fn f32_to_f16(a: u32, rm: Rm) -> (u16, Fflags) {
+    let sign = a >> 31;
+    let exp = (a >> 23) & 0xff;
+    let frac = a & 0x7f_ffff;
+    let s16 = (sign as u16) << 15;
+    if exp == 0xff {
+        if frac == 0 {
+            return (s16 | 0x7c00, 0);
+        }
+        let flags = if frac & (1 << 22) == 0 { NV } else { 0 };
+        return (0x7e00, flags); // canonical NaN, positive
+    }
+    if exp == 0 && frac == 0 {
+        return (s16, 0);
+    }
+    // value = m · 2^e with a 24-bit significand.
+    let (m, e) = if exp == 0 {
+        let shift = frac.leading_zeros() as i32 - 8;
+        (u64::from(frac) << shift, -149 - shift)
+    } else {
+        (u64::from(frac | 0x80_0000), exp as i32 - 150)
+    };
+    let eh = e + 23; // the value's exponent of two
+    let negative = sign == 1;
+    if eh < -14 {
+        // Subnormal: quantum 2^-24; 1024 carries up to the smallest normal.
+        let (r, inx) = round_h(m, e, -24, rm, negative);
+        if r >= 1024 {
+            return (s16 | 1 << 10, if inx { NX } else { 0 });
+        }
+        return (s16 | r as u16, if inx { NX | UF } else { 0 });
+    }
+    let (mut r, inx) = round_h(m, e, eh - 10, rm, negative);
+    let mut eh = eh;
+    if r == 2048 {
+        // The significand carried out of the binade: that is 1.0 of the next one.
+        r = 1024;
+        eh += 1;
+    }
+    if eh > 15 {
+        // Some rounding modes carry the overflow to the largest finite value
+        // instead of infinity (IEEE: RTZ, and the modes pointing inward).
+        let to_max = matches!((rm, negative), (Rm::Rtz, _) | (Rm::Rdn, false) | (Rm::Rup, true));
+        return (s16 | if to_max { 0x7bff } else { 0x7c00 }, OF | NX);
+    }
+    (s16 | (((eh + 15) as u16) << 10) | (r as u16 - 1024), if inx { NX } else { 0 })
+}
+
+/// Round `m · 2^e` to an 11-bit significand with quantum `2^q_exp`, returning the
+/// (possibly carrying to 2^11) integer and whether anything was lost.
+fn round_h(m: u64, e: i32, q_exp: i32, rm: Rm, negative: bool) -> (u64, bool) {
+    let shift = e - q_exp;
+    if shift >= 0 {
+        return (m << shift, false);
+    }
+    let drop = -shift;
+    if drop >= 64 {
+        // Far below half a quantum: only the directed modes tick up.
+        let inx = m != 0;
+        let inc = inx && ((rm == Rm::Rup && !negative) || (rm == Rm::Rdn && negative));
+        return (u64::from(inc), inx);
+    }
+    let r = m >> drop;
+    let rem = m & ((1u64 << drop) - 1);
+    let half = 1u64 << (drop - 1);
+    let inc = match rm {
+        Rm::Rne => rem > half || (rem == half && r & 1 == 1),
+        Rm::Rtz => false,
+        Rm::Rdn => negative && rem != 0,
+        Rm::Rup => !negative && rem != 0,
+        Rm::Rmm => rem >= half,
+    };
+    (r + u64::from(inc), rem != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,6 +1046,23 @@ mod tests {
         assert_eq!(soft_binop(BinOp::Mul, Width::S, a, b, Rm::Rne), (0x0080_0000, NX));
         // Rounding toward zero keeps it below the smallest normal: a real underflow.
         assert_eq!(binop(BinOp::Mul, Width::S, a, b, Rm::Rtz), (0x007f_ffff, UF | NX));
+    }
+
+    #[test]
+    fn half_conversions_match_softfloat() {
+        let mut g = Gen(0x0f16_0f16_0f16_0f16);
+        for _ in 0..N {
+            let rm = g.rm();
+            let a = g.float(Width::S) as u32;
+            let (want, flags) =
+                sf::with(rm.softfloat(), || unsafe { sf::f32_to_f16(sf::F32 { v: a }) });
+            assert_eq!(f32_to_f16(a, rm), (want.v, flags), "fcvt.h.s {a:#x} {rm:?}");
+            // Half -> single is exact, so the mode only shows up in the NaN cases.
+            let h = g.next() as u16;
+            let (want, flags) =
+                sf::with(sf::Rounding::NearEven, || unsafe { sf::f16_to_f32(sf::F16 { v: h }) });
+            assert_eq!(f16_to_f32(h), (want.v, flags), "fcvt.s.h {h:#x}");
+        }
     }
 
     #[test]

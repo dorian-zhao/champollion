@@ -182,6 +182,38 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             let v = cpu.x(rs1);
             cpu.f[rd as usize] = if width == FWidth::S { nan_box(v as u32 as u64) } else { v };
         }
+        Inst::FLoadH { rd, rs1, offset } => {
+            let addr = cpu.x(rs1).wrapping_add(sext(offset));
+            let v = load_value(mem, addr, LoadWidth::Hu)
+                .map_err(|fault| Trap::LoadFault { pc, fault })?;
+            cpu.f[rd as usize] = nan_box_h(v as u16);
+        }
+        Inst::FStoreH { rs1, rs2, offset } => {
+            let addr = cpu.x(rs1).wrapping_add(sext(offset));
+            mem.write(addr, &(cpu.f[rs2 as usize] as u16).to_le_bytes())
+                .map_err(|fault| Trap::StoreFault { pc, fault })?;
+        }
+        Inst::FMvXH { rd, rs1 } => {
+            // Raw low bits, sign-extended; no boxing check (qemu reads the plain bits).
+            cpu.set_x(rd, cpu.f[rs1 as usize] as u16 as i16 as i64 as u64);
+        }
+        Inst::FMvHX { rd, rs1 } => {
+            cpu.f[rd as usize] = nan_box_h(cpu.x(rs1) as u16);
+        }
+        Inst::FCvtH { to_half, rd, rs1, rm } => {
+            let rm = rounding(cpu, rm)?;
+            let (r, fl) = if to_half {
+                // fcvt.h.s: the source is a single (boxed as S), the result a half.
+                let (r, fl) = fpu::f32_to_f16(unbox(cpu.f[rs1 as usize]), rm);
+                (nan_box_h(r), fl)
+            } else {
+                // fcvt.s.h: the source is a half, the result a single.
+                let (r, fl) = fpu::f16_to_f32(unbox_h(cpu.f[rs1 as usize]));
+                (nan_box(u64::from(r)), fl)
+            };
+            cpu.f[rd as usize] = r;
+            cpu.fcsr |= fl as u32;
+        }
         Inst::FArith { op, width, rd, rs1, rs2, rm } => {
             let rm = rounding(cpu, rm)?;
             let (r, fl) = fpu::binop(op, width, fget(cpu, width, rs1), fget(cpu, width, rs2), rm);
@@ -579,6 +611,20 @@ fn amo_op(op: AmoOp, width: AmoWidth, old: u64, src: u64) -> u64 {
         AmoOp::Minu => ua.min(ub),
         AmoOp::Maxu => ua.max(ub),
     }
+}
+
+/// NaN-box a half value (in the low 16 bits) for an `f` register.
+#[inline]
+fn nan_box_h(v: u16) -> u64 {
+    0xffff_ffff_ffff_0000 | u64::from(v)
+}
+
+/// A half operand of an `f` register: the low 16 bits when the value is properly
+/// NaN-boxed (bits 63:16 all ones), and the canonical half NaN otherwise. qemu reads
+/// unboxed values that way, without raising NV.
+#[inline]
+fn unbox_h(v: u64) -> u16 {
+    if v >> 16 == 0xffff_ffff_ffff { v as u16 } else { 0x7e00 }
 }
 
 /// Resolve an instruction's `rm` field, reading `frm` for `dyn`.
@@ -1301,6 +1347,39 @@ mod tests {
         assert_eq!(cpu.x[12], 0xffff_ffff_c000_0000);
         assert_eq!(cpu.f[3], 0xffff_ffff_3f80_0000);
         assert_eq!(cpu.f[4], 0x1234_5678_3f80_0000);
+    }
+
+    #[test]
+    fn zfhmin_half_precision() {
+        // flh NaN-boxes the loaded half, fsh stores the register's low half, fmv.x.h
+        // sign-extends the raw bits (no boxing check), and anything that is not a
+        // boxed half reads as the canonical half NaN. Values cross-checked against
+        // qemu-riscv64 8.2 (notes/zfh-qemu-expected.txt).
+        let (mut cpu, mem) = setup(&[
+            fload(0b001, 1, 11, 0),            // flh f1, 0(a1)
+            fstore(0b001, 11, 1, 8),           // fsh f1, 8(a1)
+            op_fp(0b11110, 0b10, 0, 2, 10, 0), // fmv.h.x f2, a0
+            op_fp(0b11100, 0b10, 0, 13, 2, 0), // fmv.x.h a3, f2
+            op_fp(0b01000, 0b00, 0, 4, 1, 2),  // fcvt.s.h f4, f1: half 1.5 -> single
+            op_fp(0b01000, 0b10, 1, 5, 4, 0),  // fcvt.h.s f5, f4, rtz: single -> half
+            op_fp(0b01000, 0b00, 0, 6, 7, 2),  // fcvt.s.h f6, f7: unboxed source
+        ]);
+        mem.write(DATA, &0x3e00u16.to_le_bytes()).unwrap(); // 1.5 in half
+        cpu.set_x(11, DATA);
+        cpu.set_x(10, 0xbeef);
+        cpu.set_x(7, 0x3ff8_0000_0000_0000); // a plain double, not a boxed half
+        run(&mut cpu, &mem, 7);
+
+        assert_eq!(cpu.f[1], 0xffff_ffff_ffff_3e00, "flh boxes");
+        assert_eq!(cpu.f[2], 0xffff_ffff_ffff_beef, "fmv.h.x boxes");
+        assert_eq!(cpu.x[13], 0xffff_ffff_ffff_beef, "fmv.x.h sign-extends the raw bits");
+        let mut b = [0u8; 2];
+        mem.read(DATA + 8, &mut b).unwrap();
+        assert_eq!(u16::from_le_bytes(b), 0x3e00, "fsh writes the low half");
+        assert_eq!(cpu.f[4], 0xffff_ffff_3fc0_0000, "fcvt.s.h 1.5");
+        assert_eq!(cpu.f[5], 0xffff_ffff_ffff_3e00, "fcvt.h.s 1.5");
+        assert_eq!(cpu.f[6], 0xffff_ffff_7fc0_0000, "unboxed reads as the canonical NaN");
+        assert_eq!(cpu.fcsr, 0, "nothing raised a flag");
     }
 
     #[test]

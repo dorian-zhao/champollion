@@ -25,6 +25,12 @@ pub struct F32 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct F16 {
+    pub v: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct F64 {
     pub v: u64,
 }
@@ -44,7 +50,9 @@ unsafe extern "C" {
     pub fn f32_le(a: F32, b: F32) -> bool;
     pub fn f32_lt_quiet(a: F32, b: F32) -> bool;
     pub fn f32_isSignalingNaN(a: F32) -> bool;
+    pub fn f16_to_f32(a: F16) -> F32;
     pub fn f32_to_f64(a: F32) -> F64;
+    pub fn f32_to_f16(a: F32) -> F16;
     pub fn f32_to_i32(a: F32, rm: u8, exact: bool) -> i32;
     pub fn f32_to_ui32(a: F32, rm: u8, exact: bool) -> u32;
     pub fn f32_to_i64(a: F32, rm: u8, exact: bool) -> i64;

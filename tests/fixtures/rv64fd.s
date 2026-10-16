@@ -1,7 +1,7 @@
 # F/D data-movement subset, one instruction per line; see
 # crates/champollion-rv/tests/decode.rs.
 .option norvc
-.option arch, +f,+d,+zfa
+.option arch, +f,+d,+zfa,+zfhmin
 fli.s fa0, -1.0
 fli.d fa1, 1.5
 flw fa0, -4(sp)
@@ -53,3 +53,12 @@ fmaxm.s fa7, fs0, fs1
 fleq.s a0, fa1, fa2
 fltq.d a1, fa3, fa4
 fcvtmod.w.d a2, fa5, rtz
+# Zfhmin.
+flh fa0, -2(sp)
+flh fs11, 6(a0)
+fsh ft0, 4(a1)
+fsh fa7, 0(s0)
+fmv.x.h a0, fa1
+fmv.h.x ft1, t2
+fcvt.s.h fa0, fa1, dyn
+fcvt.h.s fa2, fa3, rdn

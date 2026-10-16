@@ -409,6 +409,16 @@ fn rv64fd() {
         ("fleq.s a0, fa1, fa2", FCmp { op: FCmpOp::Leq, width: S, rd: A0, rs1: FA1, rs2: FA2 }),
         ("fltq.d a1, fa3, fa4", FCmp { op: FCmpOp::Ltq, width: D, rd: A1, rs1: FA3, rs2: FA4 }),
         ("fcvtmod.w.d a2, fa5, rtz", FCvtMod { rd: A2, rs1: FA5 }),
+        // Zfhmin.
+        ("flh fa0, -2(sp)", FLoadH { rd: FA0, rs1: SP, offset: -2 }),
+        ("flh fs11, 6(a0)", FLoadH { rd: FS11, rs1: A0, offset: 6 }),
+        ("fsh ft0, 4(a1)", FStoreH { rs1: A1, rs2: FT0, offset: 4 }),
+        ("fsh fa7, 0(s0)", FStoreH { rs1: S0, rs2: FA7, offset: 0 }),
+        ("fmv.x.h a0, fa1", FMvXH { rd: A0, rs1: FA1 }),
+        ("fmv.h.x ft1, t2", FMvHX { rd: FT1, rs1: T2 }),
+        // LLVM's assembler defaults the bare fcvt.s.h to rne, not dyn; spell it out.
+        ("fcvt.s.h fa0, fa1, dyn", FCvtH { to_half: false, rd: FA0, rs1: FA1, rm: RM_DYN }),
+        ("fcvt.h.s fa2, fa3, rdn", FCvtH { to_half: true, rd: FA2, rs1: FA3, rm: 2 }),
     ];
     check(
         include_str!("../../../tests/fixtures/rv64fd.s"),

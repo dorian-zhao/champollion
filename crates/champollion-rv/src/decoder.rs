@@ -136,6 +136,36 @@ pub enum Inst {
         rs2: u8,
         offset: i32,
     },
+    /// Zfhmin `flh`: a half-precision load, NaN-boxed into the `f` register.
+    FLoadH {
+        rd: u8,
+        rs1: u8,
+        offset: i32,
+    },
+    /// Zfhmin `fsh`: the low half of the `f` register.
+    FStoreH {
+        rs1: u8,
+        rs2: u8,
+        offset: i32,
+    },
+    /// Zfhmin `fmv.x.h`: the raw low half to an `x` register, sign-extended; the
+    /// boxing is not checked (qemu reads the plain bits).
+    FMvXH {
+        rd: u8,
+        rs1: u8,
+    },
+    /// Zfhmin `fmv.h.x`: the low half of the `x` register, NaN-boxed.
+    FMvHX {
+        rd: u8,
+        rs1: u8,
+    },
+    /// Zfhmin `fcvt.h.s` (`to_half`) and `fcvt.s.h`.
+    FCvtH {
+        to_half: bool,
+        rd: u8,
+        rs1: u8,
+        rm: u8,
+    },
     FMvToInt {
         width: FWidth,
         rd: u8,
@@ -1113,10 +1143,18 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
         // them (FP uses 010/011, vector widths use 000 and 101..111).
         LOAD_FP | STORE_FP if matches!(f3, 0b000 | 0b101 | 0b110 | 0b111) => vector::decode_mem(w)?,
         LOAD_FP | STORE_FP => {
+            // Zfhmin's `flh`/`fsh` share this group (funct3 = 001).
+            if f3 == 0b001 {
+                return Ok(if w & 0x7f == LOAD_FP {
+                    Inst::FLoadH { rd, rs1, offset: imm_i(w) }
+                } else {
+                    Inst::FStoreH { rs1, rs2, offset: imm_s(w) }
+                });
+            }
             let width = match f3 {
                 0b010 => FWidth::S,
                 0b011 => FWidth::D,
-                _ => return illegal, // flh/flq: Zfh, Q
+                _ => return illegal, // flq: Q
             };
             if w & 0x7f == LOAD_FP {
                 Inst::FLoad { width, rd, rs1, offset: imm_i(w) }
@@ -1145,7 +1183,18 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
             Inst::FFma { op, width, rd, rs1, rs2, rs3: (w >> 27) as u8, rm: f3 as u8 }
         }
         OP_FP => {
-            // funct7 = funct5 << 2 | fmt, with fmt 0 = S, 1 = D.
+            // funct7 = funct5 << 2 | fmt, with fmt 0 = S, 1 = D, 2 = H.
+            if f7 & 0b11 == 0b10 {
+                // Zfhmin's half-precision conversions and moves.
+                let rm = f3 as u8;
+                let rm_ok = !(rm == 0b101 || rm == 0b110);
+                return match (f7 >> 2, f3, rs2) {
+                    (0b01000, _, 0) if rm_ok => Ok(Inst::FCvtH { to_half: true, rd, rs1, rm }),
+                    (0b11100, 0b000, 0) => Ok(Inst::FMvXH { rd, rs1 }),
+                    (0b11110, 0b000, 0) => Ok(Inst::FMvHX { rd, rs1 }),
+                    _ => illegal,
+                };
+            }
             let width = match f7 & 0b11 {
                 0b00 => FWidth::S,
                 0b01 => FWidth::D,
@@ -1189,6 +1238,10 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 }
                 (0b01000, _, 0) if rm_ok && width == FWidth::D => {
                     Inst::FCvtFloat { to: FWidth::D, rd, rs1, rm }
+                }
+                // Zfhmin fcvt.h.s: the S-width fcvt with rs2 = 2.
+                (0b01000, _, 2) if rm_ok && width == FWidth::S => {
+                    Inst::FCvtH { to_half: false, rd, rs1, rm }
                 }
                 // Zfa: fround/froundnx are fcvt.s.d/fcvt.d.s with rs2 = 4 and 5.
                 (0b01000, _, 4) if rm_ok => Inst::FRound { width, rd, rs1, rm, exact: false },
@@ -1447,7 +1500,7 @@ mod tests {
             op_32(0b010, 0, 1, 2, 3),             // no sltw
             0x0020_0073,                          // uret-shaped SYSTEM encoding
             0x0000_1073,           // csrrw on ustatus: not a user-mode CSR we implement
-            fload(0b001, 1, 2, 0), // flh: Zfh
+            fload(0b100, 1, 2, 0), // flq: Q
             op_fp(0b00000, 0b01, 0b101, 1, 2, 3), // fadd.d with reserved rm 101
             op_fp(0b01011, 0b00, 0b000, 1, 2, 3), // fsqrt.s with rs2 != 0
             op_fp(0b01000, 0b00, 0b000, 1, 2, 0), // fcvt.s.s
