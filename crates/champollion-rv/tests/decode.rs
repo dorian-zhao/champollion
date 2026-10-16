@@ -4,8 +4,8 @@
 
 use champollion_rv::decoder::inst_len;
 use champollion_rv::decoder::{
-    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FArithOp, FCmpOp, FWidth, FmaOp, IntType,
-    LoadWidth, RM_DYN, SgnjKind, StoreWidth,
+    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, CboOp, FArithOp, FCmpOp, FWidth, FmaOp, IntType,
+    LoadWidth, RM_DYN, SgnjKind, StoreWidth, VUnaryOp,
 };
 use champollion_rv::decoder::{
     VArithOp, VCmpOp, VMaskOp, VMemKind, VRedOp, VSel, VSetKind, VStoreKind, VWidth,
@@ -714,7 +714,7 @@ fn rv64v() {
             VArith { op: VArithOp::Rsub, vd: 1, vs2: 2, src: I(3), mask: false },
         ),
         ("vsll.vi v1, v2, 3", VArith { op: VArithOp::Sll, vd: 1, vs2: 2, src: I(3), mask: false }),
-        ("vnsrl.wi v1, v2, 3", Vnsrl { vd: 1, vs2: 2, imm: 3 }),
+        ("vnsrl.wi v1, v2, 3", VNarrow { sra: false, mask: false, vd: 1, vs2: 2, src: I(3) }),
         (
             "vslidedown.vi v1, v2, 3",
             VArith { op: VArithOp::SlideDown, vd: 1, vs2: 2, src: I(3), mask: false },
@@ -735,10 +735,76 @@ fn rv64v() {
             "vrgather.vv v1, v2, v3",
             VArith { op: VArithOp::Gather, vd: 1, vs2: 2, src: V(3), mask: false },
         ),
-        ("vmerge.vvm v1, v2, v3, v0", Vmerge { vd: 1, vs1: 3, vs2: 2 }),
+        ("vmerge.vvm v1, v2, v3, v0", Vmerge { vd: 1, vs2: 2, src: V(3) }),
         ("vredor.vs v1, v2, v3", VRed { op: VRedOp::Or, vd: 1, vs1: 3, vs2: 2 }),
         ("vredand.vs v1, v2, v3", VRed { op: VRedOp::And, vd: 1, vs1: 3, vs2: 2 }),
         ("vredsum.vs v1, v2, v3", VRed { op: VRedOp::Sum, vd: 1, vs1: 3, vs2: 2 }),
+        ("vsub.vv v1, v2, v3", VArith { op: VArithOp::Sub, vd: 1, vs2: 2, src: V(3), mask: false }),
+        (
+            "vsub.vx v1, v2, a0",
+            VArith { op: VArithOp::Sub, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
+        ("vsrl.vv v1, v2, v3", VArith { op: VArithOp::Srl, vd: 1, vs2: 2, src: V(3), mask: false }),
+        (
+            "vsrl.vx v1, v2, a0",
+            VArith { op: VArithOp::Srl, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
+        ("vsrl.vi v1, v2, 3", VArith { op: VArithOp::Srl, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vsra.vv v1, v2, v3", VArith { op: VArithOp::Sra, vd: 1, vs2: 2, src: V(3), mask: false }),
+        (
+            "vsra.vx v1, v2, a0",
+            VArith { op: VArithOp::Sra, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
+        ("vsra.vi v1, v2, 3", VArith { op: VArithOp::Sra, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vmul.vv v1, v2, v3", VArith { op: VArithOp::Mul, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vmslt.vv v1, v2, v3", VCmp { op: VCmpOp::Lt, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vmslt.vx v1, v2, a0", VCmp { op: VCmpOp::Lt, vd: 1, vs2: 2, src: X(10), mask: false }),
+        ("vmsltu.vv v1, v2, v3", VCmp { op: VCmpOp::LtU, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vmsle.vv v1, v2, v3", VCmp { op: VCmpOp::Le, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vmsle.vi v1, v2, 3", VCmp { op: VCmpOp::Le, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vmsgt.vi v1, v2, 3", VCmp { op: VCmpOp::Gt, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vredxor.vs v1, v2, v3", VRed { op: VRedOp::Xor, vd: 1, vs1: 3, vs2: 2 }),
+        ("vmerge.vim v1, v2, 3, v0", Vmerge { vd: 1, vs2: 2, src: I(3) }),
+        ("vmerge.vxm v1, v2, a0, v0", Vmerge { vd: 1, vs2: 2, src: X(10) }),
+        ("vcompress.vm v1, v2, v3", VCompress { vd: 1, vs2: 2, vs1: 3 }),
+        ("vwaddu.wv v1, v2, v3", VWiden { mask: false, vd: 1, vs2: 2, src: V(3) }),
+        ("vwaddu.wx v1, v2, a0", VWiden { mask: false, vd: 1, vs2: 2, src: X(10) }),
+        ("vnsrl.wv v1, v2, v3", VNarrow { sra: false, mask: false, vd: 1, vs2: 2, src: V(3) }),
+        ("vnsrl.wx v1, v2, a0", VNarrow { sra: false, mask: false, vd: 1, vs2: 2, src: X(10) }),
+        ("vnsra.wv v1, v2, v3", VNarrow { sra: true, mask: false, vd: 1, vs2: 2, src: V(3) }),
+        ("vnsra.wi v1, v2, 3", VNarrow { sra: true, mask: false, vd: 1, vs2: 2, src: I(3) }),
+        (
+            "vluxei8.v v1, (a0), v2",
+            VIndexLoad { width: VWidth::E8, mask: false, vd: 1, rs1: A0, vs2: 2 },
+        ),
+        (
+            "vluxei16.v v1, (a0), v2",
+            VIndexLoad { width: VWidth::E16, mask: false, vd: 1, rs1: A0, vs2: 2 },
+        ),
+        (
+            "vluxei32.v v1, (a0), v2",
+            VIndexLoad { width: VWidth::E32, mask: false, vd: 1, rs1: A0, vs2: 2 },
+        ),
+        (
+            "vluxei64.v v1, (a0), v2",
+            VIndexLoad { width: VWidth::E64, mask: false, vd: 1, rs1: A0, vs2: 2 },
+        ),
+        ("vror.vv v1, v2, v3", VArith { op: VArithOp::Ror, vd: 1, vs2: 2, src: V(3), mask: false }),
+        (
+            "vror.vx v1, v2, a0",
+            VArith { op: VArithOp::Ror, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
+        ("vror.vi v1, v2, 7", VArith { op: VArithOp::Ror, vd: 1, vs2: 2, src: I(7), mask: false }),
+        (
+            "vror.vi v1, v2, 40",
+            VArith { op: VArithOp::Ror, vd: 1, vs2: 2, src: I(40), mask: false },
+        ),
+        ("vrev8.v v1, v2", VUnary { op: VUnaryOp::Rev8, mask: false, vd: 1, vs2: 2 }),
+        ("vbrev8.v v1, v2", VUnary { op: VUnaryOp::Brev8, mask: false, vd: 1, vs2: 2 }),
+        (
+            "vandn.vx v1, v2, a0",
+            VArith { op: VArithOp::Andn, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
         (
             "vl2r.v v4, (a1)",
             VLoad {
@@ -779,6 +845,30 @@ fn rv64v() {
     check(
         include_str!("../../../tests/fixtures/rv64v.s"),
         include_bytes!("../../../tests/fixtures/rv64v.bin"),
+        &expected,
+    );
+}
+
+#[test]
+fn zicbo() {
+    use AluOp::Or;
+    use Inst::*;
+    let expected = [
+        // The prefetch hints are the ORI-to-x0 they are encoded as; the r/w selector
+        // shares the low five bits of the immediate (32-byte scaled offset << 5 | 1/3).
+        ("prefetch.r 32(a0)", OpImm { op: Or, rd: ZERO, rs1: A0, imm: 32 | 1 }),
+        ("prefetch.w 64(a0)", OpImm { op: Or, rd: ZERO, rs1: A0, imm: 64 | 3 }),
+        ("prefetch.i 0(a0)", OpImm { op: Or, rd: ZERO, rs1: A0, imm: 0 }),
+        ("cbo.clean (a0)", Cbo { op: CboOp::Clean, rs1: A0 }),
+        ("cbo.flush (a0)", Cbo { op: CboOp::Flush, rs1: A0 }),
+        ("cbo.inval (a0)", Cbo { op: CboOp::Inval, rs1: A0 }),
+        ("cbo.zero (a0)", Cbo { op: CboOp::Zero, rs1: A0 }),
+        ("wrs.nto", Wrs),
+        ("wrs.sto", Wrs),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/zicbo.s"),
+        include_bytes!("../../../tests/fixtures/zicbo.bin"),
         &expected,
     );
 }

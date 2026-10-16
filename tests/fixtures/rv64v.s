@@ -69,6 +69,42 @@ vmerge.vvm v1, v2, v3, v0
 vredor.vs v1, v2, v3
 vredand.vs v1, v2, v3
 vredsum.vs v1, v2, v3
+vsub.vv v1, v2, v3
+vsub.vx v1, v2, a0
+vsrl.vv v1, v2, v3
+vsrl.vx v1, v2, a0
+vsrl.vi v1, v2, 3
+vsra.vv v1, v2, v3
+vsra.vx v1, v2, a0
+vsra.vi v1, v2, 3
+vmul.vv v1, v2, v3
+vmslt.vv v1, v2, v3
+vmslt.vx v1, v2, a0
+vmsltu.vv v1, v2, v3
+vmsle.vv v1, v2, v3
+vmsle.vi v1, v2, 3
+vmsgt.vi v1, v2, 3
+vredxor.vs v1, v2, v3
+vmerge.vim v1, v2, 3, v0
+vmerge.vxm v1, v2, a0, v0
+vcompress.vm v1, v2, v3
+vwaddu.wv v1, v2, v3
+vwaddu.wx v1, v2, a0
+vnsrl.wv v1, v2, v3
+vnsrl.wx v1, v2, a0
+vnsra.wv v1, v2, v3
+vnsra.wi v1, v2, 3
+vluxei8.v v1, (a0), v2
+vluxei16.v v1, (a0), v2
+vluxei32.v v1, (a0), v2
+vluxei64.v v1, (a0), v2
+vror.vv v1, v2, v3
+vror.vx v1, v2, a0
+vror.vi v1, v2, 7
+vror.vi v1, v2, 40
+vrev8.v v1, v2
+vbrev8.v v1, v2
+vandn.vx v1, v2, a0
 vl2r.v v4, (a1)
 vl4r.v v12, (a1)
 vs4r.v v12, (a1)

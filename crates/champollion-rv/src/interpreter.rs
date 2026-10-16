@@ -2,8 +2,8 @@
 
 use crate::cpu::CpuState;
 use crate::decoder::{
-    self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, DecodeError, FWidth, Inst,
-    LoadWidth, SgnjKind, StoreWidth, VMaskOp, VMemKind, VSel, VSetKind, VStoreKind,
+    self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, CboOp, Csr, CsrOp, DecodeError, FWidth,
+    Inst, LoadWidth, SgnjKind, StoreWidth, VMaskOp, VMemKind, VSel, VSetKind, VStoreKind,
 };
 use crate::fpu;
 use crate::memory::{MemFault, Memory};
@@ -352,7 +352,7 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         Inst::VMask { op: VMaskOp::Or, vd, vs1, vs2 } => vector::exec_mask_or(cpu, vd, vs1, vs2),
         Inst::Vmv { vd, src } => vector::exec_mv(cpu, vd, src),
         Inst::VmvNr { vd, vs2, nf } => vector::exec_mv_nr(cpu, vd, vs2, nf),
-        Inst::Vmerge { vd, vs1, vs2 } => vector::exec_merge(cpu, vd, vs1, vs2),
+        Inst::Vmerge { vd, vs2, src } => vector::exec_merge(cpu, vd, vs2, src),
         Inst::VRed { op, vd, vs1, vs2 } => vector::exec_red(cpu, op, vd, vs1, vs2),
         Inst::VmvXs { rd, vs2 } => {
             let v = vector::elem0(cpu, vs2);
@@ -401,7 +401,25 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                 vector::set_elem(cpu, vd, i, sew_b, v);
             }
         }
-        Inst::Vnsrl { vd, vs2, imm } => vector::exec_nsrl(cpu, vd, vs2, imm),
+        Inst::VNarrow { sra, mask, vd, vs2, src } => {
+            vector::exec_narrow(cpu, sra, mask, vd, vs2, src)
+        }
+        Inst::VUnary { op, mask, vd, vs2 } => vector::exec_unary(cpu, op, mask, vd, vs2),
+        Inst::VCompress { vd, vs2, vs1 } => vector::exec_compress(cpu, vd, vs2, vs1),
+        Inst::VWiden { mask, vd, vs2, src } => vector::exec_widen(cpu, mask, vd, vs2, src),
+        Inst::VIndexLoad { width, mask, vd, rs1, vs2 } => {
+            vector::exec_index_load(cpu, mem, width.bytes(), mask, vd, rs1, vs2)
+                .map_err(|fault| Trap::LoadFault { pc, fault })?;
+        }
+        Inst::Cbo { op: CboOp::Zero, rs1 } => {
+            // Zicboz: zero the 64-byte block containing the address.
+            let addr = cpu.x(rs1) & !63;
+            mem.write(addr, &[0u8; 64]).map_err(|fault| Trap::StoreFault { pc, fault })?;
+        }
+        // cbo.clean/flush/inval are no-ops for a coherent, single-level memory model,
+        // and wrs.nto/wrs.sto wait for a reservation event that emulation does not
+        // model: the spin loop around them still makes progress.
+        Inst::Cbo { .. } | Inst::Wrs => {}
     }
     cpu.pc = next;
     cpu.instret = cpu.instret.wrapping_add(1);

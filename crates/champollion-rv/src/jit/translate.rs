@@ -1665,7 +1665,11 @@ fn is_vector(inst: Inst) -> bool {
             | Inst::Vid { .. }
             | Inst::VmvSx { .. }
             | Inst::VmvXs { .. }
-            | Inst::Vnsrl { .. }
+            | Inst::VNarrow { .. }
+            | Inst::VUnary { .. }
+            | Inst::VCompress { .. }
+            | Inst::VIndexLoad { .. }
+            | Inst::VWiden { .. }
     )
 }
 

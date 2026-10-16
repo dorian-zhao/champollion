@@ -88,6 +88,9 @@ pub enum Inst {
         succ: u8,
     },
     FenceI,
+    /// Zawrs `wrs.nto`/`wrs.sto`: waits for a reservation set that never exists under
+    /// emulation, so it is a no-op (the surrounding spin loop still runs).
+    Wrs,
     Csr {
         op: CsrOp,
         csr: Csr,
@@ -295,8 +298,8 @@ pub enum Inst {
     },
     Vmerge {
         vd: u8,
-        vs1: u8,
         vs2: u8,
+        src: VSel,
     },
     VRed {
         op: VRedOp,
@@ -339,10 +342,48 @@ pub enum Inst {
         vs2: u8,
         src: VSel,
     },
-    Vnsrl {
+    /// Narrowing shift right (`vnsrl`/`vnsra`): the source element is 2×SEW wide, the
+    /// result SEW wide.
+    VNarrow {
+        sra: bool,
+        mask: bool,
         vd: u8,
         vs2: u8,
-        imm: u8,
+        src: VSel,
+    },
+    /// Zvbb single-source bit operations (`vrev8.v` and friends).
+    VUnary {
+        op: VUnaryOp,
+        mask: bool,
+        vd: u8,
+        vs2: u8,
+    },
+    /// `vcompress.vm`: the elements selected by v0 are packed to the front of `vd`.
+    VCompress {
+        vd: u8,
+        vs2: u8,
+        vs1: u8,
+    },
+    /// Indexed load (`vluxeiN.v`): element `i` comes from `x[rs1] + index[i]`.
+    VIndexLoad {
+        width: VWidth,
+        mask: bool,
+        vd: u8,
+        rs1: u8,
+        vs2: u8,
+    },
+    /// Widening unsigned add (`vwaddu.wv`/`vwaddu.wx`): `vs2` is read 2×SEW wide and
+    /// the source is zero-extended from SEW.
+    VWiden {
+        mask: bool,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+    },
+    /// Zicbom/Zicboz `cbo.*`: clean/flush/invalidate/zero the block at `x[rs1]`.
+    Cbo {
+        op: CboOp,
+        rs1: u8,
     },
 }
 
@@ -406,6 +447,7 @@ pub enum VStoreKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VArithOp {
     Add,
+    Sub,
     /// `vrsub`: vs2 is subtracted from the operand's source.
     Rsub,
     And,
@@ -413,6 +455,12 @@ pub enum VArithOp {
     Xor,
     Andn,
     Sll,
+    /// `vsrl`: logical shift right by the low log2(SEW) bits of the source.
+    Srl,
+    /// `vsra`: arithmetic (sign-propagating) shift right.
+    Sra,
+    /// Zvbb `vror`: rotate right.
+    Ror,
     Mul,
     SlideUp,
     SlideDown,
@@ -428,12 +476,16 @@ pub enum VSel {
     I(u8),
 }
 
-/// Mask-producing comparisons (`vmseq`/`vmsne`/`vmsleu`/`vmsgtu`).
+/// Mask-producing comparisons (`vmseq`, `vmslt[u]`, `vmsle[u]`, `vmsgt[u]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VCmpOp {
     Eq,
     Ne,
+    Lt,
+    LtU,
+    Le,
     LeU,
+    Gt,
     GtU,
 }
 
@@ -443,13 +495,41 @@ pub enum VMaskOp {
     Or,
 }
 
-/// Mask-form reductions (`vredand.vs`, `vredor.vs`).
+/// Reductions (`vredsum`, `vredand`, `vredor`, `vredxor`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VRedOp {
     And,
     Or,
     /// `vredsum.vs`: the elements summed modulo the element width.
     Sum,
+    /// `vredxor.vs`.
+    Xor,
+}
+
+/// Zvbb's single-source bit operations (funct6 010010, the `vs1` field selects one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VUnaryOp {
+    /// `vbrev8.v`: reverse the bits within each byte.
+    Brev8,
+    /// `vrev8.v`: reverse the element's byte order.
+    Rev8,
+    /// `vbrev.v`: reverse the element's bits.
+    Brev,
+    /// `vclz.v` / `vctz.v` / `vcpop.v`: counts within the element.
+    Clz,
+    Ctz,
+    Cpop,
+}
+
+/// Zicbom/Zicboz cache-block operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CboOp {
+    /// Zicbom: write back (and make clean) the block containing `rs1`.
+    Clean,
+    Flush,
+    Inval,
+    /// Zicboz: write zeros to the block containing `rs1`.
+    Zero,
 }
 
 /// `rm` value meaning "use `frm`". Instructions store `rm` raw (0–4 or 7); reserved values
@@ -851,6 +931,8 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b010, _) => (AluOp::Slt, imm_i(w)),
                 (0b011, _) => (AluOp::Sltu, imm_i(w)),
                 (0b100, _) => (AluOp::Xor, imm_i(w)),
+                // Zicbop's prefetch hints are OP-IMM with an x0 destination, so the
+                // generic ORI arm below already turns them into the required no-op.
                 (0b110, _) => (AluOp::Or, imm_i(w)),
                 (0b111, _) => (AluOp::And, imm_i(w)),
                 (0b001, 0b00_0000) => (AluOp::Sll, shamt),
@@ -1129,6 +1211,19 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
         }
         // fence.i: imm, rs1, and rd are reserved and ignored, like fence's.
         MISC_MEM if f3 == 0b001 => Inst::FenceI,
+        // Zicbom/Zicboz: cbo.clean/flush/inval/zero on the block containing `rs1`.
+        // The operation selector is the whole 12-bit field at 31:20 (so it includes
+        // the bits `rs2` would occupy; `cbo.clean` really encodes 1 there).
+        MISC_MEM if f3 == 0b010 && rd == 0 => {
+            let op = match w >> 20 {
+                0 => CboOp::Inval,
+                1 => CboOp::Clean,
+                2 => CboOp::Flush,
+                4 => CboOp::Zero,
+                _ => return illegal,
+            };
+            Inst::Cbo { op, rs1 }
+        }
         SYSTEM if f3 != 0b000 && f3 != 0b100 => {
             let csr = Csr::from_number(w >> 20).ok_or(DecodeError::Illegal(w))?;
             let op = match f3 & 0b11 {
@@ -1145,6 +1240,8 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
         }
         SYSTEM if w == ECALL => Inst::Ecall,
         SYSTEM if w == EBREAK => Inst::Ebreak,
+        // Zawrs: wrs.nto/wrs.sto (funct12 0x00D/0x01D, all operand fields zero).
+        SYSTEM if f3 == 0 && matches!(w >> 20, 0x00d | 0x01d) && rs1 == 0 && rd == 0 => Inst::Wrs,
         _ => return illegal,
     };
     Ok(inst)
