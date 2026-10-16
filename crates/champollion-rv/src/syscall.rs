@@ -628,6 +628,57 @@ fn hwprobe(p: &Process, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// The machine's own files, served from memory: the host's `/proc` describes the host
+/// (an arm64 Mac), and a guest that read it would see the wrong CPU — or, for
+/// `/proc/version`, a kernel that contradicts its own `uname`. Read-only opens only:
+/// anything else (writes to `/proc/sys`, `O_PATH` references) goes to the host, whose
+/// answers (or errors) are the real ones. Returns `None` for every path we do not own
+/// and whenever the scratch file cannot be written, so the open proceeds normally.
+fn machine_file(path: &[u8], flags: i32) -> Option<u64> {
+    // O_ACCMODE (O_WRONLY and O_RDWR) and O_PATH.
+    if flags & 0b11 != 0 || flags & 0o10000000 != 0 {
+        return None;
+    }
+    let (name, content) = match path {
+        b"/proc/cpuinfo" => ("cpuinfo", machine::Machine::current().cpuinfo()),
+        b"/proc/version" => (
+            "version",
+            format!(
+                "Linux version {} (rvrun@champollion) {}\n",
+                machine::KERNEL_RELEASE,
+                machine::KERNEL_VERSION
+            ),
+        ),
+        b"/proc/sys/kernel/osrelease" => ("osrelease", format!("{}\n", machine::KERNEL_RELEASE)),
+        b"/proc/sys/kernel/ostype" => ("ostype", "Linux\n".to_string()),
+        b"/proc/sys/kernel/version" => ("kversion", format!("{}\n", machine::KERNEL_VERSION)),
+        _ => return None,
+    };
+    use std::os::fd::IntoRawFd;
+    let fd = scratch_file(name, content.as_bytes()).ok()?.into_raw_fd();
+    Some(fd as u64)
+}
+
+/// Write `content` to a scratch file in the host's temporary directory and unlink it
+/// right away, leaving nothing but the fd: a real file keeps `read`, `fstat`, and
+/// `mmap` on the normal path, where a new kind of virtual fd would need its own.
+fn scratch_file(name: &str, content: &[u8]) -> std::io::Result<std::fs::File> {
+    use std::io::{Seek, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = std::env::temp_dir().join(format!("rvrun-{}-{name}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&path)?;
+    file.write_all(content)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
+}
+
 /// `kill`, `tkill`, `tgkill`. Signals to this process or its threads are queued and
 /// delivered by the recipient's run loop (right after this syscall, for the caller).
 fn kill(p: &Process, nr: u64, a: [u64; 6]) -> SysResult {
@@ -1209,7 +1260,11 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::PREAD64 => host.pread(fd, buf(a[1], a[2], Prot::WRITE)?, a[3] as i64),
         nr::OPENAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
-            host.openat(fd, &p.host_path(&path, true), a[2] as i32, a[3] as u32)
+            let flags = a[2] as i32;
+            if let Some(fd) = machine_file(path.as_bytes(), flags) {
+                return Ok(fd);
+            }
+            host.openat(fd, &p.host_path(&path, true), flags, a[3] as u32)
         }
         nr::OPENAT2 => {
             // `open_how`: `flags`, `mode`, `resolve`, little-endian. The kernel accepts
@@ -1226,6 +1281,9 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 return Err(errno::EINVAL);
             }
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
+            if let Some(fd) = machine_file(path.as_bytes(), flags as i32) {
+                return Ok(fd);
+            }
             host.openat2(fd, &p.host_path(&path, true), flags as i32, mode, resolve)
         }
         nr::CLOSE => host.close(fd),

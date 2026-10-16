@@ -3,9 +3,11 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
@@ -83,6 +85,33 @@ int main(int argc, char **argv) {
     struct utsname u;
     CHECK("uname", uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0 &&
                        strcmp(u.machine, "riscv64") == 0);
+
+    // The machine identity: uname, /proc/version, and /proc/cpuinfo must all describe
+    // the machine we emulate (never the arm64 host under it), and V stays unclaimed
+    // until the vector paths of real libraries run.
+    CHECK("uname release", strcmp(u.release, "6.12.0-champollion") == 0);
+    CHECK("hwcap no v", (getauxval(AT_HWCAP) & (1UL << 21)) == 0);
+    char line[256];
+    FILE *ver = fopen("/proc/version", "r");
+    CHECK("proc version", ver != NULL);
+    CHECK("proc version text", ver && fgets(line, sizeof line, ver) &&
+                                   strncmp(line, "Linux version 6.12.0-champollion", 32) == 0);
+    if (ver) fclose(ver);
+    static char cpuinfo[16384];
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    size_t ci_len = ci ? fread(cpuinfo, 1, sizeof cpuinfo - 1, ci) : 0;
+    cpuinfo[ci_len] = '\0';
+    if (ci) fclose(ci);
+    int blocks = 0;
+    for (char *p = cpuinfo; (p = strstr(p, "processor\t: ")) != NULL; p++) blocks++;
+    cpu_set_t set;
+    CHECK("cpuinfo harts", sched_getaffinity(0, sizeof set, &set) == 0 &&
+                               CPU_COUNT(&set) == blocks && blocks > 0);
+    CHECK("cpuinfo isa", strstr(cpuinfo, "isa\t\t: rv64imafdc_zicsr_") != NULL);
+    CHECK("cpuinfo mmu", strstr(cpuinfo, "mmu\t\t: sv39") != NULL);
+    CHECK("cpuinfo ours", strncmp(cpuinfo, "processor\t: 0", 13) == 0 &&
+                              strstr(cpuinfo, "CPU implementer") == NULL &&
+                              strstr(cpuinfo, "asimd") == NULL);
     CHECK("getpid", getpid() > 0);
     CHECK("process group", getpgid(0) == getpgrp() && getpgrp() > 0 && getsid(0) > 0);
 
