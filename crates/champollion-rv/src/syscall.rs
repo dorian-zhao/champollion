@@ -96,6 +96,7 @@ syscalls! {
     WRITEV = 66 "writev",
     PREAD64 = 67 "pread64",
     PWRITE64 = 68 "pwrite64",
+    PSELECT6 = 72 "pselect6",
     PPOLL = 73 "ppoll",
     READLINKAT = 78 "readlinkat",
     NEWFSTATAT = 79 "newfstatat",
@@ -929,7 +930,12 @@ pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
     if result == Err(errno::EINTR) && nr != nr::RT_SIGSUSPEND {
         let restartable = !matches!(
             nr,
-            nr::EPOLL_PWAIT | nr::PPOLL | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::FUTEX
+            nr::EPOLL_PWAIT
+                | nr::PPOLL
+                | nr::PSELECT6
+                | nr::NANOSLEEP
+                | nr::CLOCK_NANOSLEEP
+                | nr::FUTEX
         );
         if p.signal_waiting(t).is_none_or(|all_restart| all_restart && restartable) {
             return Flow::Continue;
@@ -1678,6 +1684,106 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 put(p, a[0] + i as u64 * 8 + 6, &f.revents.to_le_bytes())?;
             }
             Ok(n)
+        }
+        nr::PSELECT6 => {
+            // `select`: three `fd_set`s of up to `FD_SETSIZE` (1024) bits each. The wait
+            // uses the same poll machinery as `ppoll`, but the 6th argument's signal mask
+            // is applied to this thread for the duration of the wait, so the signal
+            // pump's wake-up path sees the mask the guest meant for it — GNU make's
+            // jobserver wait depends on that. Unlike `select`, the timeout is not
+            // rewritten.
+            const FD_SET_BYTES: usize = 128;
+            let nfds = a[0] as usize;
+            if nfds > FD_SET_BYTES * 8 {
+                return Err(errno::EINVAL);
+            }
+            let bytes = nfds.div_ceil(64) * 8;
+            let mut sets = [[0u8; FD_SET_BYTES]; 3];
+            for (set, addr) in sets.iter_mut().zip([a[1], a[2], a[3]]) {
+                if addr != 0 && bytes != 0 {
+                    p.mem.read(addr, &mut set[..bytes]).map_err(efault)?;
+                }
+            }
+            let [read_set, write_set, except_set] = sets;
+            let mut fds: Vec<PollFd> = Vec::new();
+            for i in 0..nfds {
+                let bit = |set: &[u8; FD_SET_BYTES]| set[i / 8] & (1 << (i % 8)) != 0;
+                let events = (if bit(&read_set) { libc::POLLIN } else { 0 })
+                    | (if bit(&write_set) { libc::POLLOUT } else { 0 })
+                    | (if bit(&except_set) { libc::POLLPRI } else { 0 });
+                if events != 0 {
+                    fds.push(PollFd { fd: i as i32, events, revents: 0 });
+                }
+            }
+            let timeout = if a[4] == 0 { None } else { Some(read_timespec(p, a[4])?) };
+            let saved_mask = t.signals.mask();
+            let mut applied = None;
+            if a[5] != 0 {
+                // A `{ sigset, size }` pair pointing at the mask to wait under.
+                let mut pair = [0u8; 16];
+                p.mem.read(a[5], &mut pair).map_err(efault)?;
+                let ptr = u64::from_le_bytes(pair[..8].try_into().unwrap());
+                let size = u64::from_le_bytes(pair[8..].try_into().unwrap());
+                if size != 8 {
+                    return Err(errno::EINVAL);
+                }
+                if ptr != 0 {
+                    let mut set = [0u8; 8];
+                    p.mem.read(ptr, &mut set).map_err(efault)?;
+                    let mask = u64::from_le_bytes(set);
+                    applied = Some(mask);
+                    t.signals.set_mask(mask);
+                }
+            }
+            let result = host.poll(&mut fds, timeout);
+            if let Err(errno::EINTR) = result {
+                // A forwarded signal interrupted the wait. Restore the guest's old mask;
+                // if the signal came through because of the wait mask but the old mask
+                // blocks it, keep the wait mask for delivery and let `rt_sigreturn`
+                // restore the old one (`sigsuspend`'s pattern), so the handler runs now,
+                // which is what a `select` interrupted by it expects.
+                if let Some(wait_mask) = applied {
+                    let pending = p.pending_for(t);
+                    if pending & !wait_mask != 0 && pending & !saved_mask == 0 {
+                        t.saved_mask = Some(saved_mask);
+                    } else {
+                        t.signals.set_mask(saved_mask);
+                    }
+                }
+            } else if applied.is_some() {
+                t.signals.set_mask(saved_mask);
+            }
+            result?;
+            // Rewrite the sets the way `select` does: ready bits set, everything else
+            // cleared. A descriptor the poll does not know reports `EBADF`, as Linux's
+            // upfront check would.
+            let mut out = [[0u8; FD_SET_BYTES]; 3];
+            let mut ready = 0u64;
+            for f in &fds {
+                if f.revents & libc::POLLNVAL != 0 {
+                    return Err(errno::EBADF);
+                }
+                let i = f.fd as usize;
+                let hits = [
+                    f.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0,
+                    f.revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0,
+                    f.revents & libc::POLLPRI != 0,
+                ];
+                if hits.iter().any(|&hit| hit) {
+                    ready += 1;
+                }
+                for (j, hit) in hits.iter().enumerate() {
+                    if *hit {
+                        out[j][i / 8] |= 1 << (i % 8);
+                    }
+                }
+            }
+            for (set, addr) in out.iter().zip([a[1], a[2], a[3]]) {
+                if addr != 0 && bytes != 0 {
+                    put(p, addr, &set[..bytes])?;
+                }
+            }
+            Ok(ready)
         }
         nr::PRCTL => {
             // Thread names (libtest and std name their threads); the rest are unsupported.
