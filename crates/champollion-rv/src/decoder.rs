@@ -502,6 +502,8 @@ pub enum VStoreKind {
     Unit,
     Stride,
     WholeRegister,
+    /// `vsm.v`: the mask register's low `ceil(vl/8)` bytes.
+    Mask,
 }
 
 /// The vector integer arithmetic in the supported subset.
@@ -550,10 +552,25 @@ pub enum VCmpOp {
     GtU,
 }
 
-/// Mask register logic (`vmor.mm`).
+/// Mask register logic (the `vm*.mm` family).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VMaskOp {
+    /// `vmand.mm`: `vs2 && vs1`.
+    And,
+    /// `vmandn.mm`: `vs2 && !vs1`.
+    Andn,
+    /// `vmnand.mm`: `!(vs2 && vs1)`.
+    Nand,
+    /// `vmor.mm`: `vs2 || vs1`.
     Or,
+    /// `vmorn.mm`: `vs2 || !vs1`.
+    Orn,
+    /// `vmnor.mm`: `!(vs2 || vs1)`.
+    Nor,
+    /// `vmxor.mm`: `vs2 ^ vs1`.
+    Xor,
+    /// `vmxnor.mm`: `!(vs2 ^ vs1)`.
+    Xnor,
 }
 
 /// Reductions (`vredsum`, `vredand`, `vredor`, `vredxor`).

@@ -20,6 +20,8 @@ vse64.v v1, (a0)
 vle8.v v1, (a0), v0.t
 vlse64.v v1, (a0), a1
 vlm.v v0, (a0)
+vlm.v v1, (a1)
+vsm.v v3, (a0)
 vl1re64.v v2, (a0)
 vl1r.v v2, (a0)
 vl2r.v v2, (a0)
@@ -40,6 +42,13 @@ vmsne.vi v1, v2, 3
 vmsleu.vi v1, v2, 3
 vmsgtu.vi v1, v2, 3
 vmor.mm v1, v2, v3
+vmand.mm v1, v2, v3
+vmnand.mm v4, v5, v6
+vmandn.mm v7, v8, v9
+vmxor.mm v10, v11, v12
+vmnor.mm v13, v14, v15
+vmorn.mm v16, v17, v18
+vmxnor.mm v19, v20, v21
 vfirst.m a0, v1
 vcpop.m a0, v1
 vadd.vv v1, v2, v3

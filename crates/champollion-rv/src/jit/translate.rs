@@ -1422,14 +1422,11 @@ impl Tx {
         true
     }
 
-    /// `vmor.mm` (and friends) at the supported widths: the bitmask lives in the low
-    /// bytes, so this is a read-modify-write of exactly the bits below `vl`, matching
-    /// the interpreter's per-bit update.
+    /// The `vm*.mm` mask-register logical ops at the supported widths: the bitmask
+    /// lives in the low bytes, so this is a read-modify-write of exactly the bits
+    /// below `vl`, matching the interpreter's per-bit update.
     fn vector_mask(&mut self, op: VMaskOp, vd: u8, vs1: u8, vs2: u8) -> bool {
         let Some((_, _)) = self.vec else { return false };
-        if op != VMaskOp::Or {
-            return false;
-        }
         let mask = (1u64 << self.vec_vl()) - 1;
         self.v_addr(vd);
         self.a.ldr_off(DST, ADDR, 0);
@@ -1437,7 +1434,25 @@ impl Tx {
         self.a.ldr_off(SRC0, ADDR, 0);
         self.v_addr(vs1);
         self.a.ldr_off(SRC1, ADDR, 0);
-        self.a.orr(SRC0, SRC0, SRC1);
+        match op {
+            VMaskOp::And => self.a.and(SRC0, SRC0, SRC1),
+            VMaskOp::Andn => self.a.bic(SRC0, SRC0, SRC1),
+            VMaskOp::Nand => {
+                self.a.and(SRC0, SRC0, SRC1);
+                self.a.mvn(SRC0, SRC0);
+            }
+            VMaskOp::Or => self.a.orr(SRC0, SRC0, SRC1),
+            VMaskOp::Orn => self.a.orn(SRC0, SRC0, SRC1),
+            VMaskOp::Nor => {
+                self.a.orr(SRC0, SRC0, SRC1);
+                self.a.mvn(SRC0, SRC0);
+            }
+            VMaskOp::Xor => self.a.eor(SRC0, SRC0, SRC1),
+            VMaskOp::Xnor => {
+                self.a.eor(SRC0, SRC0, SRC1);
+                self.a.mvn(SRC0, SRC0);
+            }
+        }
         self.a.mov_imm(SRC1, mask);
         self.a.and(SRC0, SRC0, SRC1);
         self.a.bic(DST, DST, SRC1);

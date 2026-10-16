@@ -10,7 +10,7 @@
 //! scanning is handled explicitly and does not trap).
 
 use crate::cpu::CpuState;
-use crate::decoder::{VArithOp, VCmpOp, VRedOp, VSel, VUnaryOp};
+use crate::decoder::{VArithOp, VCmpOp, VMaskOp, VRedOp, VSel, VUnaryOp};
 use crate::memory::{MemFault, Memory};
 
 /// VLEN in bytes. The minimum the vector spec allows, and enough for the RVA23
@@ -328,10 +328,23 @@ pub fn exec_cmp(cpu: &mut CpuState, op: VCmpOp, vd: u8, vs2: u8, src: VSel, mask
     }
 }
 
-/// `vmor.mm`.
-pub fn exec_mask_or(cpu: &mut CpuState, vd: u8, vs1: u8, vs2: u8) {
+/// The `vm*.mm` mask-register logical ops. Only the bits below `vl` are written;
+/// qemu 8.2 leaves the bits above undisturbed too, and the spec allows it.
+pub fn exec_mask(cpu: &mut CpuState, op: VMaskOp, vd: u8, vs1: u8, vs2: u8) {
     for i in 0..cpu.vl {
-        mask_set(cpu, vd, i, mask_get(cpu, vs2, i) || mask_get(cpu, vs1, i));
+        let a = mask_get(cpu, vs2, i);
+        let b = mask_get(cpu, vs1, i);
+        let v = match op {
+            VMaskOp::And => a && b,
+            VMaskOp::Andn => a && !b,
+            VMaskOp::Nand => !(a && b),
+            VMaskOp::Or => a || b,
+            VMaskOp::Orn => a || !b,
+            VMaskOp::Nor => !(a || b),
+            VMaskOp::Xor => a != b,
+            VMaskOp::Xnor => a == b,
+        };
+        mask_set(cpu, vd, i, v);
     }
 }
 

@@ -102,7 +102,7 @@ pub fn decode_mem(w: u32) -> Result<Inst, DecodeError> {
             (0b00, 0b00000) if nf == 0 => VMemKind::Unit,
             (0b00, 0b10000) if nf == 0 => VMemKind::FaultOnlyFirst,
             (0b00, 0b01000) if !mask => VMemKind::WholeRegister,
-            (0b00, 0b01011) if !mask && nf == 0 && vd == 0 => VMemKind::Mask,
+            (0b00, 0b01011) if !mask && nf == 0 => VMemKind::Mask,
             (0b10, _) if nf == 0 => VMemKind::Stride,
             _ => return Err(illegal(w)),
         };
@@ -144,6 +144,7 @@ pub fn decode_mem(w: u32) -> Result<Inst, DecodeError> {
         let kind = match (mop, rs2) {
             (0b00, 0b00000) if nf == 0 => VStoreKind::Unit,
             (0b00, 0b01000) if !mask => VStoreKind::WholeRegister,
+            (0b00, 0b01011) if !mask && nf == 0 => VStoreKind::Mask,
             (0b10, _) if nf == 0 => VStoreKind::Stride,
             _ => return Err(illegal(w)),
         };
@@ -276,7 +277,16 @@ pub fn decode_op(w: u32) -> Result<Inst, DecodeError> {
             0b000001 => Ok(Inst::VRed { op: VRedOp::And, vd, vs1, vs2 }),
             0b000010 => Ok(Inst::VRed { op: VRedOp::Or, vd, vs1, vs2 }),
             0b000011 => Ok(Inst::VRed { op: VRedOp::Xor, vd, vs1, vs2 }),
-            0b011010 => Ok(Inst::VMask { op: VMaskOp::Or, vd, vs1, vs2 }),
+            // The mask-register logical ops share funct6 011000..011111. They are
+            // always unmasked, so vm = 0 is reserved.
+            0b011000 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::Andn, vd, vs1, vs2 }),
+            0b011001 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::And, vd, vs1, vs2 }),
+            0b011010 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::Or, vd, vs1, vs2 }),
+            0b011011 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::Xor, vd, vs1, vs2 }),
+            0b011100 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::Orn, vd, vs1, vs2 }),
+            0b011101 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::Nand, vd, vs1, vs2 }),
+            0b011110 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::Nor, vd, vs1, vs2 }),
+            0b011111 if vm == 1 => Ok(Inst::VMask { op: VMaskOp::Xnor, vd, vs1, vs2 }),
             // Zvbb's single-source ops and vsext/vzext share funct6 010010; the vs1
             // field (which these have no use for) selects one. The extension ops keep
             // the low six codes, the bit operations start at 01000.

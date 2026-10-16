@@ -3,7 +3,7 @@
 use crate::cpu::CpuState;
 use crate::decoder::{
     self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, CboOp, Csr, CsrOp, DecodeError, FWidth,
-    Inst, LoadWidth, SgnjKind, StoreWidth, VMaskOp, VMemKind, VSel, VSetKind, VStoreKind,
+    Inst, LoadWidth, SgnjKind, StoreWidth, VMemKind, VSel, VSetKind, VStoreKind,
 };
 use crate::fpu;
 use crate::memory::{MemFault, Memory};
@@ -325,11 +325,13 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                     }
                 }
                 VMemKind::Mask => {
-                    // The mask register is VLEN/8 bits, loaded little-endian.
-                    let mut b = [0u8; (vector::VLEN_BYTES / 8) as usize];
-                    mem.read(base, &mut b).map_err(|fault| Trap::LoadFault { pc, fault })?;
-                    cpu.v[0] = [0; 16];
-                    cpu.v[0][..b.len()].copy_from_slice(&b);
+                    // `vlm.v` moves ceil(vl/8) bytes, little-endian, into the low bits
+                    // of the destination mask register; the rest is left undisturbed
+                    // (qemu's tail-agnostic choice; the spec also allows ones).
+                    let n = cpu.vl.div_ceil(8) as usize;
+                    let mut b = [0u8; 16];
+                    mem.read(base, &mut b[..n]).map_err(|fault| Trap::LoadFault { pc, fault })?;
+                    cpu.v[vd as usize & 31][..n].copy_from_slice(&b[..n]);
                 }
                 VMemKind::Unit | VMemKind::FaultOnlyFirst | VMemKind::Stride => {
                     // The width suffix is the element width *in memory and in the
@@ -378,6 +380,12 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                     }
                     mem.write(base, &b).map_err(|fault| Trap::StoreFault { pc, fault })?;
                 }
+                VStoreKind::Mask => {
+                    // `vsm.v`: the same ceil(vl/8) bytes, straight out of the register.
+                    let n = cpu.vl.div_ceil(8) as usize;
+                    mem.write(base, &cpu.v[vs3 as usize & 31][..n])
+                        .map_err(|fault| Trap::StoreFault { pc, fault })?;
+                }
                 VStoreKind::Unit | VStoreKind::Stride => {
                     for i in 0..cpu.vl {
                         if mask && !vector::mask_get(cpu, 0, i) {
@@ -397,7 +405,7 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         }
         Inst::VArith { op, vd, vs2, src, mask } => vector::exec_arith(cpu, op, vd, vs2, src, mask),
         Inst::VCmp { op, vd, vs2, src, mask } => vector::exec_cmp(cpu, op, vd, vs2, src, mask),
-        Inst::VMask { op: VMaskOp::Or, vd, vs1, vs2 } => vector::exec_mask_or(cpu, vd, vs1, vs2),
+        Inst::VMask { op, vd, vs1, vs2 } => vector::exec_mask(cpu, op, vd, vs1, vs2),
         Inst::Vmv { vd, src } => vector::exec_mv(cpu, vd, src),
         Inst::VmvNr { vd, vs2, nf } => vector::exec_mv_nr(cpu, vd, vs2, nf),
         Inst::Vmerge { vd, vs2, src } => vector::exec_merge(cpu, vd, vs2, src),
@@ -2077,6 +2085,126 @@ mod tests {
         let mut one = [0u8; 1];
         mem.read(DATA + 64, &mut one).unwrap();
         assert_eq!(one, [0x11], "vl=1: the clang extract idiom");
+    }
+
+    #[test]
+    fn vector_mask_logic_family() {
+        // Hand-assembled helpers, checked against the assembler. e8/m1 gives VLMAX = 16
+        // mask bits, i.e. the low two bytes of a register.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vlm = |vd: u32, rs1: u32| (1 << 25) | (0b01011 << 20) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vsm =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b01011 << 20) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vm = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (0b010 << 12) | (vd << 7) | 0x57
+        };
+        const VT: u32 = 0xc0; // e8, m1, ta, ma
+
+        // v1 = 0xAAAA, v2 = 0xCCCC; each op's result goes to its own 16-byte slot.
+        let ops: [(u32, u8, u64, u16); 8] = [
+            (0b011001, 13, 16, 0x8888),  // vmand.mm
+            (0b011000, 14, 32, 0x2222),  // vmandn.mm
+            (0b011101, 15, 48, 0x7777),  // vmnand.mm
+            (0b011011, 16, 64, 0x6666),  // vmxor.mm
+            (0b011010, 17, 80, 0xeeee),  // vmor.mm
+            (0b011110, 8, 96, 0x1111),   // vmnor.mm
+            (0b011100, 9, 112, 0xbbbb),  // vmorn.mm
+            (0b011111, 18, 128, 0x9999), // vmxnor.mm
+        ];
+        let mut prog = vec![vsetivli(0, 16, VT), vlm(1, 11), vlm(2, 12)];
+        for &(f6, slot, _, _) in &ops {
+            prog.push(vm(f6, 3, 1, 2));
+            prog.push(vsm(3, slot as u32));
+        }
+        // vl = 3 with v11 prefilled to all ones: only the low three bits are written,
+        // the rest stay undisturbed (qemu 8.2 does the same).
+        prog.push(vlm(11, 20));
+        prog.push(vsetivli(0, 3, VT));
+        prog.push(vm(0b011010, 11, 1, 2));
+        prog.push(vsm(11, 19));
+
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        mem.write(DATA, &[0xaa, 0xaa]).unwrap();
+        mem.write(DATA + 8, &[0xcc, 0xcc]).unwrap();
+        mem.write(DATA + 160, &[0xff, 0xff]).unwrap();
+        let mut cpu = CpuState::new(BASE);
+        for (r, off) in [
+            (11u8, 0u64),
+            (12, 8),
+            (13, 16),
+            (14, 32),
+            (15, 48),
+            (16, 64),
+            (17, 80),
+            (8, 96),
+            (9, 112),
+            (18, 128),
+            (19, 144),
+            (20, 160),
+        ] {
+            cpu.set_x(r, DATA + off);
+        }
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        for &(_, _, off, want) in &ops {
+            let mut b = [0u8; 2];
+            mem.read(DATA + off, &mut b).unwrap();
+            assert_eq!(u16::from_le_bytes(b), want, "slot {off}");
+        }
+        assert_eq!(cpu.v[11][0], 0xfe, "bits 0..=2 compute, 3..=7 stay set");
+        assert_eq!(cpu.v[11][1], 0xff, "bits above vl stay undisturbed");
+        let mut b = [0u8; 2];
+        mem.read(DATA + 144, &mut b).unwrap();
+        assert_eq!(b, [0xfe, 0x00], "vsm.v stores ceil(3/8) = one byte");
+        assert_eq!(cpu.vl, 3, "vsetivli pinned vl for the tail case");
+    }
+
+    #[test]
+    fn mask_load_and_store_move_ceil_vl_over_8_bytes() {
+        // `vlm.v` moves ceil(vl/8) bytes into the low bits of *vd* (not always v0)
+        // and leaves the rest of the register undisturbed; `vsm.v` stores the same
+        // count back out. qemu-riscv64 8.2 makes both choices.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vlm = |vd: u32, rs1: u32| (1 << 25) | (0b01011 << 20) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vsm =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b01011 << 20) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        const VT: u32 = 0xc0; // e8, m1, ta, ma
+        let prog = [
+            vsetivli(0, 3, VT),
+            vlm(2, 11), // one byte: 0x11
+            vsm(2, 12),
+            vsetivli(0, 16, VT),
+            vlm(3, 11), // two bytes: 0x11 0x22
+            vsm(3, 13),
+        ];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        mem.write(DATA, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+        mem.write(DATA + 32, &[0xaa, 0xaa]).unwrap();
+        let mut cpu = CpuState::new(BASE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 32);
+        cpu.set_x(13, DATA + 64);
+        cpu.v[2][1] = 0xab; // a byte just above the moved one
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        assert_eq!(cpu.v[2][0], 0x11, "vlm.v wrote vd, not v0");
+        assert_eq!(cpu.v[2][1], 0xab, "only ceil(vl/8) bytes were touched");
+        assert_eq!(cpu.v[0], [0u8; 16], "v0 stays untouched");
+        let mut b = [0u8; 2];
+        mem.read(DATA + 32, &mut b).unwrap();
+        assert_eq!(b, [0x11, 0xaa], "vsm.v stored one byte");
+        mem.read(DATA + 64, &mut b).unwrap();
+        assert_eq!(b, [0x11, 0x22], "vl=16 moves two bytes");
     }
 
     #[test]

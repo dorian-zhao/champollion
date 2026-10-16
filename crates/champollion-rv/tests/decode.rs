@@ -632,6 +632,14 @@ fn rv64v() {
             VLoad { width: E8, kind: M::Mask, vd: 0, rs1: A0, rs2: 0, mask: false, nf: 0 },
         ),
         (
+            "vlm.v v1, (a1)",
+            VLoad { width: E8, kind: M::Mask, vd: 1, rs1: A1, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vsm.v v3, (a0)",
+            VStore { width: E8, kind: SM::Mask, vs3: 3, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
             "vl1re64.v v2, (a0)",
             VLoad {
                 width: E64,
@@ -690,6 +698,13 @@ fn rv64v() {
         ("vmsleu.vi v1, v2, 3", VCmp { op: C::LeU, vd: 1, vs2: 2, src: I(3), mask: false }),
         ("vmsgtu.vi v1, v2, 3", VCmp { op: C::GtU, vd: 1, vs2: 2, src: I(3), mask: false }),
         ("vmor.mm v1, v2, v3", VMask { op: VMaskOp::Or, vd: 1, vs1: 3, vs2: 2 }),
+        ("vmand.mm v1, v2, v3", VMask { op: VMaskOp::And, vd: 1, vs1: 3, vs2: 2 }),
+        ("vmnand.mm v4, v5, v6", VMask { op: VMaskOp::Nand, vd: 4, vs1: 6, vs2: 5 }),
+        ("vmandn.mm v7, v8, v9", VMask { op: VMaskOp::Andn, vd: 7, vs1: 9, vs2: 8 }),
+        ("vmxor.mm v10, v11, v12", VMask { op: VMaskOp::Xor, vd: 10, vs1: 12, vs2: 11 }),
+        ("vmnor.mm v13, v14, v15", VMask { op: VMaskOp::Nor, vd: 13, vs1: 15, vs2: 14 }),
+        ("vmorn.mm v16, v17, v18", VMask { op: VMaskOp::Orn, vd: 16, vs1: 18, vs2: 17 }),
+        ("vmxnor.mm v19, v20, v21", VMask { op: VMaskOp::Xnor, vd: 19, vs1: 21, vs2: 20 }),
         ("vfirst.m a0, v1", Vfirst { rd: 10, vs2: 1 }),
         ("vcpop.m a0, v1", Vcpop { rd: 10, vs2: 1 }),
         ("vadd.vv v1, v2, v3", VArith { op: VArithOp::Add, vd: 1, vs2: 2, src: V(3), mask: false }),
