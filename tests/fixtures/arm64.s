@@ -38,6 +38,7 @@ add w10, w11, #1
 add sp, sp, #16
 sub x12, x13, #2048
 sub x16, x27, #20, lsl #12
+add x13, x14, #20, lsl #12
 sub w14, w15, #7
 cmp x16, #0
 cmp w17, #5
@@ -193,3 +194,24 @@ cmeq v20.16b, v21.16b, #0
 mvn v22.16b, v23.16b
 rbit v16.16b, v16.16b
 rbit v3.16b, v5.16b
+ldr q0, [x1]
+ldr q2, [x3, #32]
+str q4, [x5]
+str q6, [x7, #48]
+ldr q25, [x2, x3]
+str q26, [x2, x3]
+add v0.16b, v1.16b, v2.16b
+add v3.8h, v4.8h, v5.8h
+add v6.4s, v7.4s, v8.4s
+add v9.2d, v10.2d, v11.2d
+sub v0.16b, v1.16b, v2.16b
+sub v3.8h, v4.8h, v5.8h
+sub v6.4s, v7.4s, v8.4s
+sub v9.2d, v10.2d, v11.2d
+and v12.16b, v13.16b, v14.16b
+orr v15.16b, v16.16b, v17.16b
+eor v18.16b, v19.16b, v20.16b
+dup v21.16b, w1
+dup v22.8h, w2
+dup v23.4s, w3
+dup v24.2d, x4

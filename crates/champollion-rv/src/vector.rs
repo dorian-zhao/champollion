@@ -18,23 +18,23 @@ pub const VLEN_BYTES: u64 = 16;
 
 /// `vl` for one `vset*`: validate `vtype`, set it with `vl`, and return the new `vl`.
 pub fn vset(cpu: &mut CpuState, avl: u64, bits: u64) -> u64 {
-    if bits & 7 == 4 {
-        return vill(cpu, bits); // vlmul 100 is reserved
-    }
-    if (bits >> 3) & 7 > 3 {
-        return vill(cpu, bits); // vsew 4..7 are reserved
-    }
-    let vl = avl.min(vlmax_of(bits));
-    cpu.vtype = bits;
+    let (vtype, vl) = vset_compute(avl, bits);
+    cpu.vtype = vtype;
     cpu.vl = vl;
     vl
 }
 
-/// Reserved `vtype`: `vill` is set, `vl` becomes zero, and the raw bits are kept.
-fn vill(cpu: &mut CpuState, bits: u64) -> u64 {
-    cpu.vtype = bits | 1 << 63;
-    cpu.vl = 0;
-    0
+/// `vset`'s arithmetic without the state write: the `vtype` and `vl` that setting `avl`
+/// with this raw `vtype` produces. (The JIT translates its statically known `vsetivli`
+/// through this, so both engines write bit-identical state.)
+pub fn vset_compute(avl: u64, bits: u64) -> (u64, u64) {
+    if bits & 7 == 4 {
+        return (bits | 1 << 63, 0); // vlmul 100 is reserved
+    }
+    if (bits >> 3) & 7 > 3 {
+        return (bits | 1 << 63, 0); // vsew 4..7 are reserved
+    }
+    (bits, avl.min(vlmax_of(bits)))
 }
 
 /// `vlmax` for a validated `vtype`.

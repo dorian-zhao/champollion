@@ -33,7 +33,7 @@ use super::arm64::{Asm, AtomicOp, Cond, FmaKind, Fp, FpOp, FpRound, Mem, Reg, XZ
 use crate::cpu::CpuState;
 use crate::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FArithOp, FCmpOp, FWidth, FmaOp, Inst, IntType,
-    LoadWidth, RM_DYN, SgnjKind, StoreWidth,
+    LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VMemKind, VSel, VSetKind, VStoreKind,
 };
 use crate::memory::{CONTROL_OFFSET, GUARD_SIZE, GUEST_SIZE};
 const _: () = assert!(CONTROL_OFFSET.is_multiple_of(4096) && CONTROL_OFFSET >> 12 < 4096);
@@ -103,6 +103,12 @@ const PC: u32 = offset_of!(CpuState, pc) as u32;
 const INSTRET: u32 = offset_of!(CpuState, instret) as u32;
 const RESERVED_ADDR: u32 = offset_of!(CpuState, reserved_addr) as u32;
 const FCSR: u32 = offset_of!(CpuState, fcsr) as u32;
+const VL_OFF: u32 = offset_of!(CpuState, vl) as u32;
+const VTYPE_OFF: u32 = offset_of!(CpuState, vtype) as u32;
+
+fn v_offset(v: u8) -> u32 {
+    (offset_of!(CpuState, v) + 16 * v as usize) as u32
+}
 /// Host v-register holding each guest f register, or `None` if it lives in `CpuState`.
 /// f0–f15 -> v0–v15 and f16–f27 -> v20–v31; ft8–ft11 (f28–f31) stay in memory. v8–v15 are
 /// callee-saved in the host ABI (their low halves), so the trampoline preserves them.
@@ -224,6 +230,10 @@ struct Tx {
     interrupt_slot: u32,
     /// Whether guest memory uses the identity layout (see [`MEMBASE`]).
     identity: bool,
+    /// Vector configuration this translation assumes, `(sew log2, element bytes)`, when
+    /// it translates vector instructions: the block's entry guard requires the guest to
+    /// still be in exactly this configuration (vl == vlmax, m1) or it interprets instead.
+    vec: Option<(u32, u32)>,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -491,6 +501,26 @@ impl Tx {
                             None => self.a.str_reg(mem, SRC1, self.base_reg(), self.index_reg()),
                         }
                     }
+                }
+            }
+            Inst::VLoad { .. } | Inst::VStore { .. } => {
+                if !self.vector_mem(inst, pc) {
+                    return false;
+                }
+            }
+            Inst::VSetvl { rd, rs1, rs2, kind: VSetKind::ImmediateAvl } => {
+                if !self.vsetivli(rd, u64::from(rs1), u64::from(rs2)) {
+                    return false;
+                }
+            }
+            Inst::VArith { op, vd, vs2, src, mask } => {
+                if !self.vector_arith(op, vd, vs2, src, mask) {
+                    return false;
+                }
+            }
+            Inst::Vmv { vd, src } => {
+                if !self.vector_mv(vd, src) {
+                    return false;
                 }
             }
             Inst::FMvFromInt { width, rd, rs1 } => {
@@ -1206,6 +1236,135 @@ impl Tx {
         self.a.lslv(tmp, tmp, b);
     }
 
+    /// A unit-stride vector access at `vl == vlmax`: VLEN bits are one NEON register,
+    /// whatever the element width, so the whole access is one 16-byte load or store
+    /// (the entry guard pinned the configuration; unaligned addresses are fine).
+    fn vector_mem(&mut self, inst: Inst, pc: u64) -> bool {
+        if self.vec.is_none() {
+            return false;
+        }
+        match inst {
+            Inst::VLoad { kind: VMemKind::Unit, vd, rs1, mask: false, nf: 0, .. } => {
+                let operand = self.mem_operand(rs1, 0, 16);
+                self.accesses.push((self.a.pos(), pc, self.retired, false));
+                match operand {
+                    Some(_) => self.a.ldr_q(FA, ADDR),
+                    None => self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg()),
+                }
+                self.v_addr(vd);
+                self.a.str_q(FA, ADDR);
+                true
+            }
+            Inst::VStore { kind: VStoreKind::Unit, vs3, rs1, mask: false, nf: 0, .. } => {
+                self.v_addr(vs3);
+                self.a.ldr_q(FA, ADDR);
+                let operand = self.mem_operand(rs1, 0, 16);
+                self.accesses.push((self.a.pos(), pc, self.retired, true));
+                match operand {
+                    Some(_) => self.a.str_q(FA, ADDR),
+                    None => self.a.str_q_reg(FA, self.base_reg(), self.index_reg()),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A lane-wise unmasked arithmetic op, one NEON instruction per element width (the
+    /// bitwise ones are element-size independent and use the byte forms).
+    fn vector_arith(&mut self, op: VArithOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if mask {
+            return false;
+        }
+        // Decide before emitting anything that guest state depends on.
+        let supported = matches!(
+            op,
+            VArithOp::Add | VArithOp::Rsub | VArithOp::And | VArithOp::Or | VArithOp::Xor
+        );
+        if !supported {
+            return false;
+        }
+        self.v_addr(vs2);
+        self.a.ldr_q(FA, ADDR);
+        if !self.vector_operand(src, FB, bytes) {
+            return false; // only scratch (FA) was touched
+        }
+        match op {
+            VArithOp::Add => self.a.vec_add(bytes * 8, FA, FA, FB),
+            VArithOp::Rsub => self.a.vec_sub(bytes * 8, FA, FB, FA),
+            VArithOp::And => self.a.vec_and(FA, FA, FB),
+            VArithOp::Or => self.a.vec_orr(FA, FA, FB),
+            _ => self.a.vec_eor(FA, FA, FB),
+        }
+        self.v_addr(vd);
+        self.a.str_q(FA, ADDR);
+        true
+    }
+
+    /// `vmv.v.*`: the whole register becomes the broadcast of the source.
+    fn vector_mv(&mut self, vd: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if !self.vector_operand(src, FA, bytes) {
+            return false;
+        }
+        self.v_addr(vd);
+        self.a.str_q(FA, ADDR);
+        true
+    }
+
+    /// `vsetivli`: its AVL and vtype are constants, so the resulting state is known at
+    /// translation time. Write it like the interpreter would and continue under it,
+    /// which lets a loop that opens with a `vsetivli` translate as one block.
+    fn vsetivli(&mut self, rd: u8, avl: u64, bits: u64) -> bool {
+        let (vtype, vl) = crate::vector::vset_compute(avl, bits);
+        self.a.mov_imm(SRC0, vtype);
+        self.a.str_off(SRC0, CTX, VTYPE_OFF);
+        self.a.mov_imm(SRC0, vl);
+        self.a.str_off(SRC0, CTX, VL_OFF);
+        self.constant(rd, vl);
+        // Later vector ops in this block run under the new configuration; if it is not
+        // one this subset can express, the first of them ends the block for the
+        // interpreter (the state write above stays, as it must).
+        self.vec = vector_config((vtype, vl));
+        true
+    }
+
+    /// The vector instruction's source: another register, a broadcast scalar from an x
+    /// register, or the sign-extended 5-bit immediate (arithmetic forms).
+    fn vector_operand(&mut self, src: VSel, dst: Reg, bytes: u32) -> bool {
+        match src {
+            VSel::V(vs1) => {
+                self.v_addr(vs1);
+                self.a.ldr_q(dst, ADDR);
+            }
+            VSel::X(rs1) => {
+                let x = self.src(rs1, SRC0);
+                self.a.vec_dup(dst, x, bytes);
+            }
+            VSel::I(imm) => {
+                self.a.mov_imm(ADDR, crate::vector::sext5(imm));
+                self.a.vec_dup(dst, ADDR, bytes);
+            }
+        }
+        true
+    }
+
+    /// Put the address of guest vector register `v` in `ADDR`. The register file is a
+    /// plain byte array (no 16-byte alignment to lean on), so it is addressed through a
+    /// base register rather than the load/store immediate forms.
+    fn v_addr(&mut self, v: u8) {
+        let off = v_offset(v);
+        if off <= 4095 {
+            self.a.add_imm(ADDR, CTX, off);
+        } else {
+            self.a.add_imm_lsl12(ADDR, CTX, off & !0xfff);
+            if off & 0xfff != 0 {
+                self.a.add_imm(ADDR, ADDR, off & 0xfff);
+            }
+        }
+    }
+
     /// Zba word adds: `b + (zero-extended a << shift)`. In the ARM extended-register
     /// form register 31 reads as SP, not XZR, so a zero `b` cannot take the one-instruction
     /// form — the zero-extended source is the whole result then.
@@ -1283,9 +1442,48 @@ fn mem_base(inst: Inst) -> Option<u8> {
         Inst::Load { rs1, .. }
         | Inst::Store { rs1, .. }
         | Inst::FLoad { rs1, .. }
-        | Inst::FStore { rs1, .. } => Some(rs1),
+        | Inst::FStore { rs1, .. }
+        | Inst::VLoad { rs1, .. }
+        | Inst::VStore { rs1, .. } => Some(rs1),
         _ => None,
     }
+}
+
+/// The vector configuration `(sew log2, element bytes)` a translation may assume for
+/// `(vtype, vl)`: m1 with no `vill`, a supported element width, and `vl` at its maximum
+/// (VLEN = 128 bits, one NEON register). Anything else must interpret.
+fn vector_config((vtype, vl): (u64, u64)) -> Option<(u32, u32)> {
+    let sew = (vtype >> 3) & 7;
+    if vtype >> 63 != 0 || vtype & 7 != 0 || sew > 3 {
+        return None;
+    }
+    let bytes = 1u32 << sew;
+    if vl == u64::from(16 / bytes) { Some((sew as u32, bytes)) } else { None }
+}
+
+/// Whether the instruction reads or writes vector state, so its translation has to pin
+/// the vector configuration. `vset*` is not included: it ends the block instead.
+fn is_vector(inst: Inst) -> bool {
+    matches!(
+        inst,
+        Inst::VLoad { .. }
+            | Inst::VStore { .. }
+            | Inst::VArith { .. }
+            | Inst::VCmp { .. }
+            | Inst::VMask { .. }
+            | Inst::Vmv { .. }
+            | Inst::VmvNr { .. }
+            | Inst::Vmerge { .. }
+            | Inst::VRed { .. }
+            | Inst::VExt { .. }
+            | Inst::VMacc { .. }
+            | Inst::Vcpop { .. }
+            | Inst::Vfirst { .. }
+            | Inst::Vid { .. }
+            | Inst::VmvSx { .. }
+            | Inst::VmvXs { .. }
+            | Inst::Vnsrl { .. }
+    )
 }
 
 /// Whether translating `inst` leaves `ADDR` alone, apart from [`Tx::mem_operand`], so the
@@ -1354,6 +1552,7 @@ fn base_reuse(block: &[(Inst, u8)]) -> Vec<bool> {
 /// check interrupt flag `interrupt_slot` (see [`GuestMemory::interrupt_flag`]).
 ///
 /// [`GuestMemory::interrupt_flag`]: crate::memory::GuestMemory::interrupt_flag
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     block: &[(Inst, u8)],
     pc: u64,
@@ -1362,7 +1561,24 @@ pub fn translate(
     jump_cache: i64,
     interrupt_slot: u32,
     identity: bool,
+    vstate: (u64, u64),
 ) -> Option<Translation> {
+    // A block with vector instructions is translated for one exact vector configuration
+    // (the one it is being translated in), and its entry guard re-checks that at run
+    // time. A configuration the subset cannot express leaves `vec` empty: the scalar
+    // prefix still translates (and is cached), and the first vector instruction ends the
+    // block, exactly as untranslated instructions always have.
+    let vec =
+        if block.iter().any(|&(inst, _)| is_vector(inst)) { vector_config(vstate) } else { None };
+    // The entry guard is only needed while a translated vector op can run under the
+    // entry's vector state: a `vsetivli` in the block re-establishes it from constants.
+    let guard = vec.is_some()
+        && block
+            .iter()
+            .take_while(|&&(inst, _)| {
+                !matches!(inst, Inst::VSetvl { kind: VSetKind::ImmediateAvl, .. })
+            })
+            .any(|&(inst, _)| is_vector(inst));
     let mut tx = Tx {
         a: Asm::new(),
         tails: Vec::new(),
@@ -1376,11 +1592,29 @@ pub fn translate(
         base_reused: false,
         interrupt_slot,
         identity,
+        vec,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
     let instret_at = tx.a.pos();
     tx.a.add_imm(INSTRET_REG, INSTRET_REG, 0); // patched below
+
+    // The vector entry guard (after the instret update, which its tail corrects): if
+    // vtype or vl differ from what this translation assumed (a different loop, a later
+    // vset), leave to the interpreter at this pc.
+    if guard {
+        let (vtype, vl) = vstate;
+        tx.a.ldr_off(SRC0, CTX, VTYPE_OFF);
+        tx.a.mov_imm(SRC1, vtype);
+        tx.a.eor(SRC0, SRC0, SRC1);
+        tx.a.ldr_off(SRC1, CTX, VL_OFF);
+        tx.a.mov_imm(DST, vl);
+        tx.a.eor(SRC1, SRC1, DST);
+        tx.a.orr(SRC0, SRC0, SRC1);
+        let to_tail = tx.a.pos();
+        tx.a.cbnz(SRC0, to_tail); // patched to the interpret tail by emit_tails
+        tx.tails.push((to_tail, Tail::Interpret { pc, retired_before: 0 }));
+    }
 
     let mut retired = 0u32;
     let mut at = pc;

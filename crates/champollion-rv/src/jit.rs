@@ -95,6 +95,11 @@ pub struct Stats {
     /// Blocks loaded from a persistent code cache.
     pub restored: u64,
     pub resets: u64,
+    /// Lookups that missed the cache and had to decode, and blocks those decodes then
+    /// refused to translate (their first instruction ends on the interpreter): how much
+    /// time goes to re-deciding a pc that never becomes a block of its own.
+    pub misses: u64,
+    pub refused: u64,
     /// Exits by code (see `translate::exit`), and NEXT exits whose target was already
     /// translated (a missed chain or jump-cache slot rather than new code).
     pub exits: [u64; 7],
@@ -110,13 +115,15 @@ impl Stats {
         top.sort_by(|a, b| b.1.cmp(a.1));
         let top: Vec<String> = top.iter().take(6).map(|(k, v)| format!("{k} {v}")).collect();
         format!(
-            "jit: {} entries, {} translations, {} restored, {} resets, exits \
+            "jit: {} entries, {} translations, {} restored, {} resets, misses {}/{}, exits \
              next/ecall/interp/fence.i/fault/interrupt {:?} ({} next to known blocks), {total} \
              interpreted [{}]",
             self.entries,
             self.translations,
             self.restored,
             self.resets,
+            self.misses,
+            self.refused,
             self.exits,
             self.next_known,
             top.join(", ")
@@ -196,10 +203,16 @@ impl Jit {
 
     /// Byte offset of the translation for `pc`, translating it on first use. `Ok(None)`
     /// means its first instruction must be interpreted.
-    fn lookup(&mut self, pc: u64, mem: &GuestMemory) -> Result<Option<usize>, Trap> {
+    fn lookup(
+        &mut self,
+        pc: u64,
+        mem: &GuestMemory,
+        vstate: (u64, u64),
+    ) -> Result<Option<usize>, Trap> {
         if let Some(&at) = self.blocks.get(&pc) {
             return Ok(Some(at));
         }
+        self.stats.misses += 1;
         // Fetch through a TLB: a lookup per instruction in the mapping table showed up as
         // 11% of a short program's run time.
         let reader = self.tlb_reader.get_or_insert_with(|| mem.tlb_reader());
@@ -217,8 +230,10 @@ impl Jit {
             let stub = self.stub_word as i64;
             let slot = self.interrupt_slot;
             let identity = self.identity;
-            let Some(t) = translate::translate(&block, pc, word, stub, cache, slot, identity)
+            let Some(t) =
+                translate::translate(&block, pc, word, stub, cache, slot, identity, vstate)
             else {
+                self.stats.refused += 1;
                 return Ok(None);
             };
             match self.code.append(&t.code) {
@@ -320,7 +335,7 @@ impl Jit {
                 self.generation = generation;
                 self.identity = mem.is_identity();
             }
-            let at = match self.lookup(cpu.pc, mem) {
+            let at = match self.lookup(cpu.pc, mem, (cpu.vtype, cpu.vl)) {
                 Ok(Some(at)) => {
                     // Let generated indirect jumps find this block without us next time.
                     self.jump_cache()[translate::jump_cache_index(cpu.pc)] =
@@ -715,6 +730,140 @@ mod tests {
         ]);
         assert_eq!(cpu.x[13] as i64, -78);
         assert_eq!(f64::from_bits(cpu.x[14]), 78.0);
+    }
+
+    /// A vector load, lane-wise add, and store at `vl == vlmax`; the JIT translates the
+    /// unit-stride accesses as one 16-byte move each and the add per element width, and
+    /// the block's entry guard keeps other vector configurations on the interpreter.
+    #[test]
+    fn vector_lane_ops_match_the_interpreter() {
+        // Hand-assembled helpers for the pieces this test needs (as in the interpreter's
+        // own vector test).
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle64 = |vd: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse64 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vadd_vv =
+            |vd: u32, vs2: u32, vs1: u32| (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57;
+        let vand_vv = |vd: u32, vs2: u32, vs1: u32| {
+            (1 << 25) | (0b001001 << 26) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+
+        // The second case is a configuration the translation refuses (vl < vlmax), so the
+        // whole block goes through the interpreter; both engines must still agree.
+        let cases = [("e64 m1", 0x0d8, 2, true), ("e64 m1, vl = 1 falls back", 0x0d8, 1, false)];
+        for (name, vtype, avl, check_values) in cases {
+            let prog = [
+                vsetivli(0, avl, vtype),
+                vle64(1, 11),     // v1 = [a1]
+                vle64(2, 12),     // v2 = [a2]
+                vadd_vv(3, 1, 2), // v3 = v1 + v2
+                vand_vv(4, 3, 2), // v4 = v3 & v2 (the byte-wise form)
+                vse64(3, 13),     // [a3] = v3
+                vse64(4, 14),     // [a4] = v4
+            ];
+            let setup_data = |mem: &GuestMemory| {
+                mem.write_privileged(DATA, &0x0000_0000_0000_0001u64.to_le_bytes()).unwrap();
+                mem.write_privileged(DATA + 8, &0x0000_0000_0000_0002u64.to_le_bytes()).unwrap();
+                mem.write_privileged(DATA + 16, &0x0000_0000_0000_0010u64.to_le_bytes()).unwrap();
+                mem.write_privileged(DATA + 24, &0x0000_0000_0000_0020u64.to_le_bytes()).unwrap();
+            };
+            let init = |cpu: &mut CpuState| {
+                for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, DATA + 48)] {
+                    cpu.set_x(r, v);
+                }
+            };
+            let mem_i = setup(&prog);
+            setup_data(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            init(&mut oracle);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            setup_data(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            init(&mut cpu);
+            let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+            assert_eq!(got, want, "{name}: trap");
+            assert_eq!(cpu.x[13..15], oracle.x[13..15], "{name}: pointers");
+            assert_eq!(cpu.v, oracle.v, "{name}: vector register file");
+            assert_eq!(cpu, oracle, "{name}: state");
+            for off in [32u64, 40, 48, 56] {
+                let mut a = [0u8; 8];
+                let mut b = [0u8; 8];
+                mem_i.read_privileged(DATA + off, &mut a).unwrap();
+                mem_j.read_privileged(DATA + off, &mut b).unwrap();
+                assert_eq!(a, b, "{name}: stores differ at +{off}");
+                if check_values {
+                    // v3 = v1 + v2 = [0x11, 0x22] at a3, v4 = v3 & v2 = [0x10, 0x20] at a4.
+                    let want = match off {
+                        32 => 0x11,
+                        40 => 0x22,
+                        48 => 0x10,
+                        _ => 0x20,
+                    };
+                    assert_eq!(u64::from_le_bytes(a), want, "{name}: value at +{off}");
+                }
+            }
+        }
+    }
+
+    /// A loop whose head is a `vsetivli`: the whole body translates as one block (the
+    /// constant vset is emitted inline), and the engines must agree after every trip.
+    #[test]
+    fn vector_loop_with_vsetivli_head_matches_the_interpreter() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle64 = |vd: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse64 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vadd_vv =
+            |vd: u32, vs2: u32, vs1: u32| (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57;
+        // vsetivli zero, 2, e64, m1; v2 = v1 + v1; [a2] = v2; a3 -= 1; bne a3, x0, -20
+        let prog = [
+            vsetivli(0, 2, 0x0d8),
+            vle64(1, 11),
+            vadd_vv(2, 1, 1),
+            vse64(2, 12),
+            addi(13, 13, -1),
+            b(0b001, 13, 0, -20),
+        ];
+        let init = |cpu: &mut CpuState| {
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 16);
+            cpu.set_x(13, 3);
+        };
+        let mem_i = setup(&prog);
+        mem_i.write_privileged(DATA, &0x0000_0000_0000_0001u64.to_le_bytes()).unwrap();
+        mem_i.write_privileged(DATA + 8, &0x0000_0000_0000_0002u64.to_le_bytes()).unwrap();
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        mem_j.write_privileged(DATA, &0x0000_0000_0000_0001u64.to_le_bytes()).unwrap();
+        mem_j.write_privileged(DATA + 8, &0x0000_0000_0000_0002u64.to_le_bytes()).unwrap();
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        let mut a = [0u8; 8];
+        let mut b = [0u8; 8];
+        mem_i.read_privileged(DATA + 16, &mut a).unwrap();
+        mem_j.read_privileged(DATA + 16, &mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(u64::from_le_bytes(a), 2, "v2 = v1 + v1");
+        assert_eq!(cpu.x[13], 0, "three trips");
     }
 
     #[test]

@@ -328,6 +328,9 @@ impl Asm {
     pub fn sub_imm_lsl12(&mut self, rd: Reg, rn: Reg, imm: u32) {
         self.imm12(0xd140_0000, rd, rn, imm);
     }
+    pub fn add_imm_lsl12(&mut self, rd: Reg, rn: Reg, imm: u32) {
+        self.imm12(0x9140_0000, rd, rn, imm);
+    }
     pub fn sub_imm_w(&mut self, rd: Reg, rn: Reg, imm: u32) {
         self.imm12(0x5100_0000, rd, rn, imm);
     }
@@ -882,6 +885,68 @@ impl Asm {
     /// `rbit v.16b`: reverse the bits within each byte (Zbkb `brev8`).
     pub fn rbit16b(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x6e60_5800 | (rn as u32) << 5 | rd as u32);
+    }
+
+    // ---- 128-bit vector moves and lane-wise ALU, for the RVV JIT subset ----
+
+    /// `ldr q` / `str q`: 16-byte moves, unaligned-capable, in the immediate form
+    /// (scaled by 16) and the index form.
+    pub fn ldr_q(&mut self, rt: Reg, rn: Reg) {
+        self.emit(0x3dc0_0000 | (rn as u32) << 5 | rt as u32);
+    }
+    pub fn ldr_q_off(&mut self, rt: Reg, rn: Reg, offset: u32) -> bool {
+        if !offset.is_multiple_of(16) || offset > 65520 {
+            return false;
+        }
+        self.emit(0x3dc0_0000 | (offset / 16) << 10 | (rn as u32) << 5 | rt as u32);
+        true
+    }
+    pub fn str_q(&mut self, rt: Reg, rn: Reg) {
+        self.emit(0x3d80_0000 | (rn as u32) << 5 | rt as u32);
+    }
+    pub fn str_q_off(&mut self, rt: Reg, rn: Reg, offset: u32) -> bool {
+        if !offset.is_multiple_of(16) || offset > 65520 {
+            return false;
+        }
+        self.emit(0x3d80_0000 | (offset / 16) << 10 | (rn as u32) << 5 | rt as u32);
+        true
+    }
+    pub fn ldr_q_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x3ce0_6800 | (rm as u32) << 16 | (rn as u32) << 5 | rt as u32);
+    }
+    pub fn str_q_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x3ca0_6800 | (rm as u32) << 16 | (rn as u32) << 5 | rt as u32);
+    }
+
+    /// The size field of the lane-wise integer ops: the element size in bits.
+    const fn vec_size(size: u32) -> u32 {
+        (size / 8).ilog2() << 22
+    }
+    /// `add v.16b/8h/4s/2d ...`: lane-wise add of the elements (`size` in bits).
+    pub fn vec_add(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x4e20_8400 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    pub fn vec_sub(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x6e20_8400 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// Byte-wise `and`/`orr`/`eor` (element-size independent).
+    pub fn vec_and(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x4e20_1c00 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn vec_orr(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x4ea0_1c00 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn vec_eor(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x6e20_1c00 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `dup v, wn`: broadcast the low `bytes` bytes of `rn` (a W register for 1/2/4,
+    /// an X register for 8) to every lane.
+    pub fn vec_dup(&mut self, rd: Reg, rn: Reg, bytes: u32) {
+        self.emit(0x4e00_0c00 | bytes << 16 | (rn as u32) << 5 | rd as u32);
     }
     /// `cmn wn, #imm` (sets flags for wn + imm).
     pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
