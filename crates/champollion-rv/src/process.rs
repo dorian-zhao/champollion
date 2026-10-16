@@ -716,6 +716,12 @@ impl Process {
         let mut slots = lock(&self.slots);
         let mut pending = lock(&self.pending);
         let mut own_pending = lock(&thread.signals.pending);
+        // The signal pump can hold these while it forwards a signal (it reads `actions`
+        // for every one, and the forking thread's `waker` when interrupting a wait): a
+        // child that inherited them locked would deadlock on its first syscall.
+        let own_waker = lock(&thread.signals.waker);
+        let actions = lock(&self.actions);
+        let itimer = lock(&self.itimer);
         let mut maps = self.mem.lock_for_fork();
         // SAFETY: plain fork; the child continues on this thread only, holding the locks.
         let pid = unsafe { libc::fork() };
@@ -742,7 +748,18 @@ impl Process {
         thread.tid = new;
         // The forking thread is in a syscall, so its own TLB readers are idle too.
         maps.forget_other_threads();
-        drop((brk, threads, registry, slots, pending, own_pending, maps));
+        drop((
+            brk,
+            threads,
+            registry,
+            slots,
+            pending,
+            own_pending,
+            own_waker,
+            actions,
+            itimer,
+            maps,
+        ));
         if let (Some(f), Some(this)) = (self.on_fork.get(), self.this.upgrade()) {
             f(this);
         }
