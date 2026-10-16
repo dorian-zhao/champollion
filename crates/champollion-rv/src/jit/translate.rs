@@ -1497,10 +1497,16 @@ impl Tx {
         let (vtype, vlmax) = crate::vector::vset_compute(u64::MAX, bits);
         self.a.mov_imm(SRC0, vlmax);
         if rs1 != 0 {
-            // AVL = x0 asks for the largest available (vlmax, which SRC0 already holds).
             let avl = self.src(rs1, SRC1);
             self.a.cmp(avl, SRC0);
             self.a.csel(SRC0, avl, SRC0, Cond::Lo);
+        } else if rd == 0 {
+            // The AVL table's keep form: (rd, rs1) = (x0, x0) leaves vl as it is,
+            // clipped by the new vlmax. rs1 = x0 with a real rd asks for VLMAX, which
+            // SRC0 already holds.
+            self.a.ldr_off(SRC1, CTX, VL_OFF);
+            self.a.cmp(SRC1, SRC0);
+            self.a.csel(SRC0, SRC1, SRC0, Cond::Lo);
         }
         let d = self.dst(rd);
         if d != SRC0 {

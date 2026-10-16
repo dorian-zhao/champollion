@@ -258,7 +258,18 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             // vtype in the instruction, the register form reads it from `rs2`.
             let avl = match kind {
                 VSetKind::ImmediateAvl => u64::from(rs1),
-                VSetKind::RegisterAvl | VSetKind::RegisterVtype if rs1 == 0 => u64::MAX,
+                // The spec's AVL table: rs1 = x0 asks for VLMAX only when rd is a real
+                // register; with rd = x0 too ("vsetvli zero, zero, ...", a common way
+                // to change only the vtype) the current vl is kept. zlib's inflateBack
+                // leans on the keep form: the last loop iteration shrinks vl, and the
+                // scatter that follows must not run past the elements it built.
+                VSetKind::RegisterAvl | VSetKind::RegisterVtype if rs1 == 0 => {
+                    if rd == 0 {
+                        cpu.vl
+                    } else {
+                        u64::MAX
+                    }
+                }
                 VSetKind::RegisterAvl | VSetKind::RegisterVtype => cpu.x(rs1),
             };
             let bits = match kind {
@@ -289,6 +300,11 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                     cpu.v[0][..b.len()].copy_from_slice(&b);
                 }
                 VMemKind::Unit | VMemKind::FaultOnlyFirst | VMemKind::Stride => {
+                    // The width suffix is the element width *in memory and in the
+                    // register*: unit-stride and constant-stride operations transfer
+                    // EEW-wide elements directly (the spec encodes EEW statically so
+                    // mixed-width routines can skip `vsetvli` round trips; qemu lays
+                    // them out packed too).
                     for i in 0..cpu.vl {
                         if mask && !vector::mask_get(cpu, 0, i) {
                             continue; // masked-off elements are never accessed
@@ -1825,6 +1841,25 @@ mod tests {
 
     #[test]
     fn segmented_loads_and_stores_interleave_fields() {
+        // The AVL table's third row: (rd, rs1) = (x0, x0) keeps the current vl; a real
+        // rd with rs1 = x0 asks for VLMAX. zlib's inflateBack depends on the keep form
+        // (and qemu implements it) — the scattered indices must not run past what the
+        // shrunken loop built.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vsetvli = |rd: u32, rs1: u32, vtype: u32| {
+            (vtype << 20) | (rs1 << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let prog = [vsetivli(0, 2, 0xd8), vsetvli(0, 0, 0xcf), vsetvli(10, 0, 0xcf)];
+        let (mut cpu, mem) = setup(&prog);
+        step(&mut cpu, &mem).unwrap();
+        assert_eq!((cpu.vl, cpu.vtype), (2, 0xd8), "e64/m1 clips the 2-element request");
+        step(&mut cpu, &mem).unwrap();
+        assert_eq!((cpu.vl, cpu.vtype), (2, 0xcf), "x0/x0 keeps vl under the new vtype");
+        step(&mut cpu, &mem).unwrap();
+        assert_eq!((cpu.vl, cpu.x[10], cpu.vtype), (4, 4, 0xcf), "a real rd asks for VLMAX");
+
         // Two interleaved streams in and back out again.
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
