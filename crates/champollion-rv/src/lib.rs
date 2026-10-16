@@ -26,6 +26,7 @@ pub mod memory;
 pub mod process;
 pub mod signal;
 pub mod syscall;
+pub mod vector;
 
 pub use cpu::CpuState;
 pub use decoder::{Inst, decode};

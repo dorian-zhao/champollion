@@ -27,6 +27,14 @@ pub struct CpuState {
     pub reserved_value: u64,
     /// Instructions retired (the `instret` CSR; also what `cycle` reports).
     pub instret: u64,
+    /// Vector registers `v0..v31`. VLEN is 128 bits; only the low `vl` elements (of the
+    /// byte width `vtype` selects) are ever read or written.
+    pub v: [[u8; 16]; 32],
+    /// `vl`, from the last `vset*`.
+    pub vl: u64,
+    /// `vtype` as written: `vma` bit 7, `vta` bit 6, `vsew` bits 5:3, `vlmul` bits 2:0.
+    /// `vstart` is not modeled and always reads zero.
+    pub vtype: u64,
 }
 
 impl CpuState {
@@ -39,6 +47,9 @@ impl CpuState {
             reserved_addr: NO_RESERVATION,
             reserved_value: 0,
             instret: 0,
+            v: [[0; 16]; 32],
+            vl: 0,
+            vtype: 0,
         }
     }
 

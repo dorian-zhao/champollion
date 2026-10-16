@@ -33,6 +33,9 @@ rori a3, a4, 60
 rolw a5, a6, a7
 rorw s0, s1, s2
 roriw s3, s4, 25
+clzw a5, a6
+ctzw s0, s1
+cpopw s2, s3
 # Zbs
 bclr s5, s6, s7
 bext s8, s9, s10

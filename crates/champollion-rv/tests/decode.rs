@@ -7,6 +7,9 @@ use champollion_rv::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FArithOp, FCmpOp, FWidth, FmaOp, IntType,
     LoadWidth, RM_DYN, SgnjKind, StoreWidth,
 };
+use champollion_rv::decoder::{
+    VArithOp, VCmpOp, VMaskOp, VMemKind, VRedOp, VSel, VSetKind, VStoreKind, VWidth,
+};
 use champollion_rv::{Inst, decode};
 
 // Register numbers by ABI name, for readability below.
@@ -455,6 +458,9 @@ fn rv64zb() {
         ("rolw a5, a6, a7", Op32 { op: W::Rol, rd: A5, rs1: A6, rs2: A7 }),
         ("rorw s0, s1, s2", Op32 { op: W::Ror, rd: S0, rs1: S1, rs2: S2 }),
         ("roriw s3, s4, 25", OpImm32 { op: W::Ror, rd: S3, rs1: S4, imm: 25 }),
+        ("clzw a5, a6", OpImm32 { op: W::Clz, rd: A5, rs1: A6, imm: 0 }),
+        ("ctzw s0, s1", OpImm32 { op: W::Ctz, rd: S0, rs1: S1, imm: 0 }),
+        ("cpopw s2, s3", OpImm32 { op: W::Cpop, rd: S2, rs1: S3, imm: 0 }),
         // Zbs
         ("bclr s5, s6, s7", Op { op: A::Bclr, rd: S5, rs1: S6, rs2: S7 }),
         ("bext s8, s9, s10", Op { op: A::Bext, rd: S8, rs1: S9, rs2: S10 }),
@@ -483,6 +489,219 @@ fn rv64zb() {
     check(
         include_str!("../../../tests/fixtures/rv64zb.s"),
         include_bytes!("../../../tests/fixtures/rv64zb.bin"),
+        &expected,
+    );
+}
+
+#[test]
+fn rv64v() {
+    use Inst::*;
+    use VCmpOp as C;
+    use VMemKind as M;
+    use VSel::*;
+    use VSetKind as K;
+    use VStoreKind as SM;
+    use VWidth::*;
+    let expected = [
+        (
+            "vsetvli a0, a1, e8, m1, ta, ma",
+            VSetvl { rd: A0, rs1: A1, rs2: 0x0c0, kind: K::RegisterAvl },
+        ),
+        (
+            "vsetvli a0, a1, e32, mf2, ta, ma",
+            VSetvl { rd: A0, rs1: A1, rs2: 0x0d7, kind: K::RegisterAvl },
+        ),
+        (
+            "vsetvli a0, a1, e64, m1, ta, ma",
+            VSetvl { rd: A0, rs1: A1, rs2: 0x0d8, kind: K::RegisterAvl },
+        ),
+        (
+            "vsetivli a0, 16, e8, m1, tu, mu",
+            VSetvl { rd: A0, rs1: 16, rs2: 0x000, kind: K::ImmediateAvl },
+        ),
+        (
+            "vsetivli a0, 2, e8, mf8, ta, ma",
+            VSetvl { rd: A0, rs1: 2, rs2: 0x0c5, kind: K::ImmediateAvl },
+        ),
+        ("vsetvli a0, a1, e8, m1", VSetvl { rd: A0, rs1: A1, rs2: 0x000, kind: K::RegisterAvl }),
+        ("vsetvl a0, a1, a2", VSetvl { rd: A0, rs1: A1, rs2: 12, kind: K::RegisterVtype }),
+        (
+            "vle8.v v1, (a0)",
+            VLoad { width: E8, kind: M::Unit, vd: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vle8ff.v v1, (a0)",
+            VLoad {
+                width: E8,
+                kind: M::FaultOnlyFirst,
+                vd: 1,
+                rs1: A0,
+                rs2: 0,
+                mask: false,
+                nf: 0,
+            },
+        ),
+        (
+            "vle16.v v1, (a0)",
+            VLoad { width: E16, kind: M::Unit, vd: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vle32.v v1, (a0)",
+            VLoad { width: E32, kind: M::Unit, vd: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vle64.v v1, (a0)",
+            VLoad { width: E64, kind: M::Unit, vd: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vse8.v v1, (a0)",
+            VStore { width: E8, kind: SM::Unit, vs3: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vse16.v v1, (a0)",
+            VStore { width: E16, kind: SM::Unit, vs3: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vse32.v v1, (a0)",
+            VStore { width: E32, kind: SM::Unit, vs3: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vse64.v v1, (a0)",
+            VStore { width: E64, kind: SM::Unit, vs3: 1, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vle8.v v1, (a0), v0.t",
+            VLoad { width: E8, kind: M::Unit, vd: 1, rs1: A0, rs2: 0, mask: true, nf: 0 },
+        ),
+        (
+            "vlse64.v v1, (a0), a1",
+            VLoad { width: E64, kind: M::Stride, vd: 1, rs1: A0, rs2: A1, mask: false, nf: 0 },
+        ),
+        (
+            "vlm.v v0, (a0)",
+            VLoad { width: E8, kind: M::Mask, vd: 0, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vl1re64.v v2, (a0)",
+            VLoad {
+                width: E64,
+                kind: M::WholeRegister,
+                vd: 2,
+                rs1: A0,
+                rs2: 0,
+                mask: false,
+                nf: 0,
+            },
+        ),
+        (
+            "vl1r.v v2, (a0)",
+            VLoad { width: E8, kind: M::WholeRegister, vd: 2, rs1: A0, rs2: 0, mask: false, nf: 0 },
+        ),
+        (
+            "vl2r.v v2, (a0)",
+            VLoad { width: E8, kind: M::WholeRegister, vd: 2, rs1: A0, rs2: 0, mask: false, nf: 1 },
+        ),
+        (
+            "vs1r.v v2, (a0)",
+            VStore {
+                width: E8,
+                kind: SM::WholeRegister,
+                vs3: 2,
+                rs1: A0,
+                rs2: 0,
+                mask: false,
+                nf: 0,
+            },
+        ),
+        (
+            "vs2r.v v2, (a0)",
+            VStore {
+                width: E8,
+                kind: SM::WholeRegister,
+                vs3: 2,
+                rs1: A0,
+                rs2: 0,
+                mask: false,
+                nf: 1,
+            },
+        ),
+        ("vsext.vf8 v8, v10", VExt { sext: true, narrow: 8, vd: 8, vs2: 10 }),
+        ("vzext.vf4 v8, v10", VExt { sext: false, narrow: 4, vd: 8, vs2: 10 }),
+        ("vmv.v.i v1, 5", Vmv { vd: 1, src: I(5) }),
+        ("vmv.v.x v1, a0", Vmv { vd: 1, src: X(10) }),
+        ("vmv.s.x v1, a0", VmvSx { vd: 1, rs1: 10 }),
+        ("vmv.x.s a0, v1", VmvXs { rd: 10, vs2: 1 }),
+        ("vmv1r.v v2, v3", VmvNr { vd: 2, vs2: 3 }),
+        ("vid.v v1", Vid { vd: 1 }),
+        ("vmseq.vi v1, v2, 3", VCmp { op: C::Eq, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vmseq.vx v1, v2, a0", VCmp { op: C::Eq, vd: 1, vs2: 2, src: X(10), mask: false }),
+        ("vmsne.vv v1, v2, v3", VCmp { op: C::Ne, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vmsne.vi v1, v2, 3", VCmp { op: C::Ne, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vmsleu.vi v1, v2, 3", VCmp { op: C::LeU, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vmsgtu.vi v1, v2, 3", VCmp { op: C::GtU, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vmor.mm v1, v2, v3", VMask { op: VMaskOp::Or, vd: 1, vs1: 3, vs2: 2 }),
+        ("vfirst.m a0, v1", Vfirst { rd: 10, vs2: 1 }),
+        ("vcpop.m a0, v1", Vcpop { rd: 10, vs2: 1 }),
+        ("vadd.vv v1, v2, v3", VArith { op: VArithOp::Add, vd: 1, vs2: 2, src: V(3), mask: false }),
+        (
+            "vadd.vx v1, v2, a0",
+            VArith { op: VArithOp::Add, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
+        ("vadd.vi v1, v2, 3", VArith { op: VArithOp::Add, vd: 1, vs2: 2, src: I(3), mask: false }),
+        (
+            "vadd.vv v1, v2, v3, v0.t",
+            VArith { op: VArithOp::Add, vd: 1, vs2: 2, src: V(3), mask: true },
+        ),
+        ("vmacc.vv v1, v2, v3", VMacc { add: true, vd: 1, vs2: 3, src: V(2) }),
+        ("vmacc.vx v1, a0, v3", VMacc { add: true, vd: 1, vs2: 3, src: X(10) }),
+        ("vmadd.vv v1, v2, v3", VMacc { add: false, vd: 1, vs2: 3, src: V(2) }),
+        ("vmadd.vx v1, a0, v3", VMacc { add: false, vd: 1, vs2: 3, src: X(10) }),
+        ("vxor.vv v1, v2, v3", VArith { op: VArithOp::Xor, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vxor.vi v1, v2, 3", VArith { op: VArithOp::Xor, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vor.vv v1, v2, v3", VArith { op: VArithOp::Or, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vand.vv v1, v2, v3", VArith { op: VArithOp::And, vd: 1, vs2: 2, src: V(3), mask: false }),
+        ("vand.vi v1, v2, 3", VArith { op: VArithOp::And, vd: 1, vs2: 2, src: I(3), mask: false }),
+        (
+            "vandn.vv v1, v2, v3",
+            VArith { op: VArithOp::Andn, vd: 1, vs2: 2, src: V(3), mask: false },
+        ),
+        (
+            "vmul.vx v1, v2, a0",
+            VArith { op: VArithOp::Mul, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
+        (
+            "vrsub.vi v1, v2, 3",
+            VArith { op: VArithOp::Rsub, vd: 1, vs2: 2, src: I(3), mask: false },
+        ),
+        ("vsll.vi v1, v2, 3", VArith { op: VArithOp::Sll, vd: 1, vs2: 2, src: I(3), mask: false }),
+        ("vnsrl.wi v1, v2, 3", Vnsrl { vd: 1, vs2: 2, imm: 3 }),
+        (
+            "vslidedown.vi v1, v2, 3",
+            VArith { op: VArithOp::SlideDown, vd: 1, vs2: 2, src: I(3), mask: false },
+        ),
+        (
+            "vslideup.vi v1, v2, 3",
+            VArith { op: VArithOp::SlideUp, vd: 1, vs2: 2, src: I(3), mask: false },
+        ),
+        (
+            "vslide1down.vx v1, v2, a0",
+            VArith { op: VArithOp::Slide1Down, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
+        (
+            "vrgather.vi v1, v2, 3",
+            VArith { op: VArithOp::Gather, vd: 1, vs2: 2, src: I(3), mask: false },
+        ),
+        (
+            "vrgather.vv v1, v2, v3",
+            VArith { op: VArithOp::Gather, vd: 1, vs2: 2, src: V(3), mask: false },
+        ),
+        ("vmerge.vvm v1, v2, v3, v0", Vmerge { vd: 1, vs1: 3, vs2: 2 }),
+        ("vredor.vs v1, v2, v3", VRed { op: VRedOp::Or, vd: 1, vs1: 3, vs2: 2 }),
+        ("vredand.vs v1, v2, v3", VRed { op: VRedOp::And, vd: 1, vs1: 3, vs2: 2 }),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/rv64v.s"),
+        include_bytes!("../../../tests/fixtures/rv64v.bin"),
         &expected,
     );
 }

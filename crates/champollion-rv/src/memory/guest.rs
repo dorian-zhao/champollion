@@ -1213,4 +1213,21 @@ mod tests {
         m.map(0x40000, hp, Prot::RW).unwrap();
         m.unmap(0x40000, hp).unwrap();
     }
+
+    /// The sequence an ELF loader uses: map a large R-X region for a library, then cover
+    /// its tail with MAP_FIXED read-write parts. Everything before the fixed maps must
+    /// keep its permissions.
+    #[test]
+    fn fixed_maps_do_not_clobber_the_rest_of_a_mapping() {
+        let m = GuestMemory::new().unwrap();
+        let base = 0x3fbfc81000;
+        let span = 0x189000;
+        m.map(base, span, Prot::READ | Prot::EXEC).unwrap();
+        m.map(base + 0x178000, 0x5000, Prot::READ | Prot::WRITE).unwrap();
+        m.map(base + 0x17d000, 0xc000, Prot::READ | Prot::WRITE).unwrap();
+        let text = base + 0x8961e;
+        assert_eq!(m.page_prot(text), Some(Prot::READ | Prot::EXEC), "library text");
+        let mut b = [0u8; 4];
+        m.fetch(text, &mut b).unwrap();
+    }
 }

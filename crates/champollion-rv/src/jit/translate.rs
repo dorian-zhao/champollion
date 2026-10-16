@@ -837,6 +837,7 @@ impl Tx {
                 | AluOp::Cpop
                 | AluOp::SextB
                 | AluOp::SextH
+                | AluOp::ZextH
                 | AluOp::Rev8
                 | AluOp::OrcB
                 | AluOp::Ror
@@ -894,6 +895,7 @@ impl Tx {
             | AluOp::Cpop
             | AluOp::SextB
             | AluOp::SextH
+            | AluOp::ZextH
             | AluOp::Rev8
             | AluOp::OrcB
             | AluOp::Ror
@@ -912,6 +914,9 @@ impl Tx {
             return true;
         }
         if rs1 == 0 {
+            if matches!(op, AluOp32::Clz | AluOp32::Ctz | AluOp32::Cpop) {
+                return false; // clzw(0) = 32, not a foldable zero
+            }
             let r = if op == AluOp32::Add { sext(imm) } else { 0 };
             self.constant(rd, r);
             return true;
@@ -924,7 +929,8 @@ impl Tx {
             AluOp32::Sll => self.a.lsl_imm_w(d, a, imm as u32),
             AluOp32::Srl => self.a.lsr_imm_w(d, a, imm as u32),
             AluOp32::Sra => self.a.asr_imm_w(d, a, imm as u32),
-            AluOp32::Ror => return false, // Zbb roriw: interpreted only for now
+            // Zbb word rotates and counts are interpreted only for now.
+            AluOp32::Ror | AluOp32::Clz | AluOp32::Ctz | AluOp32::Cpop => return false,
             _ => unreachable!("no immediate form of {op:?}"),
         }
         self.a.sxtw(d, d);
@@ -1056,8 +1062,10 @@ impl Tx {
                 }
                 self.a.msub_w(d, ADDR, b, a);
             }
-            // Zbb word rotations are interpreted only for now.
-            AluOp32::Rol | AluOp32::Ror => return false,
+            // Zbb word rotations and counts are interpreted only for now.
+            AluOp32::Rol | AluOp32::Ror | AluOp32::Clz | AluOp32::Ctz | AluOp32::Cpop => {
+                return false;
+            }
         }
         self.a.sxtw(d, d);
         self.commit(rd, d);

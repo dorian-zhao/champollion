@@ -23,39 +23,407 @@
 ///   `x` source of `FMvFromInt`/`FCvtFromInt`. `rm` is the raw rounding-mode field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inst {
-    Lui { rd: u8, imm: i32 },
-    Auipc { rd: u8, imm: i32 },
-    Jal { rd: u8, offset: i32 },
-    Jalr { rd: u8, rs1: u8, offset: i32 },
-    Branch { cond: BranchCond, rs1: u8, rs2: u8, offset: i32 },
-    Load { width: LoadWidth, rd: u8, rs1: u8, offset: i32 },
-    Store { width: StoreWidth, rs1: u8, rs2: u8, offset: i32 },
-    OpImm { op: AluOp, rd: u8, rs1: u8, imm: i32 },
-    Op { op: AluOp, rd: u8, rs1: u8, rs2: u8 },
-    OpImm32 { op: AluOp32, rd: u8, rs1: u8, imm: i32 },
-    Op32 { op: AluOp32, rd: u8, rs1: u8, rs2: u8 },
-    Fence { fm: u8, pred: u8, succ: u8 },
+    Lui {
+        rd: u8,
+        imm: i32,
+    },
+    Auipc {
+        rd: u8,
+        imm: i32,
+    },
+    Jal {
+        rd: u8,
+        offset: i32,
+    },
+    Jalr {
+        rd: u8,
+        rs1: u8,
+        offset: i32,
+    },
+    Branch {
+        cond: BranchCond,
+        rs1: u8,
+        rs2: u8,
+        offset: i32,
+    },
+    Load {
+        width: LoadWidth,
+        rd: u8,
+        rs1: u8,
+        offset: i32,
+    },
+    Store {
+        width: StoreWidth,
+        rs1: u8,
+        rs2: u8,
+        offset: i32,
+    },
+    OpImm {
+        op: AluOp,
+        rd: u8,
+        rs1: u8,
+        imm: i32,
+    },
+    Op {
+        op: AluOp,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    OpImm32 {
+        op: AluOp32,
+        rd: u8,
+        rs1: u8,
+        imm: i32,
+    },
+    Op32 {
+        op: AluOp32,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    Fence {
+        fm: u8,
+        pred: u8,
+        succ: u8,
+    },
     FenceI,
-    Csr { op: CsrOp, csr: Csr, rd: u8, src: u8, imm: bool },
+    Csr {
+        op: CsrOp,
+        csr: Csr,
+        rd: u8,
+        src: u8,
+        imm: bool,
+    },
     Ecall,
     Ebreak,
-    Lr { width: AmoWidth, rd: u8, rs1: u8, aq: bool, rl: bool },
-    Sc { width: AmoWidth, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
-    Amo { op: AmoOp, width: AmoWidth, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
-    FLoad { width: FWidth, rd: u8, rs1: u8, offset: i32 },
-    FStore { width: FWidth, rs1: u8, rs2: u8, offset: i32 },
-    FMvToInt { width: FWidth, rd: u8, rs1: u8 },
-    FMvFromInt { width: FWidth, rd: u8, rs1: u8 },
-    FSgnj { kind: SgnjKind, width: FWidth, rd: u8, rs1: u8, rs2: u8 },
-    FArith { op: FArithOp, width: FWidth, rd: u8, rs1: u8, rs2: u8, rm: u8 },
-    FSqrt { width: FWidth, rd: u8, rs1: u8, rm: u8 },
-    FFma { op: FmaOp, width: FWidth, rd: u8, rs1: u8, rs2: u8, rs3: u8, rm: u8 },
-    FMinMax { max: bool, width: FWidth, rd: u8, rs1: u8, rs2: u8 },
-    FCmp { op: FCmpOp, width: FWidth, rd: u8, rs1: u8, rs2: u8 },
-    FClass { width: FWidth, rd: u8, rs1: u8 },
-    FCvtToInt { from: FWidth, to: IntType, rd: u8, rs1: u8, rm: u8 },
-    FCvtFromInt { from: IntType, to: FWidth, rd: u8, rs1: u8, rm: u8 },
-    FCvtFloat { to: FWidth, rd: u8, rs1: u8, rm: u8 },
+    Lr {
+        width: AmoWidth,
+        rd: u8,
+        rs1: u8,
+        aq: bool,
+        rl: bool,
+    },
+    Sc {
+        width: AmoWidth,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        aq: bool,
+        rl: bool,
+    },
+    Amo {
+        op: AmoOp,
+        width: AmoWidth,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        aq: bool,
+        rl: bool,
+    },
+    FLoad {
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        offset: i32,
+    },
+    FStore {
+        width: FWidth,
+        rs1: u8,
+        rs2: u8,
+        offset: i32,
+    },
+    FMvToInt {
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+    },
+    FMvFromInt {
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+    },
+    FSgnj {
+        kind: SgnjKind,
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    FArith {
+        op: FArithOp,
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        rm: u8,
+    },
+    FSqrt {
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        rm: u8,
+    },
+    FFma {
+        op: FmaOp,
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+        rs3: u8,
+        rm: u8,
+    },
+    FMinMax {
+        max: bool,
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    FCmp {
+        op: FCmpOp,
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+        rs2: u8,
+    },
+    FClass {
+        width: FWidth,
+        rd: u8,
+        rs1: u8,
+    },
+    FCvtToInt {
+        from: FWidth,
+        to: IntType,
+        rd: u8,
+        rs1: u8,
+        rm: u8,
+    },
+    FCvtFromInt {
+        from: IntType,
+        to: FWidth,
+        rd: u8,
+        rs1: u8,
+        rm: u8,
+    },
+    FCvtFloat {
+        to: FWidth,
+        rd: u8,
+        rs1: u8,
+        rm: u8,
+    },
+    /// `vsetvli`/`vsetivli`/`vsetvl`: sets `vl` and `vtype`. `rs2` carries the 10-bit
+    /// vtype value for the immediate forms and the vtype register number for `vsetvl`;
+    /// the avl is `x[rs1]` except for `vsetivli`, where `rs1` is the 5-bit immediate.
+    VSetvl {
+        rd: u8,
+        rs1: u8,
+        rs2: u16,
+        kind: VSetKind,
+    },
+    VLoad {
+        width: VWidth,
+        kind: VMemKind,
+        vd: u8,
+        rs1: u8,
+        rs2: u8,
+        mask: bool,
+        /// Number of registers for whole-register ops (`vl1r` = 0, `vl2r` = 1 extra);
+        /// zero for every other kind.
+        nf: u8,
+    },
+    VStore {
+        width: VWidth,
+        kind: VStoreKind,
+        vs3: u8,
+        rs1: u8,
+        rs2: u8,
+        mask: bool,
+        nf: u8,
+    },
+    VArith {
+        op: VArithOp,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+        mask: bool,
+    },
+    VCmp {
+        op: VCmpOp,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+        mask: bool,
+    },
+    VMask {
+        op: VMaskOp,
+        vd: u8,
+        vs1: u8,
+        vs2: u8,
+    },
+    Vmv {
+        vd: u8,
+        src: VSel,
+    },
+    VmvNr {
+        vd: u8,
+        vs2: u8,
+    },
+    Vmerge {
+        vd: u8,
+        vs1: u8,
+        vs2: u8,
+    },
+    VRed {
+        op: VRedOp,
+        vd: u8,
+        vs1: u8,
+        vs2: u8,
+    },
+    VmvXs {
+        rd: u8,
+        vs2: u8,
+    },
+    VmvSx {
+        vd: u8,
+        rs1: u8,
+    },
+    Vcpop {
+        rd: u8,
+        vs2: u8,
+    },
+    Vfirst {
+        rd: u8,
+        vs2: u8,
+    },
+    Vid {
+        vd: u8,
+    },
+    /// Vector sign/zero-extend (`vsext.vfN`/`vzext.vfN`, `narrow` = the source is SEW/2,
+    /// /4, or /8 wide).
+    VExt {
+        sext: bool,
+        narrow: u8,
+        vd: u8,
+        vs2: u8,
+    },
+    /// Vector multiply-accumulate (`vmacc` = vd += src × vs2) and multiply-add
+    /// (`vmadd` = vd = src × vd + vs2).
+    VMacc {
+        add: bool,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+    },
+    Vnsrl {
+        vd: u8,
+        vs2: u8,
+        imm: u8,
+    },
+}
+
+/// Vector element width (`vsew`) for the loads, stores, and arithmetic ops in the subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VWidth {
+    E8,
+    E16,
+    E32,
+    E64,
+}
+
+impl VWidth {
+    /// Element size in bytes.
+    #[inline]
+    pub fn bytes(self) -> u64 {
+        match self {
+            VWidth::E8 => 1,
+            VWidth::E16 => 2,
+            VWidth::E32 => 4,
+            VWidth::E64 => 8,
+        }
+    }
+}
+
+/// The three `vset*` forms, which differ in where the avl and vtype come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VSetKind {
+    /// `vsetvli rd, rs1, vtype`: avl in `x[rs1]` (`x0` means "the largest available").
+    RegisterAvl,
+    /// `vsetivli rd, avl, vtype`: the avl is the 5-bit immediate.
+    ImmediateAvl,
+    /// `vsetvl rd, rs1, rs2`: avl in `x[rs1]`, vtype in `x[rs2]`.
+    RegisterVtype,
+}
+
+/// Vector memory access kind (`mop`/`lumop`/`sumop` fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VMemKind {
+    /// Unit-stride `vle<n>.v`.
+    Unit,
+    /// `vle<n>ff.v`: stops at the first fault with a shortened `vl`.
+    FaultOnlyFirst,
+    /// Strided `vlse<n>.v`, element i at `rs1 + i * rs2`.
+    Stride,
+    /// Whole-register `vl1re<n>.v`: VLEN bits, no `vl` involved.
+    WholeRegister,
+    /// `vlm.v`: one mask register, no `vl` involved.
+    Mask,
+}
+
+/// Vector store kind (unit-stride, strided, or whole-register).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VStoreKind {
+    Unit,
+    Stride,
+    WholeRegister,
+}
+
+/// The vector integer arithmetic in the supported subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VArithOp {
+    Add,
+    /// `vrsub`: vs2 is subtracted from the operand's source.
+    Rsub,
+    And,
+    Or,
+    Xor,
+    Andn,
+    Sll,
+    Mul,
+    SlideUp,
+    SlideDown,
+    Slide1Down,
+    Gather,
+}
+
+/// Second source of a vector op: another vector, a scalar register, or an immediate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VSel {
+    V(u8),
+    X(u8),
+    I(u8),
+}
+
+/// Mask-producing comparisons (`vmseq`/`vmsne`/`vmsleu`/`vmsgtu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VCmpOp {
+    Eq,
+    Ne,
+    LeU,
+    GtU,
+}
+
+/// Mask register logic (`vmor.mm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VMaskOp {
+    Or,
+}
+
+/// Mask-form reductions (`vredand.vs`, `vredor.vs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VRedOp {
+    And,
+    Or,
 }
 
 /// `rm` value meaning "use `frm`". Instructions store `rm` raw (0–4 or 7); reserved values
@@ -216,6 +584,10 @@ pub enum AluOp32 {
     // Zbb word rotations.
     Rol,
     Ror,
+    // Zbb word counts (`clzw`/`ctzw`/`cpopw`).
+    Clz,
+    Ctz,
+    Cpop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +626,12 @@ pub enum Csr {
     Cycle,
     Time,
     Instret,
+    /// `vl`: the active element count (read-only to the guest for our subset).
+    Vl,
+    /// `vtype`: the last `vset*`'s raw configuration (read-only here).
+    Vtype,
+    /// `vlenb`: VLEN in bytes, a constant 16.
+    Vlenb,
 }
 
 impl Csr {
@@ -265,17 +643,21 @@ impl Csr {
             0xc00 => Csr::Cycle,
             0xc01 => Csr::Time,
             0xc02 => Csr::Instret,
+            0xc20 => Csr::Vl,
+            0xc21 => Csr::Vtype,
+            0xc22 => Csr::Vlenb,
             _ => return None,
         })
     }
 
     /// CSR numbers with bits 11:10 = 0b11 are read-only.
     fn read_only(self) -> bool {
-        matches!(self, Csr::Cycle | Csr::Time | Csr::Instret)
+        matches!(self, Csr::Cycle | Csr::Time | Csr::Instret | Csr::Vl | Csr::Vtype | Csr::Vlenb)
     }
 }
 
 mod compressed;
+mod vector;
 
 pub use compressed::decode_compressed;
 
@@ -289,6 +671,7 @@ pub enum DecodeError {
 const LOAD: u32 = 0b000_0011;
 const LOAD_FP: u32 = 0b000_0111;
 const STORE_FP: u32 = 0b010_0111;
+const OP_V: u32 = 0b101_0111;
 const OP_FP: u32 = 0b101_0011;
 const MADD: u32 = 0b100_0011;
 const MSUB: u32 = 0b100_0111;
@@ -513,6 +896,16 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 }
                 // Zbb roriw.
                 (0b101, 0b011_0000) => Inst::OpImm32 { op: AluOp32::Ror, rd, rs1, imm: rs2 as i32 },
+                // Zbb clzw/ctzw/cpopw share funct6 011000; the rs2 field selects one.
+                (0b001, 0b011_0000) if rs2 == 0b00000 => {
+                    Inst::OpImm32 { op: AluOp32::Clz, rd, rs1, imm: 0 }
+                }
+                (0b001, 0b011_0000) if rs2 == 0b00001 => {
+                    Inst::OpImm32 { op: AluOp32::Ctz, rd, rs1, imm: 0 }
+                }
+                (0b001, 0b011_0000) if rs2 == 0b00010 => {
+                    Inst::OpImm32 { op: AluOp32::Cpop, rd, rs1, imm: 0 }
+                }
                 _ => return illegal,
             }
         }
@@ -549,6 +942,9 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
             pred: ((w >> 24) & 0xf) as u8,
             succ: ((w >> 20) & 0xf) as u8,
         },
+        // Vector loads and stores share the FP load/store opcodes; funct3 picks between
+        // them (FP uses 010/011, vector widths use 000 and 101..111).
+        LOAD_FP | STORE_FP if matches!(f3, 0b000 | 0b101 | 0b110 | 0b111) => vector::decode_mem(w)?,
         LOAD_FP | STORE_FP => {
             let width = match f3 {
                 0b010 => FWidth::S,
@@ -561,6 +957,8 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 Inst::FStore { width, rs1, rs2, offset: imm_s(w) }
             }
         }
+        OP_V if f3 == 0b111 => vector::decode_vset(w)?,
+        OP_V => vector::decode_op(w)?,
         MADD | MSUB | NMSUB | NMADD => {
             // R4 format: rs3 in bits 31:27, fmt in bits 26:25, rm in funct3.
             let width = match f7 & 0b11 {

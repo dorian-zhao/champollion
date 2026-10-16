@@ -3,10 +3,11 @@
 use crate::cpu::CpuState;
 use crate::decoder::{
     self, AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, DecodeError, FWidth, Inst,
-    LoadWidth, SgnjKind, StoreWidth,
+    LoadWidth, SgnjKind, StoreWidth, VMaskOp, VMemKind, VSel, VSetKind, VStoreKind,
 };
 use crate::fpu;
 use crate::memory::{MemFault, Memory};
+use crate::vector;
 
 /// Why execution stopped. On every trap, `cpu.pc` still points at the trapping instruction
 /// and no architectural state has been modified, like `sepc` on real hardware.
@@ -230,6 +231,156 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                 FWidth::D => sign_inject(kind, cpu.f[rs1 as usize], cpu.f[rs2 as usize], 63),
             };
         }
+        Inst::VSetvl { rd, rs1, rs2, kind } => {
+            // AVL: x0 means "largest available" for the register forms; `vsetivli`
+            // carries it as a 5-bit immediate instead. The immediate forms carry the
+            // vtype in the instruction, the register form reads it from `rs2`.
+            let avl = match kind {
+                VSetKind::ImmediateAvl => u64::from(rs1),
+                VSetKind::RegisterAvl | VSetKind::RegisterVtype if rs1 == 0 => u64::MAX,
+                VSetKind::RegisterAvl | VSetKind::RegisterVtype => cpu.x(rs1),
+            };
+            let bits = match kind {
+                VSetKind::RegisterVtype => cpu.x(rs2 as u8) & 0x3ff,
+                _ => u64::from(rs2),
+            };
+            let vl = vector::vset(cpu, avl, bits);
+            cpu.set_x(rd, vl);
+        }
+        Inst::VLoad { width, kind, vd, rs1, rs2, mask, nf } => {
+            let base = cpu.x(rs1);
+            let sew_b = width.bytes();
+            match kind {
+                VMemKind::WholeRegister => {
+                    // Whole-register ops move `1 + nf` registers (vl1r..vl3r).
+                    let n = 1 + nf as usize;
+                    let mut b = vec![0u8; n * vector::VLEN_BYTES as usize];
+                    mem.read(base, &mut b).map_err(|fault| Trap::LoadFault { pc, fault })?;
+                    for (k, chunk) in b.as_chunks::<16>().0.iter().enumerate() {
+                        cpu.v[(vd as usize + k) % 32] = *chunk;
+                    }
+                }
+                VMemKind::Mask => {
+                    // The mask register is VLEN/8 bits, loaded little-endian.
+                    let mut b = [0u8; (vector::VLEN_BYTES / 8) as usize];
+                    mem.read(base, &mut b).map_err(|fault| Trap::LoadFault { pc, fault })?;
+                    cpu.v[0] = [0; 16];
+                    cpu.v[0][..b.len()].copy_from_slice(&b);
+                }
+                VMemKind::Unit | VMemKind::FaultOnlyFirst | VMemKind::Stride => {
+                    for i in 0..cpu.vl {
+                        if mask && !vector::mask_get(cpu, 0, i) {
+                            continue; // masked-off elements are never accessed
+                        }
+                        let addr = if kind == VMemKind::Stride {
+                            base.wrapping_add(cpu.x(rs2).wrapping_mul(i))
+                        } else {
+                            base.wrapping_add(i.wrapping_mul(sew_b))
+                        };
+                        let mut b = [0u8; 8];
+                        match mem.read(addr, &mut b[..sew_b as usize]) {
+                            Ok(()) => {
+                                let v = u64::from_le_bytes(b);
+                                vector::set_elem(cpu, vd, i, sew_b, v);
+                            }
+                            Err(fault) => {
+                                if kind == VMemKind::FaultOnlyFirst {
+                                    // The point of the ff form: stop at the first fault
+                                    // and report the successful prefix in `vl`.
+                                    cpu.vl = i;
+                                    break;
+                                }
+                                return Err(Trap::LoadFault { pc, fault });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Inst::VStore { width, kind, vs3, rs1, rs2, mask, nf } => {
+            let base = cpu.x(rs1);
+            let sew_b = width.bytes();
+            match kind {
+                VStoreKind::WholeRegister => {
+                    let n = 1 + nf as usize;
+                    let mut b = vec![0u8; n * vector::VLEN_BYTES as usize];
+                    for k in 0..n {
+                        b[k * 16..(k + 1) * 16].copy_from_slice(&cpu.v[(vs3 as usize + k) % 32]);
+                    }
+                    mem.write(base, &b).map_err(|fault| Trap::StoreFault { pc, fault })?;
+                }
+                VStoreKind::Unit | VStoreKind::Stride => {
+                    for i in 0..cpu.vl {
+                        if mask && !vector::mask_get(cpu, 0, i) {
+                            continue;
+                        }
+                        let addr = if kind == VStoreKind::Stride {
+                            base.wrapping_add(cpu.x(rs2).wrapping_mul(i))
+                        } else {
+                            base.wrapping_add(i.wrapping_mul(sew_b))
+                        };
+                        let v = vector::get_elem(cpu, vs3, i, sew_b).to_le_bytes();
+                        mem.write(addr, &v[..sew_b as usize])
+                            .map_err(|fault| Trap::StoreFault { pc, fault })?;
+                    }
+                }
+            }
+        }
+        Inst::VArith { op, vd, vs2, src, mask } => vector::exec_arith(cpu, op, vd, vs2, src, mask),
+        Inst::VCmp { op, vd, vs2, src, mask } => vector::exec_cmp(cpu, op, vd, vs2, src, mask),
+        Inst::VMask { op: VMaskOp::Or, vd, vs1, vs2 } => vector::exec_mask_or(cpu, vd, vs1, vs2),
+        Inst::Vmv { vd, src } => vector::exec_mv(cpu, vd, src),
+        Inst::VmvNr { vd, vs2 } => vector::exec_mv_nr(cpu, vd, vs2),
+        Inst::Vmerge { vd, vs1, vs2 } => vector::exec_merge(cpu, vd, vs1, vs2),
+        Inst::VRed { op, vd, vs1, vs2 } => vector::exec_red(cpu, op, vd, vs1, vs2),
+        Inst::VmvXs { rd, vs2 } => {
+            let v = vector::elem0(cpu, vs2);
+            cpu.set_x(rd, v);
+        }
+        Inst::VmvSx { vd, rs1 } => {
+            let v = cpu.x(rs1);
+            vector::set_elem0(cpu, vd, v);
+        }
+        Inst::Vcpop { rd, vs2 } => {
+            let v = vector::cpop(cpu, vs2);
+            cpu.set_x(rd, v);
+        }
+        Inst::Vfirst { rd, vs2 } => {
+            let v = vector::vfirst(cpu, vs2);
+            cpu.set_x(rd, v);
+        }
+        Inst::Vid { vd } => vector::exec_vid(cpu, vd),
+        Inst::VExt { sext, narrow, vd, vs2 } => {
+            let sew_b = vector::sew_bytes(cpu);
+            let src_b = sew_b / u64::from(narrow);
+            for i in 0..cpu.vl {
+                let raw = vector::get_elem(cpu, vs2, i, src_b);
+                let v = if sext { vector::sign_extend(raw, src_b) } else { raw };
+                vector::set_elem(cpu, vd, i, sew_b, v);
+            }
+        }
+        Inst::VMacc { add, vd, vs2, src } => {
+            let sew_b = vector::sew_bytes(cpu);
+            let mask = if sew_b == 8 { u64::MAX } else { (1u64 << (8 * sew_b)) - 1 };
+            for i in 0..cpu.vl {
+                let s = match src {
+                    VSel::V(reg) => vector::get_elem(cpu, reg, i, sew_b),
+                    VSel::X(reg) => cpu.x(reg),
+                    VSel::I(imm) => u64::from(imm),
+                };
+                let old = vector::get_elem(cpu, vd, i, sew_b);
+                let el = vector::get_elem(cpu, vs2, i, sew_b);
+                let v = if add {
+                    // vmacc: vd += src × vs2.
+                    s.wrapping_mul(el).wrapping_add(old) & mask
+                } else {
+                    // vmadd: vd = src × vd + vs2.
+                    s.wrapping_mul(old).wrapping_add(el) & mask
+                };
+                vector::set_elem(cpu, vd, i, sew_b, v);
+            }
+        }
+        Inst::Vnsrl { vd, vs2, imm } => vector::exec_nsrl(cpu, vd, vs2, imm),
     }
     cpu.pc = next;
     cpu.instret = cpu.instret.wrapping_add(1);
@@ -254,6 +405,9 @@ fn read_csr(cpu: &CpuState, csr: Csr) -> u64 {
         // No cycle model: report retired instructions, which is monotonic and cheap.
         Csr::Cycle | Csr::Instret => cpu.instret,
         Csr::Time => host_time(),
+        Csr::Vl => cpu.vl,
+        Csr::Vtype => cpu.vtype,
+        Csr::Vlenb => vector::VLEN_BYTES,
     }
 }
 
@@ -264,6 +418,7 @@ fn write_csr(cpu: &mut CpuState, csr: Csr, v: u64) {
         Csr::Frm => (cpu.fcsr & !0xe0) | ((v & 0b111) << 5),
         Csr::Fcsr => v & 0xff,
         Csr::Cycle | Csr::Time | Csr::Instret => unreachable!("read-only, rejected by decode"),
+        Csr::Vl | Csr::Vtype | Csr::Vlenb => unreachable!("read-only, rejected by decode"),
     };
 }
 
@@ -511,6 +666,11 @@ fn alu32(op: AluOp32, a: u64, b: u64) -> u64 {
         // Zbb word rotations; the sign-extension below applies to them like the *w ops.
         AluOp32::Rol => a.rotate_left(sh),
         AluOp32::Ror => a.rotate_right(sh),
+        // Zbb word counts: both use only the low 32 bits, and the results (0..=32) are
+        // unchanged by the sign-extension below.
+        AluOp32::Clz => a.leading_zeros(),
+        AluOp32::Ctz => a.trailing_zeros(),
+        AluOp32::Cpop => a.count_ones(),
     };
     r as i32 as u64
 }
@@ -1233,6 +1393,50 @@ mod tests {
         assert_eq!(one(op_32(0b101, 0b011_0000, 10, 11, 12), 1, 1), 0xffff_ffff_8000_0000);
         assert_eq!(one(op_32(0b101, 0b011_0000, 10, 11, 12), 1, 33), 0xffff_ffff_8000_0000);
         assert_eq!(one(op_imm_32(0b101, 10, 11, 0b011_000 << 6 | 31), 1, 0), 2);
+    }
+
+    #[test]
+    fn vector_merge_picks_the_masked_source() {
+        // Hand-assembled helpers for the pieces this test needs.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle64 = |vd: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vlm = |vd: u32, rs1: u32| (1 << 25) | (0b01011 << 20) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vmerge = |vd: u32, vs2: u32, vs1: u32| {
+            (0b010111 << 26) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vse64 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        // vsetivli zero, 2, e64, m1, ta, ma
+        let prog = [
+            vsetivli(0, 2, 0x0d8),
+            vle64(1, 11),    // v1 = src A, two 8-byte elements from (a1)
+            vle64(2, 12),    // v2 = src B from (a2)
+            vlm(0, 13),      // v0 = mask byte from (a3)
+            vmerge(3, 2, 1), // vmerge.vvm v3, v2, v1, v0
+            vse64(3, 14),    // store v3 to (a4)
+        ];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        mem.write(DATA, &0xaaaa_aaaa_aaaa_aaaau64.to_le_bytes()).unwrap();
+        mem.write(DATA + 8, &0xbbbb_bbbb_bbbb_bbbbu64.to_le_bytes()).unwrap();
+        mem.write(DATA + 16, &0x1111_1111_1111_1111u64.to_le_bytes()).unwrap();
+        mem.write(DATA + 24, &0x2222_2222_2222_2222u64.to_le_bytes()).unwrap();
+        mem.write(DATA + 32, &[0b01]).unwrap(); // mask: element 0 only
+        let mut cpu = CpuState::new(BASE);
+        for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, DATA + 48)] {
+            cpu.set_x(r, v);
+        }
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        // The mask selects vs1 (v1 = src A) for element 0 and vs2 (v2) otherwise.
+        let mut out = [0u8; 16];
+        mem.read(DATA + 48, &mut out).unwrap();
+        assert_eq!(u64::from_le_bytes(out[..8].try_into().unwrap()), 0xaaaa_aaaa_aaaa_aaaa);
+        assert_eq!(u64::from_le_bytes(out[8..].try_into().unwrap()), 0x2222_2222_2222_2222);
     }
 
     #[test]
