@@ -25,6 +25,10 @@ pub struct Site {
     /// Instructions the block counted in `instret` at entry but did not retire.
     pub instret_undo: u32,
     pub store: bool,
+    /// A `vle*ff.v` load: `(base register, element bytes, destination vector register)`.
+    /// Its fault does not trap -- the caller shortens `vl` and re-runs the load one
+    /// element at a time.
+    pub ff: Option<(u8, u8, u8)>,
 }
 
 /// Recorded accesses of one JIT, by byte offset in its code buffer, plus where to resume.
@@ -35,6 +39,8 @@ pub struct Table {
     pub sites: HashMap<usize, Site>,
     /// Host address of the last fault, set by the handler.
     pub fault_addr: Cell<u64>,
+    /// The site of the last fault, set by the handler next to the address.
+    pub fault_site: Cell<Option<Site>>,
 }
 
 thread_local! {
@@ -128,6 +134,7 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
         (*mc).__ss.__lr -= site.instret_undo as u64;
         let far = (*mc).__es.__far;
         t.fault_addr.set(far);
+        t.fault_site.set(Some(site));
         regs[EXIT_CODE as usize] = if site.store { exit::FAULT_STORE } else { exit::FAULT_LOAD };
         (*mc).__ss.__pc = t.stub as u64;
     }
@@ -152,6 +159,7 @@ extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut li
         (*cpu).pc = site.guest_pc;
         mc.regs[INSTRET_REG as usize] -= site.instret_undo as u64;
         t.fault_addr.set(mc.fault_address);
+        t.fault_site.set(Some(site));
         mc.regs[EXIT_CODE as usize] = if site.store { exit::FAULT_STORE } else { exit::FAULT_LOAD };
         mc.pc = t.stub as u64;
     }

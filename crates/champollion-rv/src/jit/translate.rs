@@ -32,8 +32,9 @@ use std::mem::offset_of;
 use super::arm64::{Asm, AtomicOp, Cond, FmaKind, Fp, FpOp, FpRound, Mem, Reg, XZR};
 use crate::cpu::CpuState;
 use crate::decoder::{
-    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, FArithOp, FCmpOp, FWidth, FmaOp, Inst, IntType,
-    LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VMemKind, VSel, VSetKind, VStoreKind,
+    AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, FArithOp, FCmpOp, FWidth, FmaOp, Inst,
+    IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VMaskOp, VMemKind, VSel,
+    VSetKind, VStoreKind,
 };
 use crate::memory::{CONTROL_OFFSET, GUARD_SIZE, GUEST_SIZE};
 const _: () = assert!(CONTROL_OFFSET.is_multiple_of(4096) && CONTROL_OFFSET >> 12 < 4096);
@@ -206,6 +207,21 @@ pub fn jump_cache_index(pc: u64) -> usize {
     ((pc >> 1) as usize) & (JUMP_CACHE_ENTRIES - 1)
 }
 
+/// What a translated memory access is, for the fault table and the `vle*ff.v` path.
+#[derive(Clone, Copy)]
+enum Access {
+    Load,
+    Store,
+    /// `vle*ff.v`: a fault shortens `vl` instead of trapping. `base` is the address
+    /// register (its live value is the access's base), `eew` the element size in bytes,
+    /// and `vd` the destination vector register.
+    FaultOnlyFirst {
+        base: u8,
+        eew: u8,
+        vd: u8,
+    },
+}
+
 struct Tx {
     a: Asm,
     /// (index of the body's `b`, tail) pairs, emitted after the body.
@@ -213,7 +229,7 @@ struct Tx {
     /// Indices of the tails' branches to the shared exit stub, fixed up by `translate`.
     stub_branches: Vec<usize>,
     /// Memory accesses: (instruction index, guest pc, instructions retired before, store).
-    accesses: Vec<(usize, u64, u32, bool)>,
+    accesses: Vec<(usize, u64, u32, Access)>,
     /// Instructions of this block retired so far (while translating).
     retired: u32,
     /// Byte offset of the jump cache from the start of the code buffer.
@@ -432,7 +448,7 @@ impl Tx {
                 let operand = self.mem_operand(rs1, offset, mem.size());
                 // A load to x0 still accesses memory (and may fault).
                 let d = self.dst(rd);
-                self.accesses.push((self.a.pos(), pc, self.retired, false));
+                self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
                 match operand {
                     Some(off) => assert!(self.a.ldr_imm(mem, d, ADDR, off)),
                     None => self.a.ldr_reg(mem, d, self.base_reg(), self.index_reg()),
@@ -448,7 +464,7 @@ impl Tx {
                     StoreWidth::D => Mem::U64,
                 };
                 let operand = self.mem_operand(rs1, offset, mem.size());
-                self.accesses.push((self.a.pos(), pc, self.retired, true));
+                self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                 match operand {
                     Some(off) => assert!(self.a.str_imm(mem, v, ADDR, off)),
                     None => self.a.str_reg(mem, v, self.base_reg(), self.index_reg()),
@@ -461,7 +477,7 @@ impl Tx {
             Inst::FLoad { width, rd, rs1, offset } => {
                 let size = if width == FWidth::D { 8 } else { 4 };
                 let operand = self.mem_operand(rs1, offset, size);
-                self.accesses.push((self.a.pos(), pc, self.retired, false));
+                self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
                 match (width, FHOST_REG[rd as usize]) {
                     (FWidth::D, Some(h)) => match operand {
                         Some(off) => assert!(self.a.ldr_fp_imm(Fp::D, h, ADDR, off)),
@@ -484,7 +500,7 @@ impl Tx {
                 match FHOST_REG[rs2 as usize] {
                     Some(h) => {
                         let operand = self.mem_operand(rs1, offset, bytes);
-                        self.accesses.push((self.a.pos(), pc, self.retired, true));
+                        self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                         // A single store writes the low 32 bits, boxed or not.
                         match operand {
                             Some(off) => assert!(self.a.str_fp_imm(size, h, ADDR, off)),
@@ -494,7 +510,7 @@ impl Tx {
                     None => {
                         self.a.ldr_off(SRC1, CTX, f_offset(rs2));
                         let operand = self.mem_operand(rs1, offset, bytes);
-                        self.accesses.push((self.a.pos(), pc, self.retired, true));
+                        self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                         let mem = if width == FWidth::D { Mem::U64 } else { Mem::U32 };
                         match operand {
                             Some(off) => assert!(self.a.str_imm(mem, SRC1, ADDR, off)),
@@ -516,8 +532,34 @@ impl Tx {
             Inst::VSetvl { rd, rs1, rs2, kind: VSetKind::RegisterAvl } => {
                 self.vsetvli(rd, rs1, u64::from(rs2));
             }
+            // Reading the vector CSRs (the scanners' `csrr t, vl` in every loop).
+            Inst::Csr { op: CsrOp::Rs, csr, rd, src: 0, imm: false } => {
+                let d = self.dst(rd);
+                match csr {
+                    Csr::Vl => self.a.ldr_off(d, CTX, VL_OFF),
+                    Csr::Vtype => self.a.ldr_off(d, CTX, VTYPE_OFF),
+                    Csr::Vlenb => self.a.mov_imm(d, 16),
+                    _ => return false,
+                }
+                self.commit(rd, d);
+            }
             Inst::VArith { op, vd, vs2, src, mask } => {
                 if !self.vector_arith(op, vd, vs2, src, mask) {
+                    return false;
+                }
+            }
+            Inst::VCmp { op, vd, vs2, src, mask } => {
+                if !self.vector_cmp(op, vd, vs2, src, mask) {
+                    return false;
+                }
+            }
+            Inst::VMask { op, vd, vs1, vs2 } => {
+                if !self.vector_mask(op, vd, vs1, vs2) {
+                    return false;
+                }
+            }
+            Inst::Vfirst { rd, vs2 } => {
+                if !self.vector_first(rd, vs2) {
                     return false;
                 }
             }
@@ -583,7 +625,7 @@ impl Tx {
                 self.a.mov(SRC1, base);
                 self.a.and_imm(ADDR, base, ADDR_MASK).unwrap();
                 let d = self.dst(rd);
-                self.accesses.push((self.a.pos(), pc, self.retired, false));
+                self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
                 let mem = if width == AmoWidth::D { Mem::U64 } else { Mem::S32 };
                 self.a.ldr_reg(mem, d, self.base_reg(), self.index_reg());
                 self.a.str_off(SRC1, CTX, RESERVED_ADDR);
@@ -724,7 +766,7 @@ impl Tx {
                 };
                 let d = self.dst(rd);
                 let wide = width == AmoWidth::D;
-                self.accesses.push((self.a.pos(), pc, self.retired, true));
+                self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                 self.a.atomic(lse, wide, v, if rd == 0 { XZR } else { d }, ADDR);
                 if rd != 0 {
                     if !wide {
@@ -824,7 +866,7 @@ impl Tx {
         let v = self.src(rs2, SRC1);
         self.a.ldr_off(DST, CTX, RESERVED_VALUE);
         self.a.mov(SRC0, DST);
-        self.accesses.push((self.a.pos(), pc, self.retired, true));
+        self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
         self.a.casal(wide, SRC0, v, ADDR);
         if wide {
             self.a.cmp(SRC0, DST);
@@ -1242,14 +1284,26 @@ impl Tx {
     /// A unit-stride vector access at `vl == vlmax`: VLEN bits are one NEON register,
     /// whatever the element width, so the whole access is one 16-byte load or store
     /// (the entry guard pinned the configuration; unaligned addresses are fine).
+    /// A `vle*ff.v` load translates the same way but records itself as fault-tolerant:
+    /// its fault shortens `vl` instead of trapping (see `Jit::run_interruptible`).
     fn vector_mem(&mut self, inst: Inst, pc: u64) -> bool {
-        if self.vec.is_none() {
+        let Some((_, bytes)) = self.vec else {
             return false;
-        }
+        };
         match inst {
-            Inst::VLoad { kind: VMemKind::Unit, vd, rs1, mask: false, nf: 0, .. } => {
+            Inst::VLoad { width, kind, vd, rs1, mask: false, nf: 0, .. }
+                if matches!(kind, VMemKind::Unit | VMemKind::FaultOnlyFirst)
+                    && width.bytes() == u64::from(bytes) =>
+            {
+                // With EEW == SEW the whole active set is vlmax * eew = VLEN bits, one
+                // 16-byte move (an EEW the configuration does not cover interprets).
+                let access = if kind == VMemKind::FaultOnlyFirst {
+                    Access::FaultOnlyFirst { base: rs1, eew: bytes as u8, vd }
+                } else {
+                    Access::Load
+                };
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.accesses.push((self.a.pos(), pc, self.retired, false));
+                self.accesses.push((self.a.pos(), pc, self.retired, access));
                 match operand {
                     Some(_) => self.a.ldr_q(FA, ADDR),
                     None => self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg()),
@@ -1258,11 +1312,13 @@ impl Tx {
                 self.a.str_q(FA, ADDR);
                 true
             }
-            Inst::VStore { kind: VStoreKind::Unit, vs3, rs1, mask: false, nf: 0, .. } => {
+            Inst::VStore {
+                width, kind: VStoreKind::Unit, vs3, rs1, mask: false, nf: 0, ..
+            } if width.bytes() == u64::from(bytes) => {
                 self.v_addr(vs3);
                 self.a.ldr_q(FA, ADDR);
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.accesses.push((self.a.pos(), pc, self.retired, true));
+                self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                 match operand {
                     Some(_) => self.a.str_q(FA, ADDR),
                     None => self.a.str_q_reg(FA, self.base_reg(), self.index_reg()),
@@ -1314,6 +1370,96 @@ impl Tx {
         self.v_addr(vd);
         self.a.str_q(FA, ADDR);
         true
+    }
+
+    /// `vmseq`/`vmsne` at e8/m1 unmasked: one NEON compare, then the per-byte result is
+    /// packed into a 16-bit mask (each half through the classic byte-to-bits multiply)
+    /// and written over the low two bytes of `vd`. Bits at or above `vl` are left as
+    /// they were, exactly as the interpreter leaves them.
+    fn vector_cmp(&mut self, op: VCmpOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
+        let Some((sew, bytes)) = self.vec else { return false };
+        if mask || sew != 0 || bytes != 1 {
+            return false;
+        }
+        if !matches!(op, VCmpOp::Eq | VCmpOp::Ne) {
+            return false;
+        }
+        self.v_addr(vs2);
+        self.a.ldr_q(FA, ADDR);
+        if !self.vector_operand(src, FB, 1) {
+            return false;
+        }
+        self.a.cmeq16b(FA, FA, FB);
+        if op == VCmpOp::Ne {
+            self.a.mvn16b(FA, FA);
+        }
+        // Bytes are 0xFF/0x00; keep the low bit, then gather each half's bits into the
+        // low byte of a 64-bit product (y = (y * 0x0102040810204080) >> 56).
+        self.a.movi16b_one(FB);
+        self.a.vec_and(FA, FA, FB);
+        self.a.fmov_to_gpr(Fp::D, DST, FA);
+        self.a.ext16b(FC, FA, FA, 8);
+        self.a.fmov_to_gpr(Fp::D, ADDR, FC);
+        self.a.mov_imm(SRC1, 0x0102_0408_1020_4080);
+        self.a.mul(DST, DST, SRC1);
+        self.a.mul(ADDR, ADDR, SRC1);
+        self.a.lsr_imm(DST, DST, 56);
+        self.a.lsr_imm(ADDR, ADDR, 56);
+        self.a.lsl_imm(ADDR, ADDR, 8);
+        self.a.orr(DST, DST, ADDR);
+        self.v_addr(vd);
+        assert!(self.a.str_imm(Mem::U16, DST, ADDR, 0));
+        true
+    }
+
+    /// `vmor.mm` (and friends) at the supported widths: the bitmask lives in the low
+    /// bytes, so this is a read-modify-write of exactly the bits below `vl`, matching
+    /// the interpreter's per-bit update.
+    fn vector_mask(&mut self, op: VMaskOp, vd: u8, vs1: u8, vs2: u8) -> bool {
+        let Some((_, _)) = self.vec else { return false };
+        if op != VMaskOp::Or {
+            return false;
+        }
+        let mask = (1u64 << self.vec_vl()) - 1;
+        self.v_addr(vd);
+        self.a.ldr_off(DST, ADDR, 0);
+        self.v_addr(vs2);
+        self.a.ldr_off(SRC0, ADDR, 0);
+        self.v_addr(vs1);
+        self.a.ldr_off(SRC1, ADDR, 0);
+        self.a.orr(SRC0, SRC0, SRC1);
+        self.a.mov_imm(SRC1, mask);
+        self.a.and(SRC0, SRC0, SRC1);
+        self.a.bic(DST, DST, SRC1);
+        self.a.orr(DST, DST, SRC0);
+        self.v_addr(vd);
+        self.a.str_off(DST, ADDR, 0);
+        true
+    }
+
+    /// `vfirst.m`: the lowest set mask bit below `vl`, or -1. Two instructions' worth of
+    /// work once the mask word is in a GPR: `clz(rbit(m))`.
+    fn vector_first(&mut self, rd: u8, vs2: u8) -> bool {
+        let Some((_, _)) = self.vec else { return false };
+        let mask = (1u64 << self.vec_vl()) - 1;
+        self.v_addr(vs2);
+        self.a.ldr_off(DST, ADDR, 0);
+        self.a.mov_imm(SRC1, mask);
+        self.a.and(DST, DST, SRC1);
+        self.a.rbit(DST, DST);
+        self.a.clz(DST, DST);
+        self.a.cmp_imm(DST, 64);
+        let d = self.dst(rd);
+        self.a.mov_imm(SRC0, u64::MAX);
+        self.a.csel(d, SRC0, DST, Cond::Eq);
+        self.commit(rd, d);
+        true
+    }
+
+    /// `vl` this translation assumes (its `vlmax`): only called with `vec` set.
+    fn vec_vl(&self) -> u32 {
+        let (_, bytes) = self.vec.expect("a vector translation always pins its config");
+        16 / bytes
     }
 
     /// `vsetivli`: its AVL and vtype are constants, so the resulting state is known at
@@ -1797,8 +1943,13 @@ pub fn translate(
     let sites = tx
         .accesses
         .iter()
-        .map(|&(index, guest_pc, before, store)| {
-            (index, super::fault::Site { guest_pc, instret_undo: retired - before, store })
+        .map(|&(index, guest_pc, before, access)| {
+            let (store, ff) = match access {
+                Access::Load => (false, None),
+                Access::Store => (true, None),
+                Access::FaultOnlyFirst { base, eew, vd } => (false, Some((base, eew, vd))),
+            };
+            (index, super::fault::Site { guest_pc, instret_undo: retired - before, store, ff })
         })
         .collect();
     Some(Translation { code: tx.a.code, exits, sites })

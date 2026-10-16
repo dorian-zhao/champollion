@@ -19,7 +19,7 @@ use super::fault::Site;
 use super::{Jit, translate};
 use crate::memory::GuestMemory;
 
-const MAGIC: &[u8; 8] = b"CHMPJIT2";
+const MAGIC: &[u8; 8] = b"CHMPJIT3";
 
 impl Jit {
     /// Whether the translations so far can be saved (see the module docs).
@@ -58,6 +58,12 @@ impl Jit {
             w.u64(at as u64);
             w.u64(site.guest_pc);
             w.u64(u64::from(site.instret_undo) << 1 | u64::from(site.store));
+            w.u64(match site.ff {
+                None => 0,
+                Some((base, eew, vd)) => {
+                    1 | u64::from(base) << 8 | u64::from(eew) << 16 | u64::from(vd) << 24
+                }
+            });
         }
         Some(w.0)
     }
@@ -127,7 +133,13 @@ impl Jit {
             let guest_pc = r.u64()?;
             let packed = r.u64()?;
             let instret_undo = u32::try_from(packed >> 1).map_err(|_| "bad fault site")?;
-            self.faults.sites.insert(at, Site { guest_pc, instret_undo, store: packed & 1 != 0 });
+            let ff = match r.u64()? {
+                0 => None,
+                f => Some(((f >> 8) as u8, (f >> 16) as u8, (f >> 24) as u8)),
+            };
+            self.faults
+                .sites
+                .insert(at, Site { guest_pc, instret_undo, store: packed & 1 != 0, ff });
         }
         if !r.0.is_empty() {
             return Err("trailing data".into());

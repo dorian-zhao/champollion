@@ -643,7 +643,7 @@ impl Process {
             // Both come back now and then without a trap, to take signals: the JIT when its
             // interrupt flag is set, the engine after a slice of instructions.
             let trap = match &mut thread.jit {
-                Some(jit) => jit.run_interruptible(&mut thread.cpu, &self.mem),
+                Some(jit) => jit.run_interruptible(&mut thread.cpu, &mut thread.engine, &self.mem),
                 None => thread.engine.run(&mut thread.cpu, &self.mem, 1 << 20).0,
             };
             let Some(trap) = trap else { continue };

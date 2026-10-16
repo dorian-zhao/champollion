@@ -23,7 +23,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::cpu::CpuState;
 use crate::engine::decode_block;
 use crate::interpreter::{self, Trap};
-use crate::memory::{GuestMemory, MemFault, Tlb, TlbMemory, TlbReader};
+use crate::memory::{GuestMemory, MemFault, Memory, Tlb, TlbMemory, TlbReader};
 use code::CodeBuffer;
 use translate::exit;
 
@@ -138,7 +138,18 @@ impl Stats {
 
 /// The variant name of an instruction, for statistics.
 fn kind(inst: &crate::decoder::Inst) -> &'static str {
-    let name = format!("{inst:?}");
+    use crate::decoder::Inst;
+    // Vector accesses carry their kind (unit-stride, fault-only-first, ...): which
+    // shapes fall back is exactly what decides what to translate next.
+    let name = match inst {
+        Inst::VLoad { kind, mask, .. } => {
+            format!("VLoad({kind:?}{})", if *mask { ",masked" } else { "" })
+        }
+        Inst::VStore { kind, mask, .. } => {
+            format!("VStore({kind:?}{})", if *mask { ",masked" } else { "" })
+        }
+        _ => format!("{inst:?}"),
+    };
     let end = name.find([' ', '{']).unwrap_or(name.len());
     // Leak once per distinct name; there are only a few dozen.
     thread_local! {
@@ -161,6 +172,7 @@ impl Jit {
             stub: 0,
             sites: HashMap::new(),
             fault_addr: std::cell::Cell::new(0),
+            fault_site: std::cell::Cell::new(None),
         };
         let mut jit = Jit {
             code,
@@ -245,6 +257,14 @@ impl Jit {
             else {
                 self.stats.refused += 1;
                 self.refused.insert(pc, vstate);
+                if std::env::var_os("RVRUN_DIAG").is_some() && self.stats.refused < 40 {
+                    eprintln!(
+                        "[diag] refused pc={pc:#x} vtype={:#x} vl={} first={:?}",
+                        vstate.0,
+                        vstate.1,
+                        block.first().map(|(i, _)| i)
+                    );
+                }
                 return Ok(None);
             };
             match self.code.append(&t.code) {
@@ -314,8 +334,9 @@ impl Jit {
 
     /// Run until a trap (including `ecall`), like [`interpreter::run`] with no step limit.
     pub fn run(&mut self, cpu: &mut CpuState, mem: &GuestMemory) -> Trap {
+        let mut engine = crate::engine::Engine::new();
         loop {
-            if let Some(trap) = self.run_interruptible(cpu, mem) {
+            if let Some(trap) = self.run_interruptible(cpu, &mut engine, mem) {
                 return trap;
             }
         }
@@ -328,9 +349,28 @@ impl Jit {
         self.interrupt_slot = slot as u32;
     }
 
+    /// Run a short stretch on the fast interpreter. Untranslatable code comes in runs
+    /// (the tails of vectorized loops, masked shapes): interpreting one instruction per
+    /// dispatcher round trip was the cost, so batch a few. The stretch is small enough
+    /// that the interrupt flag is checked promptly between batches.
+    fn fallback(
+        &self,
+        cpu: &mut CpuState,
+        engine: &mut crate::engine::Engine,
+        mem: &GuestMemory,
+    ) -> Option<Trap> {
+        const BATCH: u64 = 32;
+        engine.run(cpu, mem, BATCH).0
+    }
+
     /// Like [`Jit::run`], but return `None` when generated code sees the interrupt flag set
     /// (the caller delivers signals and clears it), with `cpu` at the next instruction.
-    pub fn run_interruptible(&mut self, cpu: &mut CpuState, mem: &GuestMemory) -> Option<Trap> {
+    pub fn run_interruptible(
+        &mut self,
+        cpu: &mut CpuState,
+        engine: &mut crate::engine::Engine,
+        mem: &GuestMemory,
+    ) -> Option<Trap> {
         loop {
             // Loops through the interpreter (untranslated instructions) pass here.
             if mem
@@ -354,7 +394,7 @@ impl Jit {
                     at
                 }
                 Ok(None) => {
-                    if let Err(trap) = interpreter::step(cpu, mem) {
+                    if let Some(trap) = self.fallback(cpu, engine, mem) {
                         return Some(trap);
                     }
                     continue;
@@ -394,7 +434,7 @@ impl Jit {
                     {
                         *self.stats.interpreted.entry(kind(&block[0].0)).or_default() += 1;
                     }
-                    if let Err(trap) = interpreter::step(cpu, mem) {
+                    if let Some(trap) = self.fallback(cpu, engine, mem) {
                         return Some(trap);
                     }
                 }
@@ -402,6 +442,37 @@ impl Jit {
                 exit::INTERRUPT => return None,
                 exit::FAULT_LOAD | exit::FAULT_STORE => {
                     let host = self.faults.fault_addr.get();
+                    // A `vle*ff.v` load does not trap: re-run it element by element and
+                    // keep the prefix that worked, shortening `vl` to it (the faulting
+                    // element and everything past it are left alone).
+                    if code == exit::FAULT_LOAD
+                        && let Some(site) = self.faults.fault_site.get()
+                        && let Some((base, eew, vd)) = site.ff
+                    {
+                        let eew = usize::from(eew);
+                        let addr = cpu.x(base);
+                        let vl = cpu.vl;
+                        let mut loaded = 0;
+                        while loaded < vl {
+                            let mut b = [0u8; 8];
+                            let at = addr.wrapping_add(loaded.wrapping_mul(eew as u64));
+                            if mem.read(at, &mut b[..eew]).is_err() {
+                                break;
+                            }
+                            crate::vector::set_elem(
+                                cpu,
+                                vd,
+                                loaded,
+                                eew as u64,
+                                u64::from_le_bytes(b),
+                            );
+                            loaded += 1;
+                        }
+                        cpu.vl = loaded;
+                        cpu.instret += 1; // the fault-tolerant load retires
+                        cpu.pc = site.guest_pc + 4;
+                        continue;
+                    }
                     let fault = MemFault { addr: host.wrapping_sub(mem.host_base() as u64) };
                     let pc = cpu.pc;
                     return Some(if code == exit::FAULT_LOAD {
@@ -925,6 +996,137 @@ mod tests {
         assert_eq!(cpu, oracle);
         assert_eq!(cpu.x[5], 2, "t0 = vl = min(9, vlmax)");
         assert_eq!(cpu.x[14], 0, "three trips");
+    }
+
+    /// The glibc scanner shape: `vle8ff.v`, `vmsne.vi`, `vmor.mm`, `vfirst.m`, and
+    /// reading `vl`, all against the interpreter.
+    #[test]
+    fn vector_scanner_ops_match_the_interpreter() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle8ff =
+            |vd: u32, rs1: u32| (0b10000 << 20) | (1 << 25) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vmsne_vi = |vd: u32, vs2: u32, imm: u32| {
+            (0b011001 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (imm << 15)
+                | (0b011 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let vmor_mm = |vd: u32, vs1: u32, vs2: u32| {
+            (0b011010 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (vs1 << 15)
+                | (0b010 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let vfirst_m = |rd: u32, vs2: u32| {
+            (0b010000 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (0b10001 << 15)
+                | (0b010 << 12)
+                | (rd << 7)
+                | 0x57
+        };
+        let csrr = |rd: u32, csr: u32| (csr << 20) | (0b010 << 12) | (rd << 7) | 0x73;
+        let prog = [
+            vsetivli(0, 16, 0xc0), // e8, m1, ta, ma
+            vle8ff(1, 11),         // v1 = [a1] (fault-tolerant)
+            vmsne_vi(2, 1, 0),     // v2 = v1 != 0
+            vmor_mm(3, 2, 2),      // v3 = v2 | v2
+            csrr(6, 0xc20),        // t1 = vl
+            vfirst_m(5, 3),        // t0 = index of the first set mask bit
+        ];
+        // Hand-encodings must decode to the instructions this test means to exercise.
+        for (i, want) in [(1, "VLoad"), (2, "VCmp"), (3, "VMask"), (5, "Vfirst")] {
+            let name = format!("{:?}", crate::decode(prog[i]).unwrap());
+            assert!(name.starts_with(want), "{i}: {name}");
+        }
+        let fill = |mem: &GuestMemory| {
+            let mut bytes = [0u8; 16];
+            bytes[1] = 7;
+            bytes[3] = 0x80;
+            mem.write_privileged(DATA, &bytes).unwrap();
+        };
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "scanner sequence");
+        assert_eq!(cpu.x[6], 16, "t1 = vl");
+        assert_eq!(cpu.x[5], 1, "the first set element is index 1");
+        assert_eq!(cpu.v[2][0], 0b0000_1010, "vmsne packed bits");
+    }
+
+    /// A `vle8ff.v` that runs into the end of the mapping: `vl` shortens to the elements
+    /// that loaded, no trap, and both engines land in the same state.
+    #[test]
+    fn vector_ff_load_shortens_at_a_page_boundary() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle8ff =
+            |vd: u32, rs1: u32| (0b10000 << 20) | (1 << 25) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse8 = |vs3: u32, rs1: u32| (1 << 25) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let prog = [
+            vsetivli(0, 16, 0xc0),
+            vle8ff(1, 11), // a1 = the last 8 bytes of the DATA page: element 8 faults
+            vse8(1, 12),   // dump v1 (only the loaded elements matter) to a2
+        ];
+        let fill = |mem: &GuestMemory| {
+            // The probe crosses a host-page boundary (16 KiB on Apple silicon), the only
+            // boundary both engines see alike: guest memory's host pages cover four
+            // guest pages, and a sub-page gap inside a mapped host page is invisible to
+            // generated code but not to the interpreter.
+            mem.map(DATA + 0x1000, 0x3000, Prot::RW).unwrap();
+            mem.write_privileged(DATA + 0x3ff8, &[1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        };
+        let init = |cpu: &mut CpuState| {
+            cpu.set_x(11, DATA + 0x3ff8);
+            cpu.set_x(12, DATA + 16);
+        };
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu.vl, oracle.vl, "vl");
+        assert_eq!(cpu.vtype, oracle.vtype, "vtype");
+        assert_eq!(cpu.instret, oracle.instret, "instret");
+        assert_eq!(cpu.v, oracle.v, "v registers");
+        assert_eq!(cpu, oracle, "ff shortening");
+        assert_eq!(cpu.vl, 8, "eight elements loaded before the fault");
+        assert_eq!(cpu.v[1][..8], [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut stored = [0u8; 8];
+        mem_j.read_privileged(DATA + 16, &mut stored).unwrap();
+        assert_eq!(stored, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

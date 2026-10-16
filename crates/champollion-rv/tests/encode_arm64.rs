@@ -231,6 +231,9 @@ fn matches_assembler() {
     a.vec_dup(22, 2, 2);
     a.vec_dup(23, 3, 4);
     a.vec_dup(24, 4, 8);
+    a.cmeq16b(3, 4, 5);
+    a.movi16b_one(5);
+    a.ext16b(2, 0, 0, 8);
     let len = a.code.len();
     assert!(!a.ldr_imm(Mem::U64, 0, 17, 32768));
     assert!(!a.str_imm(Mem::U8, 0, 17, -257));

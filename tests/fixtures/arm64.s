@@ -215,3 +215,6 @@ dup v21.16b, w1
 dup v22.8h, w2
 dup v23.4s, w3
 dup v24.2d, x4
+cmeq v3.16b, v4.16b, v5.16b
+movi v5.16b, #1
+ext v2.16b, v0.16b, v0.16b, #8

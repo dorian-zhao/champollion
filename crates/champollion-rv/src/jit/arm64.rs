@@ -886,6 +886,18 @@ impl Asm {
     pub fn rbit16b(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x6e60_5800 | (rn as u32) << 5 | rd as u32);
     }
+    /// `cmeq v.16b, v.16b, v.16b`: per-byte equality, 0xFF where equal.
+    pub fn cmeq16b(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x6e20_8c00 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `movi v.16b, #1`: one per byte (the constant the mask packing needs).
+    pub fn movi16b_one(&mut self, rd: Reg) {
+        self.emit(0x4f00_e420 | rd as u32);
+    }
+    /// `ext v.16b, v.16b, v.16b, #imm`: reach the other half of a vector register.
+    pub fn ext16b(&mut self, rd: Reg, rn: Reg, rm: Reg, imm: u32) {
+        self.emit(0x6e00_0000 | (rm as u32) << 16 | imm << 11 | (rn as u32) << 5 | rd as u32);
+    }
 
     // ---- 128-bit vector moves and lane-wise ALU, for the RVV JIT subset ----
 
