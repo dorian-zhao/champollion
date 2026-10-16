@@ -52,11 +52,24 @@ fn apply_flags(fd: i32, flags: i32) {
     }
 }
 
+/// Darwin has no `AF_UNIX` `SOCK_SEQPACKET`, and Linux guests do ask for it — cargo's
+/// exec-error channel is one. Serve it with `SOCK_STREAM`: such callers use the pair as a
+/// pipe of small messages, which survives the substitution; only message boundaries are
+/// lost.
+fn seqpacket_as_stream(family: i32, ty: i32) -> i32 {
+    const LINUX_SOCK_SEQPACKET: i32 = 5;
+    if family == libc::AF_UNIX && ty & 0xf == LINUX_SOCK_SEQPACKET {
+        (ty & !0xf) | libc::SOCK_STREAM
+    } else {
+        ty
+    }
+}
+
 pub fn socket(domain_: i32, ty: i32, protocol: i32) -> SysResult {
     let family = domain(domain_)?;
     let flags = ty & (LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
     // SAFETY: plain syscall.
-    let fd = unsafe { libc::socket(family, ty & 0xf, protocol) };
+    let fd = unsafe { libc::socket(family, seqpacket_as_stream(family, ty) & 0xf, protocol) };
     if fd < 0 {
         return Err(last_errno());
     }
@@ -68,7 +81,10 @@ pub fn socketpair(domain_: i32, ty: i32, protocol: i32) -> Result<[i32; 2], i32>
     let family = domain(domain_)?;
     let mut fds = [0; 2];
     // SAFETY: socketpair into a local array.
-    if unsafe { libc::socketpair(family, ty & 0xf, protocol, fds.as_mut_ptr()) } < 0 {
+    if unsafe {
+        libc::socketpair(family, seqpacket_as_stream(family, ty) & 0xf, protocol, fds.as_mut_ptr())
+    } < 0
+    {
         return Err(last_errno());
     }
     let flags = ty & (LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
@@ -304,5 +320,19 @@ mod tests {
         assert_eq!(to_linux(&ss, len), unix);
         assert_eq!(to_darwin(&[1, 0, 0, b'a']).map(|_| ()), Err(errno::EINVAL), "abstract");
         assert_eq!(to_darwin(&[2, 0, 1]).map(|_| ()), Err(errno::EINVAL), "short");
+    }
+
+    #[test]
+    fn seqpacket_socketpair_becomes_a_stream_pipe() {
+        let [a, b] = socketpair(LINUX_AF_UNIX as i32, 5 | LINUX_SOCK_CLOEXEC, 0).unwrap();
+        // SAFETY: valid fds and buffers.
+        unsafe {
+            assert_eq!(libc::send(a, b"ping".as_ptr().cast(), 4, 0), 4);
+            let mut buf = [0u8; 4];
+            assert_eq!(libc::recv(b, buf.as_mut_ptr().cast(), 4, 0), 4);
+            assert_eq!(&buf, b"ping");
+            libc::close(a);
+            libc::close(b);
+        }
     }
 }
