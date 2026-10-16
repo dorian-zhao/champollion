@@ -186,6 +186,7 @@ syscalls! {
     RSEQ = 293 "rseq",
     PIDFD_OPEN = 434 "pidfd_open",
     CLONE3 = 435 "clone3",
+    OPENAT2 = 437 "openat2",
     MEMBARRIER = 283 "membarrier",
     FACCESSAT2 = 439 "faccessat2",
 }
@@ -349,6 +350,12 @@ pub trait HostOs: Send + Sync {
         Err(errno::ENOSYS)
     }
     fn openat(&self, dirfd: i32, path: &CStr, flags: i32, mode: u32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `openat2`: `openat` with an `open_how` (flags, mode, and the `RESOLVE_*` bits,
+    /// which mean the same on every architecture). Backends that cannot honor `resolve`
+    /// fail with `ENOSYS`, which callers treat as "fall back to `openat`".
+    fn openat2(&self, dirfd: i32, path: &CStr, flags: i32, mode: u64, resolve: u64) -> SysResult {
         Err(errno::ENOSYS)
     }
     fn close(&self, fd: i32) -> SysResult {
@@ -1074,6 +1081,23 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         nr::OPENAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
             host.openat(fd, &p.host_path(&path, true), a[2] as i32, a[3] as u32)
+        }
+        nr::OPENAT2 => {
+            // `open_how`: `flags`, `mode`, `resolve`, little-endian. The kernel accepts
+            // sizes >= 24; the guest's `flags` need the same translation `openat` does
+            // (riscv64 and arm64 disagree on four of them).
+            if a[3] < 24 {
+                return Err(errno::EINVAL);
+            }
+            let mut how = [0u8; 24];
+            p.mem.read(a[2], &mut how).map_err(efault)?;
+            let num = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap());
+            let (flags, mode, resolve) = (num(0), num(1), num(2));
+            if flags >> 32 != 0 {
+                return Err(errno::EINVAL);
+            }
+            let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
+            host.openat2(fd, &p.host_path(&path, true), flags as i32, mode, resolve)
         }
         nr::CLOSE => host.close(fd),
         nr::FCNTL => match a[1] as i32 {

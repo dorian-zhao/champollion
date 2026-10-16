@@ -497,6 +497,17 @@ impl HostOs for DarwinHost {
         )
     }
 
+    fn openat2(&self, fd: i32, path: &CStr, flags: i32, mode: u64, resolve: u64) -> SysResult {
+        // Darwin has no `RESOLVE_*` resolution. When the guest does not ask for it (tar's
+        // probe does not), the call is a plain `openat`; otherwise `ENOSYS` lets the
+        // caller fall back.
+        if resolve == 0 && mode <= u32::MAX as u64 {
+            self.openat(fd, path, flags, mode as u32)
+        } else {
+            Err(errno::ENOSYS)
+        }
+    }
+
     fn close(&self, fd: i32) -> SysResult {
         self.eventfds.close(fd);
         self.dirs.forget(fd);
@@ -1062,6 +1073,23 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }
+
+    #[test]
+    fn openat2_falls_back_to_openat_without_resolve() {
+        let dir = std::env::temp_dir().join(format!("champollion-openat2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, b"hi").unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let h = DarwinHost::default();
+        let fd = h.openat2(AT_FDCWD, &cpath, 0, 0, 0).unwrap() as i32;
+        h.close(fd).unwrap();
+        // RESOLVE_NO_MAGICLINKS: not representable on Darwin, and callers retry with
+        // `openat` when they see `ENOSYS`.
+        assert_eq!(h.openat2(AT_FDCWD, &cpath, 0, 0, 0x02), Err(errno::ENOSYS));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn opens_reads_and_stats_files() {
         let dir = std::env::temp_dir().join(format!("champollion-host-{}", std::process::id()));

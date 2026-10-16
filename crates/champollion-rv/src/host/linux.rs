@@ -252,6 +252,13 @@ impl HostOs for LinuxHost {
         sys!(SYS_openat, dirfd, path.as_ptr(), host_open_flags(flags), mode)
     }
 
+    fn openat2(&self, dirfd: i32, path: &CStr, flags: i32, mode: u64, resolve: u64) -> SysResult {
+        // Only `open_how.flags` is architecture-dependent; `RESOLVE_*` is uapi, and the
+        // kernel validates the rest.
+        let how: [u64; 3] = [host_open_flags(flags) as u64, mode, resolve];
+        sys!(SYS_openat2, dirfd, path.as_ptr(), how.as_ptr(), 24usize)
+    }
+
     fn close(&self, fd: i32) -> SysResult {
         sys!(SYS_close, fd)
     }
@@ -585,6 +592,29 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }
+
+    #[test]
+    fn openat2_opens_files_and_translates_flags() {
+        let dir = std::env::temp_dir().join(format!("champollion-openat2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let h = LinuxHost;
+        let fd = h.openat2(AT_FDCWD, &cpath, 0, 0, 0).unwrap() as i32;
+        let mut buf = [0u8; 5];
+        assert_eq!(h.read(fd, GuestBuf { ptr: buf.as_mut_ptr(), len: 5 }), Ok(5));
+        assert_eq!(&buf, b"hello");
+        h.close(fd).unwrap();
+        // The probe Ubuntu's `tar` makes: O_PATH|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW in
+        // riscv64 values, on a directory.
+        let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let flags = 0o10000000 | 0o2000000 | 0o200000 | 0o400000;
+        let fd = h.openat2(AT_FDCWD, &cdir, flags, 0, 0).unwrap() as i32;
+        h.close(fd).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn opens_reads_and_stats_files() {
         let dir = std::env::temp_dir().join(format!("champollion-host-{}", std::process::id()));
