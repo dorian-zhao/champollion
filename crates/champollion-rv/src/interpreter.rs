@@ -2030,6 +2030,56 @@ mod tests {
     }
 
     #[test]
+    fn slidedown_reads_source_elements_past_vl() {
+        // Spec: vslidedown's source read is bounded by VLMAX, not vl. clang's
+        // 128-bit extract idiom (vsetivli vl=1; vslidedown.vx 1) leans on it to
+        // pull the high half out of the undisturbed tail.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle8 = |vd: u32, rs1: u32| (1 << 25) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse8 = |vs3: u32, rs1: u32| (1 << 25) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let slidedown = |vd: u32, vs2: u32, off: u32| {
+            (0b001111 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (off << 15)
+                | (0b011 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        const VT: u32 = 0xc0; // e8, m1, ta, ma
+        let prog = [
+            vsetivli(0, 16, VT),
+            vle8(1, 11), // v1 = DATA[0..16] = 0x10..=0x1f
+            vsetivli(0, 2, VT),
+            slidedown(2, 1, 1), // element 1 must read vs2[2], above vl
+            vse8(2, 12),
+            vsetivli(0, 1, VT),
+            slidedown(3, 1, 1), // element 0 must read vs2[1], above vl
+            vse8(3, 13),
+        ];
+        let mem = FlatMemory::new(BASE, 4096);
+        mem.load_words(BASE, &prog).unwrap();
+        let data: Vec<u8> = (0x10u8..0x20).collect();
+        mem.write(DATA, &data).unwrap();
+        let mut cpu = CpuState::new(BASE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 32);
+        cpu.set_x(13, DATA + 64);
+        let end = BASE + 4 * prog.len() as u64;
+        while cpu.pc != end {
+            step(&mut cpu, &mem).unwrap_or_else(|t| panic!("{t:?}\n{cpu:?}"));
+        }
+        let mut two = [0u8; 2];
+        mem.read(DATA + 32, &mut two).unwrap();
+        assert_eq!(two, [0x11, 0x12], "vl=2: both source reads are register elements");
+        let mut one = [0u8; 1];
+        mem.read(DATA + 64, &mut one).unwrap();
+        assert_eq!(one, [0x11], "vl=1: the clang extract idiom");
+    }
+
+    #[test]
     fn vector_merge_picks_the_masked_source() {
         // Hand-assembled helpers for the pieces this test needs.
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {

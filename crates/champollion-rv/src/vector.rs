@@ -160,23 +160,41 @@ fn src_value(cpu: &CpuState, src: VSel, i: u64, sew_b: u64, imm_unsigned: bool) 
 
 /// Element `i` of a source register, through a snapshot when one was taken.
 #[inline]
-fn lens(cpu: &CpuState, table: &Option<[u8; 16]>, reg: u8, i: u64, sew_b: u64) -> u64 {
+fn lens(
+    cpu: &CpuState,
+    table: &Option<[u8; 8 * VLEN_BYTES as usize]>,
+    reg: u8,
+    i: u64,
+    sew_b: u64,
+) -> u64 {
     match table {
         Some(bytes) => snap_get(bytes, i, sew_b),
         None => get_elem(cpu, reg, i, sew_b),
     }
 }
 
-/// Element `i` of a snapshot of one register. Snapshot readers only ever look at
-/// elements within the register (indices the active set can produce are < vlmax).
+/// Element `i` of a snapshot of one register group. Snapshot readers only ever look
+/// at elements within the group (indices the active set can produce are < vlmax).
 #[inline]
-fn snap_get(table: &[u8; 16], i: u64, sew_b: u64) -> u64 {
+fn snap_get(table: &[u8; 8 * VLEN_BYTES as usize], i: u64, sew_b: u64) -> u64 {
     let off = (i * sew_b) as usize;
     let mut v = 0u64;
     for (k, &byte) in table[off..off + sew_b as usize].iter().enumerate() {
         v |= u64::from(byte) << (8 * k as u32);
     }
     v
+}
+
+/// A copy of the register group starting at `reg` (one register at m1 and below).
+/// The slide and gather ops can read indices up to VLMAX while also writing their
+/// destination in place, so they work off this snapshot.
+fn snap_group(cpu: &CpuState, reg: u8) -> [u8; 8 * VLEN_BYTES as usize] {
+    let mut bytes = [0u8; 8 * VLEN_BYTES as usize];
+    for k in 0..lmul_regs(cpu) as usize {
+        bytes[k * VLEN_BYTES as usize..][..VLEN_BYTES as usize]
+            .copy_from_slice(&cpu.v[(reg as usize + k) & 31]);
+    }
+    bytes
 }
 
 /// Per-element arithmetic, truncated to the element width.
@@ -216,9 +234,9 @@ pub fn exec_arith(cpu: &mut CpuState, op: VArithOp, vd: u8, vs2: u8, src: VSel, 
         op,
         VArithOp::SlideUp | VArithOp::SlideDown | VArithOp::Slide1Down | VArithOp::Gather
     );
-    let old_vs2 = if snapshot { Some(cpu.v[vs2 as usize & 31]) } else { None };
+    let old_vs2 = if snapshot { Some(snap_group(cpu, vs2)) } else { None };
     let old_src = match (snapshot, src) {
-        (true, VSel::V(reg)) => Some(cpu.v[reg as usize & 31]),
+        (true, VSel::V(reg)) => Some(snap_group(cpu, reg)),
         _ => None,
     };
     for i in 0..vl {
@@ -244,7 +262,11 @@ pub fn exec_arith(cpu: &mut CpuState, op: VArithOp, vd: u8, vs2: u8, src: VSel, 
                     VSel::X(r) => cpu.x(r) as u8,
                     VSel::V(_) => unreachable!("vslidedown has no vector form"),
                 });
-                if i + off < vl { lens(cpu, &old_vs2, vs2, i + off, sew_b) } else { 0 }
+                // The source read is bounded by VLMAX, not vl (spec: "0 <= i+OFFSET <
+                // VLMAX: src[i] = vs2[i+OFFSET]"). Compilers lean on this: clang's
+                // 128-bit extract is vsetivli vl=1 followed by vslidedown.vx 1, which
+                // reads element 1 out of the undisturbed tail.
+                if i + off < vlmax { lens(cpu, &old_vs2, vs2, i + off, sew_b) } else { 0 }
             }
             VArithOp::Slide1Down => {
                 if i + 1 < vl {
