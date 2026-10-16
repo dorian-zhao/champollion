@@ -879,6 +879,10 @@ impl Asm {
     pub fn mvn16b(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x6e20_5800 | (rn as u32) << 5 | rd as u32);
     }
+    /// `rbit v.16b`: reverse the bits within each byte (Zbkb `brev8`).
+    pub fn rbit16b(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x6e60_5800 | (rn as u32) << 5 | rd as u32);
+    }
     /// `cmn wn, #imm` (sets flags for wn + imm).
     pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
         self.imm12(0x3100_0000, XZR, rn, imm);

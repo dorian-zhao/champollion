@@ -191,3 +191,5 @@ cnt v16.16b, v17.16b
 addv b18, v19.16b
 cmeq v20.16b, v21.16b, #0
 mvn v22.16b, v23.16b
+rbit v16.16b, v16.16b
+rbit v3.16b, v5.16b

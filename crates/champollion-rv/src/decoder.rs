@@ -533,8 +533,10 @@ pub enum AluOp {
     Remu,
     // Zba (address generation), Zbb (basic bit manipulation), Zbs (single-bit), and
     // Zicond (integer conditional operations, V.1.0.2). The unary operations (`Clz`,
-    // `Ctz`, `Cpop`, `SextB`, `SextH`, `ZextH`, `Rev8`, `OrcB`) ignore their second
-    // operand, which their encodings fix to a constant.
+    // `Ctz`, `Cpop`, `SextB`, `SextH`, `ZextH`, `Rev8`, `Brev8`, `OrcB`) ignore their
+    // second operand, which their encodings fix to a constant. Zbkb adds `Pack`,
+    // `Packh`, and `Packw`, Zbc the carry-less multiplies `Clmul`, `Clmulh`, and
+    // `Clmulr`, and Zbkx the lookups `Xperm4` and `Xperm8`.
     Sh1Add,
     Sh2Add,
     Sh3Add,
@@ -565,7 +567,16 @@ pub enum AluOp {
     SextH,
     ZextH,
     Rev8,
+    Brev8,
     OrcB,
+    Pack,
+    Packh,
+    Packw,
+    Clmul,
+    Clmulh,
+    Clmulr,
+    Xperm4,
+    Xperm8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -825,7 +836,10 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b001, 0b011_000) if rs2 == 0b00101 => (AluOp::SextH, 0),
                 (0b101, 0b011_000) => (AluOp::Ror, shamt),
                 (0b101, 0b001_010) => (AluOp::OrcB, 0),
-                (0b101, 0b011_010) => (AluOp::Rev8, 0),
+                // Zbkb brev8 shares this funct6 with Zbb rev8; rs2 picks (00111 vs
+                // 11000), the way the two extension groups were aligned.
+                (0b101, 0b011_010) if rs2 == 0b00111 => (AluOp::Brev8, 0),
+                (0b101, 0b011_010) if rs2 == 0b11000 => (AluOp::Rev8, 0),
                 // Zbs immediate forms; the 6-bit shamt is the bit index.
                 (0b001, 0b010_010) => (AluOp::Bclr, shamt),
                 (0b101, 0b010_010) => (AluOp::Bext, shamt),
@@ -877,6 +891,15 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 // Zicond.
                 (0b101, 0b000_0111) => AluOp::CzeroEqz,
                 (0b111, 0b000_0111) => AluOp::CzeroNez,
+                // Zbkb pack/packh, Zbc's carry-less multiplies, and Zbkx's element
+                // permutations.
+                (0b100, 0b000_0100) => AluOp::Pack,
+                (0b111, 0b000_0100) => AluOp::Packh,
+                (0b001, 0b000_0101) => AluOp::Clmul,
+                (0b011, 0b000_0101) => AluOp::Clmulh,
+                (0b010, 0b000_0101) => AluOp::Clmulr,
+                (0b010, 0b001_0100) => AluOp::Xperm4,
+                (0b100, 0b001_0100) => AluOp::Xperm8,
                 _ => return illegal,
             };
             Inst::Op { op, rd, rs1, rs2 }
@@ -929,6 +952,8 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b000, 0b000_0100) => Inst::Op { op: AluOp::AddUw, rd, rs1, rs2 },
                 // Zbb zext.h has a 64-bit result (it is `packw` on the host side).
                 (0b100, 0b000_0100) if rs2 == 0 => Inst::Op { op: AluOp::ZextH, rd, rs1, rs2: 0 },
+                // Zbkb packw: the same halfword packing, sign-extended from the word.
+                (0b100, 0b000_0100) => Inst::Op { op: AluOp::Packw, rd, rs1, rs2 },
                 // Zbb word rotations.
                 (0b001, 0b011_0000) => Inst::Op32 { op: AluOp32::Rol, rd, rs1, rs2 },
                 (0b101, 0b011_0000) => Inst::Op32 { op: AluOp32::Ror, rd, rs1, rs2 },
@@ -1270,7 +1295,7 @@ mod tests {
             0x0010, // c.addi4spn with nzuimm = 0
             0x2001, // c.addiw with rd = 0
             0x6101, // c.addi16sp with nzimm = 0
-            0x6081, // c.lui with nzimm = 0
+            0x6001, // c.lui with nzimm = 0 and an even register (c.mop.N are the odds)
             0x9c79, // Zcb unary slot, bits 4:2 = 110 (unassigned)
             0x9c7d, // Zcb unary slot, bits 4:2 = 111 (unassigned)
             0x4002, // c.lwsp with rd = 0

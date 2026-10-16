@@ -911,6 +911,7 @@ impl Tx {
             | AluOp::SextH
             | AluOp::ZextH
             | AluOp::Rev8
+            | AluOp::Brev8
             | AluOp::OrcB => self.bit_unary(op, d, a),
             _ => unreachable!("no immediate form of {op:?}"),
         }
@@ -1088,7 +1089,17 @@ impl Tx {
             | AluOp::SextH
             | AluOp::ZextH
             | AluOp::Rev8
+            | AluOp::Brev8
             | AluOp::OrcB => self.bit_unary(op, d, a),
+            // Zbkb/Zbc/Zbkx: interpreted only for now; the block falls back as a whole.
+            AluOp::Pack
+            | AluOp::Packh
+            | AluOp::Packw
+            | AluOp::Clmul
+            | AluOp::Clmulh
+            | AluOp::Clmulr
+            | AluOp::Xperm4
+            | AluOp::Xperm8 => return false,
         }
         self.commit(rd, d);
         true
@@ -1163,6 +1174,13 @@ impl Tx {
             AluOp::SextH => self.a.sbfm(d, a, 0, 15),
             AluOp::ZextH => self.a.ubfm(d, a, 0, 15),
             AluOp::Rev8 => self.a.rev(d, a),
+            AluOp::Brev8 => {
+                // Each byte reversed: NEON's per-byte bit reversal (rbit v.16b), with
+                // the scalar register moved in and out.
+                self.a.fmov_from_gpr(Fp::D, FA, a);
+                self.a.rbit16b(FA, FA);
+                self.a.fmov_to_gpr(Fp::D, d, FA);
+            }
             AluOp::OrcB => {
                 self.a.fmov_from_gpr(Fp::D, FA, a);
                 self.a.cmeq_zero16b(FA, FA);

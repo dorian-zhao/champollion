@@ -612,11 +612,69 @@ fn alu(op: AluOp, a: u64, b: u64) -> u64 {
         AluOp::SextH => a as i16 as i64 as u64,
         AluOp::ZextH => a as u16 as u64,
         AluOp::Rev8 => a.swap_bytes(),
+        AluOp::Brev8 => u64::from_le_bytes(a.to_le_bytes().map(|b| b.reverse_bits())),
         AluOp::OrcB => {
             let mut r = 0u64;
             for i in 0..8 {
                 if a >> (8 * i) & 0xff != 0 {
                     r |= 0xff << (8 * i);
+                }
+            }
+            r
+        }
+        // Zbkb: the low half (XLEN/2, so a word here) of each source, packed; `packw`
+        // sign-extends the halfword it inserts, and `packh` packs bytes.
+        AluOp::Pack => (a & 0xffff_ffff) | (b << 32),
+        AluOp::Packh => (a & 0xff) | ((b & 0xff) << 8),
+        AluOp::Packw => ((a & 0xffff) | ((b & 0xffff) << 16)) as u32 as i32 as u64,
+        // Zbc: the carry-less product is a sum (xor) of `a` shifted by each set bit of
+        // `b`; clmul keeps the low 64 bits, clmulh the high ones, and clmulr the window
+        // around bit 63 (bits 126..63).
+        AluOp::Clmul => {
+            let mut r = 0u64;
+            for i in 0..64 {
+                if b >> i & 1 != 0 {
+                    r ^= a << i;
+                }
+            }
+            r
+        }
+        AluOp::Clmulh => {
+            let mut r = 0u64;
+            for i in 1..64 {
+                if b >> i & 1 != 0 {
+                    r ^= a >> (64 - i);
+                }
+            }
+            r
+        }
+        AluOp::Clmulr => {
+            let mut r = 0u64;
+            for i in 0..64 {
+                if b >> i & 1 != 0 {
+                    r ^= a >> (63 - i);
+                }
+            }
+            r
+        }
+        // Zbkx: every nibble (byte) of `b` indexes a nibble (byte) of the table in `a`.
+        // An index past the register selects zero (no wrap-around), matching spike.
+        AluOp::Xperm4 => {
+            let mut r = 0u64;
+            for i in 0..16 {
+                let pos = ((b >> (4 * i)) & 0xf) << 2;
+                if pos < 64 {
+                    r |= ((a >> pos) & 0xf) << (4 * i);
+                }
+            }
+            r
+        }
+        AluOp::Xperm8 => {
+            let mut r = 0u64;
+            for i in 0..8 {
+                let pos = ((b >> (8 * i)) & 0xff) << 3;
+                if pos < 64 {
+                    r |= ((a >> pos) & 0xff) << (8 * i);
                 }
             }
             r
@@ -1384,6 +1442,59 @@ mod tests {
         assert_eq!(one(op(0b101, 0b000_0111, 10, 11, 12), 5, 9), 5);
         assert_eq!(one(op(0b111, 0b000_0111, 10, 11, 12), 5, 9), 0);
         assert_eq!(one(op(0b111, 0b000_0111, 10, 11, 12), 5, 0), 5);
+    }
+
+    #[test]
+    fn zbkb_packs_and_brev8() {
+        // brev8 reverses the bits within each byte.
+        assert_eq!(
+            one(op_imm_selector(0b101, 0b011_010 << 6 | 0b00111, 10, 11), 0x1234_5678_9abc_def0, 0),
+            0x482c_6a1e_593d_7b0f
+        );
+        // pack puts the low word of each source together, packh the low bytes...
+        assert_eq!(
+            one(op(0b100, 0b000_0100, 10, 11, 12), 0xdead_beef_ffff_1234, 0xffff_0000_0000_5678),
+            0x5678_ffff_1234
+        );
+        assert_eq!(one(op(0b111, 0b000_0100, 10, 11, 12), 0x00ab, 0x00cd), 0xcdab);
+        // ...and packw sign-extends the word it packs (bit 31 comes from rs2's low 16).
+        assert_eq!(
+            one(op_32(0b100, 0b000_0100, 10, 11, 12), 0x1234, 0x8000),
+            0xffff_ffff_8000_1234
+        );
+    }
+
+    #[test]
+    fn zbc_carry_less_multiplies() {
+        // 0x3 × 0x5 without carries is 0xf, entirely in the low word.
+        assert_eq!(one(op(0b001, 0b000_0101, 10, 11, 12), 0x3, 0x5), 0xf);
+        assert_eq!(one(op(0b011, 0b000_0101, 10, 11, 12), 0x3, 0x5), 0);
+        // 2^63 × 2^63 = 2^126: clmul sees nothing, clmulh bit 62, and clmulr bit 63.
+        let top = 1u64 << 63;
+        assert_eq!(one(op(0b001, 0b000_0101, 10, 11, 12), top, top), 0);
+        assert_eq!(one(op(0b011, 0b000_0101, 10, 11, 12), top, top), 1 << 62);
+        assert_eq!(one(op(0b010, 0b000_0101, 10, 11, 12), top, top), 1 << 63);
+    }
+
+    #[test]
+    fn zbkx_permutes_elements() {
+        // xperm8: byte i of rs2 indexes the bytes of the table in rs1.
+        assert_eq!(
+            one(op(0b100, 0b001_0100, 10, 11, 12), 0x8877_6655_4433_2211, 0x0706_0504_0302_0100),
+            0x8877_6655_4433_2211
+        );
+        // An index past the last element selects zero rather than wrapping.
+        assert_eq!(
+            one(op(0b100, 0b001_0100, 10, 11, 12), 0x8877_6655_4433_2211, 0x08),
+            0x1111_1111_1111_1100,
+            "byte 0 indexes past the table (zero); the rest index table byte 0"
+        );
+        // xperm4: nibble i of rs2 indexes the table in rs1 (0x0123_4567_89ab_cdef has
+        // nibble 0 = 0xf counting up).
+        assert_eq!(
+            one(op(0b010, 0b001_0100, 10, 11, 12), 0x0123_4567_89ab_cdef, 0x3210),
+            0xffff_ffff_ffff_cdef
+        );
     }
 
     #[test]

@@ -207,6 +207,8 @@ fn matches_assembler() {
     a.addv16b(18, 19);
     a.cmeq_zero16b(20, 21);
     a.mvn16b(22, 23);
+    a.rbit16b(16, 16);
+    a.rbit16b(3, 5);
     let len = a.code.len();
     assert!(!a.ldr_imm(Mem::U64, 0, 17, 32768));
     assert!(!a.str_imm(Mem::U8, 0, 17, -257));

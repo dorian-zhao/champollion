@@ -90,13 +90,34 @@ pub fn decode_compressed(h: u16) -> Result<Inst, DecodeError> {
         (0b00, 0b001) => Inst::FLoad { width: FWidth::D, rd: rd_, rs1: rs1_, offset: off_d },
         (0b00, 0b011) => Inst::Load { width: LoadWidth::D, rd: rd_, rs1: rs1_, offset: off_d },
         (0b00, 0b100) => {
-            // Zcb: c.lbu/c.lhu/c.sb/c.sh; uimm[1] in bit 5, uimm[0] in bit 6.
-            let off = ((bits(h, 5, 5) << 1) | bits(h, 6, 6)) as i32;
+            // Zcb: c.lbu/c.lhu/c.lh/c.sb/c.sh. uimm[1] is bit 5, and bit 6 is uimm[0]
+            // for the byte forms; the halfword loads repurpose it as the sign selector
+            // (0 = c.lhu, 1 = c.lh), and the halfword store requires it clear.
+            let uimm1 = bits(h, 5, 5) << 1;
+            let uimm0 = bits(h, 6, 6);
             match bits(h, 11, 10) {
-                0b00 => Inst::Load { width: LoadWidth::Bu, rd: rd_, rs1: rs1_, offset: off },
-                0b01 => Inst::Load { width: LoadWidth::Hu, rd: rd_, rs1: rs1_, offset: off },
-                0b10 => Inst::Store { width: StoreWidth::B, rs1: rs1_, rs2: rd_, offset: off },
-                _ => Inst::Store { width: StoreWidth::H, rs1: rs1_, rs2: rd_, offset: off },
+                0b00 => Inst::Load {
+                    width: LoadWidth::Bu,
+                    rd: rd_,
+                    rs1: rs1_,
+                    offset: (uimm1 | uimm0) as i32,
+                },
+                0b01 if uimm0 == 0 => {
+                    Inst::Load { width: LoadWidth::Hu, rd: rd_, rs1: rs1_, offset: uimm1 as i32 }
+                }
+                0b01 => {
+                    Inst::Load { width: LoadWidth::H, rd: rd_, rs1: rs1_, offset: uimm1 as i32 }
+                }
+                0b10 => Inst::Store {
+                    width: StoreWidth::B,
+                    rs1: rs1_,
+                    rs2: rd_,
+                    offset: (uimm1 | uimm0) as i32,
+                },
+                0b11 if uimm0 == 0 => {
+                    Inst::Store { width: StoreWidth::H, rs1: rs1_, rs2: rd_, offset: uimm1 as i32 }
+                }
+                _ => return illegal, // c.sh with the reserved bit set
             }
         }
         (0b00, 0b101) => Inst::FStore { width: FWidth::D, rs1: rs1_, rs2: rd_, offset: off_d },
@@ -124,6 +145,11 @@ pub fn decode_compressed(h: u16) -> Result<Inst, DecodeError> {
         (0b01, 0b011) => {
             // c.lui: nzimm[17] in bit 12, nzimm[16:12] in bits 6:2
             if imm6(h) == 0 {
+                // Zcmop's c.mop.N are the reserved all-zero-immediate encodings with an
+                // odd register: instructions that must not write anything (nops today).
+                if rd % 2 == 1 && rd <= 15 {
+                    return Ok(Inst::OpImm { op: AluOp::Add, rd: 0, rs1: 0, imm: 0 });
+                }
                 return illegal;
             }
             Inst::Lui { rd, imm: sext(imm6(h), 6) << 12 }

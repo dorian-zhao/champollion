@@ -485,6 +485,23 @@ fn rv64zb() {
         ("c.zext.w a4", Op { op: A::AddUw, rd: A4, rs1: A4, rs2: 0 }),
         ("c.not a5", OpImm { op: A::Xor, rd: A5, rs1: A5, imm: -1 }),
         ("c.mul a0, a1", Op { op: A::Mul, rd: A0, rs1: A0, rs2: A1 }),
+        // Zbkb
+        ("brev8 a0, a1", OpImm { op: A::Brev8, rd: A0, rs1: A1, imm: 0 }),
+        ("pack a2, a3, a4", Op { op: A::Pack, rd: A2, rs1: A3, rs2: A4 }),
+        ("packh a5, a6, a7", Op { op: A::Packh, rd: A5, rs1: A6, rs2: A7 }),
+        ("packw s0, s1, s2", Op { op: A::Packw, rd: S0, rs1: S1, rs2: S2 }),
+        // Zbc
+        ("clmul s3, s4, s5", Op { op: A::Clmul, rd: S3, rs1: S4, rs2: S5 }),
+        ("clmulh s6, s7, s8", Op { op: A::Clmulh, rd: S6, rs1: S7, rs2: S8 }),
+        ("clmulr s9, s10, s11", Op { op: A::Clmulr, rd: S9, rs1: S10, rs2: S11 }),
+        // Zbkx
+        ("xperm4 t4, t5, t6", Op { op: A::Xperm4, rd: T4, rs1: T5, rs2: T6 }),
+        ("xperm8 a0, a1, a2", Op { op: A::Xperm8, rd: A0, rs1: A1, rs2: A2 }),
+        // The sign-extending Zcb halfword load, and Zcmop (nops whose odd register
+        // field selects the N).
+        ("c.lh a1, 2(s1)", Load { width: L::H, rd: A1, rs1: S1, offset: 2 }),
+        ("c.mop.1", OpImm { op: A::Add, rd: 0, rs1: 0, imm: 0 }),
+        ("c.mop.15", OpImm { op: A::Add, rd: 0, rs1: 0, imm: 0 }),
     ];
     check(
         include_str!("../../../tests/fixtures/rv64zb.s"),

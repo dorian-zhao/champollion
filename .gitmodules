@@ -7,3 +7,6 @@
 [submodule "third_party/lua"]
 	path = third_party/lua
 	url = https://github.com/lua/lua
+[submodule "third_party/riscv-arch-test"]
+	path = third_party/riscv-arch-test
+	url = https://github.com/riscv/riscv-arch-test
