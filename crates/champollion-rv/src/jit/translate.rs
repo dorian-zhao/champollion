@@ -657,7 +657,7 @@ impl Tx {
                 self.fcommit(FWidth::D, rd, d);
             }
             Inst::FSgnj { kind, width: FWidth::D, rd, rs1, rs2 } => {
-                // Single precision needs NaN-box checks; it stays on the interpreter for now.
+                // Doubles are raw 64-bit patterns: combine the halves in GPRs.
                 self.fraw_load(rs1, SRC0);
                 self.fraw_load(rs2, SRC1);
                 match kind {
@@ -670,6 +670,37 @@ impl Tx {
                 self.a.orr(DST, SRC0, SRC1);
                 self.fraw_store(rd, DST);
                 self.set_fboxed(rd, false);
+            }
+            // fsgnj.s reads both operands with the NaN-box rule (`fsrc` substitutes the
+            // canonical NaN) and injects the sign with a masked `bit`, which is exact -
+            // the host's scalar sign ops would flatten a NaN payload to the default NaN.
+            Inst::FSgnj { kind, width: FWidth::S, rd, rs1, rs2 } => {
+                let a = self.fsrc(FWidth::S, rs1, FA);
+                let b = self.fsrc(FWidth::S, rs2, FB);
+                self.a.vec_movi_sign(FC);
+                let d = self.fdest(FWidth::S, rd);
+                match kind {
+                    SgnjKind::Sgnj => {
+                        self.a.fmov_d(d, a);
+                        self.a.vec_bit(d, b, FC);
+                        self.fcommit(FWidth::S, rd, d);
+                    }
+                    SgnjKind::Sgnjn => {
+                        self.a.vec_eor(FB, b, FC);
+                        self.a.fmov_d(d, a);
+                        self.a.vec_bit(d, FB, FC);
+                        self.fcommit(FWidth::S, rd, d);
+                    }
+                    SgnjKind::Sgnjx => {
+                        // magnitude(a) with sign(a) ^ sign(b) is `a ^ (b & m)`: only the
+                        // sign bit differs from a, exactly where b's sign is set. `a` may
+                        // live in a pinned register (or FA, when it needed the boxing
+                        // check), so the xor goes into FA.
+                        self.a.vec_and(d, b, FC);
+                        self.a.vec_eor(FA, a, d);
+                        self.fcommit(FWidth::S, rd, FA);
+                    }
+                }
             }
             Inst::Lr { width, rd, rs1, .. } => {
                 let base = self.src(rs1, SRC0);

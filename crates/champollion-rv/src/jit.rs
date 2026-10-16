@@ -830,6 +830,51 @@ mod tests {
     }
 
     #[test]
+    fn fsgnj_single_matches_the_interpreter() {
+        // Sign injection reads both operands with the NaN-box rule, and a double read
+        // as a single produces the canonical NaN whose sign is then injected; the
+        // payload of a boxed NaN must survive untouched.
+        let prog = [
+            fload(0b010, 0, 11, 0),               // flw ft0, 0(a1): 1.5
+            fload(0b010, 1, 11, 4),               // flw ft1, 4(a1): -2.25
+            op_fp(0b00100, 0b00, 0b000, 2, 0, 1), // fsgnj.s ft2, ft0, ft1: -1.5
+            op_fp(0b00100, 0b00, 0b001, 3, 0, 1), // fsgnjn.s ft3: 1.5
+            op_fp(0b00100, 0b00, 0b010, 4, 0, 1), // fsgnjx.s ft4: -1.5
+            fload(0b011, 5, 11, 8), // fld ft5, 8(a1): a raw double, not a boxed single
+            op_fp(0b00100, 0b00, 0b000, 6, 5, 1), // fsgnj.s ft6, ft5, ft1: canonical NaN in
+            op_fp(0b00100, 0b00, 0b010, 7, 6, 1), // fsgnjx.s ft7, ft6, ft1: signs xor to +
+            ECALL,
+        ];
+        let setup_data = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &1.5f32.to_bits().to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 4, &(-2.25f32).to_bits().to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 8, &1.0f64.to_bits().to_le_bytes()).unwrap();
+        };
+        let mem_i = setup(&prog);
+        setup_data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        setup_data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "whole state");
+        assert_eq!(cpu.f[2], 0xffff_ffff_bfc0_0000); // -1.5, boxed
+        assert_eq!(cpu.f[3], 0xffff_ffff_3fc0_0000); // +1.5, boxed
+        assert_eq!(cpu.f[4], 0xffff_ffff_bfc0_0000); // -1.5, boxed
+        assert_eq!(cpu.f[6], 0xffff_ffff_ffc0_0000); // canonical NaN, sign from ft1
+        assert_eq!(cpu.f[7], 0xffff_ffff_7fc0_0000); // and exclusive-or takes it back to +
+        assert_eq!(cpu, oracle, "whole state");
+    }
+
+    #[test]
     fn faults_are_precise() {
         // Pinned (a0, s0) and unpinned (t0) registers written before the fault must be
         // visible; the instruction after the fault must not run; instret counts 3.

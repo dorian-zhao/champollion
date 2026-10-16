@@ -955,6 +955,15 @@ impl Asm {
     pub fn vec_eor(&mut self, rd: Reg, rn: Reg, rm: Reg) {
         self.emit(0x6e20_1c00 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
     }
+    /// `bit vd.16b, vn.16b, vm.16b`: where `vm` is set, take `vn`'s bits; elsewhere keep
+    /// `vd`. With the sign mask in `vm` this injects a sign exactly, payload untouched.
+    pub fn vec_bit(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x6ea0_1c00 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `movi vd.4s, #0x80, lsl #24`: the sign bit set in every 32-bit lane.
+    pub fn vec_movi_sign(&mut self, rd: Reg) {
+        self.emit(0x4f04_6400 | rd as u32);
+    }
     /// `dup v, wn`: broadcast the low `bytes` bytes of `rn` (a W register for 1/2/4,
     /// an X register for 8) to every lane.
     pub fn vec_dup(&mut self, rd: Reg, rn: Reg, bytes: u32) {
