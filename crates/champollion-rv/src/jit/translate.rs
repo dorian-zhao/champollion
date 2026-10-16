@@ -2046,6 +2046,59 @@ fn mem_base(inst: Inst) -> Option<u8> {
     }
 }
 
+/// The `f` registers an instruction reads as *singles*, where the boxing rule matters
+/// (raw readers like `fmv.x.s` and single stores never need it). Empty if the JIT does
+/// not translate the instruction.
+fn f_single_reads(inst: Inst) -> [Option<u8>; 3] {
+    match inst {
+        Inst::FArith { width: FWidth::S, rs1, rs2, rm: RM_DYN, .. } => [Some(rs1), Some(rs2), None],
+        Inst::FSqrt { width: FWidth::S, rs1, rm: RM_DYN, .. } => [Some(rs1), None, None],
+        Inst::FFma { width: FWidth::S, rs1, rs2, rs3, rm: RM_DYN, .. } => {
+            [Some(rs1), Some(rs2), Some(rs3)]
+        }
+        Inst::FCmp { width: FWidth::S, rs1, rs2, .. } => [Some(rs1), Some(rs2), None],
+        // fcvt.d.s reads its single source with the boxing rule; both int conversions too.
+        Inst::FCvtFloat { to: FWidth::D, rs1, .. } => [Some(rs1), None, None],
+        Inst::FCvtToInt { from: FWidth::S, rs1, rm, .. } if rm != RM_DYN => [Some(rs1), None, None],
+        _ => [None; 3],
+    }
+}
+
+/// The `f` register an instruction writes, if any (any width: a write ends the entry
+/// assumption for later reads).
+fn f_write(inst: Inst) -> Option<u8> {
+    match inst {
+        Inst::FLoad { rd, .. }
+        | Inst::FMvFromInt { rd, .. }
+        | Inst::FArith { rd, .. }
+        | Inst::FSqrt { rd, .. }
+        | Inst::FFma { rd, .. }
+        | Inst::FSgnj { rd, .. }
+        | Inst::FCvtFloat { rd, .. }
+        | Inst::FCvtFromInt { rd, .. } => Some(rd),
+        _ => None,
+    }
+}
+
+/// The f registers `block` reads as singles before writing them, up to two (the guard
+/// costs a few instructions each). Their boxing is assumed at entry and checked by the
+/// translation's head guard.
+fn scan_fboxed_reads(block: &[(Inst, u8)]) -> u32 {
+    let mut assumed = 0u32;
+    let mut written = 0u32;
+    for &(inst, _) in block {
+        for r in f_single_reads(inst).into_iter().flatten() {
+            if written >> r & 1 == 0 && assumed.count_ones() < 2 {
+                assumed |= 1 << r;
+            }
+        }
+        if let Some(w) = f_write(inst) {
+            written |= 1 << w;
+        }
+    }
+    assumed
+}
+
 /// The vector configuration `(sew log2, element bytes)` a translation may assume for
 /// `(vtype, vl)`: m1 with no `vill`, a supported element width, and `vl` at its maximum
 /// (VLEN = 128 bits, one NEON register). Anything else must interpret.
@@ -2243,6 +2296,24 @@ pub fn translate(
         tx.a.orr(SRC0, SRC0, SRC1);
         let to_tail = tx.a.pos();
         tx.a.cbnz(SRC0, to_tail); // patched to the interpret tail by emit_tails
+        tx.tails.push((to_tail, Tail::Interpret { pc, retired_before: 0 }));
+    }
+
+    // Boxing entry guards: a register the block reads as a single before writing it is
+    // assumed boxed - the loop-invariant float a compiler keeps in a register - and
+    // checked once here instead of canonical-NaN-fixed at every use. A register that
+    // is not boxed falls back to the interpreter for this pc, which is always correct.
+    let assumed_fboxed = scan_fboxed_reads(block);
+    tx.fboxed = assumed_fboxed;
+    for r in 0..32u8 {
+        if assumed_fboxed >> r & 1 == 0 {
+            continue;
+        }
+        tx.fraw_load(r, SRC0);
+        tx.a.lsr_imm(SRC1, SRC0, 32);
+        tx.a.cmn_imm_w(SRC1, 1); // Z set when the upper half is all ones
+        let to_tail = tx.a.pos();
+        tx.a.b_cond(Cond::Ne, to_tail); // patched by emit_tails
         tx.tails.push((to_tail, Tail::Interpret { pc, retired_before: 0 }));
     }
 

@@ -63,6 +63,10 @@ pub struct Jit {
     /// translates), and re-decoding them each time dominated the dispatcher. Cleared
     /// with the translations.
     refused: HashMap<u64, (u64, u64), BuildHasherDefault<PcHasher>>,
+    /// Instructions the interpreter fallback runs per batch: starts small so refusals
+    /// in hot code hand back to the JIT quickly, grows while the dispatcher keeps
+    /// landing inside untranslatable stretches, and resets on a translated hit.
+    batch: u64,
     /// `GuestMemory::code_generation` the translations are valid for.
     generation: u64,
     /// Instruction fetch for translation, valid for `GuestMemory::generation` `tlb_generation`.
@@ -190,6 +194,7 @@ impl Jit {
             pristine: true,
             interrupt_slot: 0,
             identity: false,
+            batch: 32,
             stats: Stats::default(),
             profiler: None,
         };
@@ -358,9 +363,9 @@ impl Jit {
         cpu: &mut CpuState,
         engine: &mut crate::engine::Engine,
         mem: &GuestMemory,
+        batch: u64,
     ) -> Option<Trap> {
-        const BATCH: u64 = 1024;
-        engine.run(cpu, mem, BATCH).0
+        engine.run(cpu, mem, batch).0
     }
 
     /// Like [`Jit::run`], but return `None` when generated code sees the interrupt flag set
@@ -388,13 +393,21 @@ impl Jit {
             }
             let at = match self.lookup(cpu.pc, mem, (cpu.vtype, cpu.vl)) {
                 Ok(Some(at)) => {
+                    // Generated code again: drop back to short interpreter stretches,
+                    // so a refusal inside hot code hands back to the JIT quickly.
+                    self.batch = 32;
                     // Let generated indirect jumps find this block without us next time.
                     self.jump_cache()[translate::jump_cache_index(cpu.pc)] =
                         [cpu.pc, self.code.ptr(at) as u64];
                     at
                 }
                 Ok(None) => {
-                    if let Some(trap) = self.fallback(cpu, engine, mem) {
+                    // A stretch of untranslatable code: stay in the interpreter longer,
+                    // growing while the dispatcher keeps landing back inside it (the
+                    // memcpy loops of vectorized code); any translated hit resets.
+                    let batch = self.batch;
+                    self.batch = (batch * 4).min(4096);
+                    if let Some(trap) = self.fallback(cpu, engine, mem, batch) {
                         return Some(trap);
                     }
                     continue;
@@ -434,7 +447,9 @@ impl Jit {
                     {
                         *self.stats.interpreted.entry(kind(&block[0].0)).or_default() += 1;
                     }
-                    if let Some(trap) = self.fallback(cpu, engine, mem) {
+                    let batch = self.batch;
+                    self.batch = (batch * 4).min(4096);
+                    if let Some(trap) = self.fallback(cpu, engine, mem, batch) {
                         return Some(trap);
                     }
                 }
@@ -704,6 +719,63 @@ mod tests {
         let mut unit = [0u8; 4];
         mem_j.read_privileged(DATA + 128, &mut unit).unwrap();
         assert_eq!(f32::from_le_bytes(unit), 1.0, "unit-stride group load");
+    }
+
+    #[test]
+    fn fboxed_entry_guard_matches_the_interpreter() {
+        // A loop that reads a single a *previous* block loaded: the translation assumes
+        // it boxed, checks that once at the loop head, and skips the per-use canonical-
+        // NaN fixup. With a plain double in the register the guard must fall back to
+        // the interpreter and still agree exactly.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        for (load_f3, data) in [(0b010u32, 0xffff_ffff_3fc0_0000u64), (0b011, 1.5f64.to_bits())] {
+            let prog = [
+                fload(load_f3, 1, 11, 0),         // flw/fld ft1, 0(a1)
+                vsetivli(0, 4, 0xd0),             // e32, m1
+                addi(5, 0, 3),                    // t0 = 3
+                op_fp(0b00000, 0b00, 7, 0, 1, 0), // fadd.s ft0, ft1, ft0
+                addi(5, 5, -1),
+                beq(5, 0, -8),           // bnez t0 -> the fadd
+                fstore(0b010, 12, 0, 0), // fsw ft0, 0(a2)
+            ];
+            let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data.to_le_bytes()).unwrap();
+            let init = |cpu: &mut CpuState| {
+                for (r, v) in [(11u8, DATA), (12, DATA + 16)] {
+                    cpu.set_x(r, v);
+                }
+            };
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            init(&mut oracle);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            init(&mut cpu);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want, "load f3={load_f3:#05b}");
+            assert_eq!(cpu, oracle, "load f3={load_f3:#05b}");
+            if load_f3 == 0b010 {
+                assert_eq!(
+                    jit.stats.interpreted.get("FArith"),
+                    None,
+                    "the boxed loop should stay in the JIT"
+                );
+            }
+            let mut out = [0u8; 4];
+            mem_j.read_privileged(DATA + 16, &mut out).unwrap();
+            let mut want_out = [0u8; 4];
+            mem_i.read_privileged(DATA + 16, &mut want_out).unwrap();
+            assert_eq!(out, want_out, "stored value");
+        }
     }
 
     #[test]
