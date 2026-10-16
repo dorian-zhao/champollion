@@ -218,3 +218,22 @@ dup v24.2d, x4
 cmeq v3.16b, v4.16b, v5.16b
 movi v5.16b, #1
 ext v2.16b, v0.16b, v0.16b, #8
+ushr v0.16b, v1.16b, #3
+ushr v2.8h, v3.8h, #5
+ushr v4.4s, v5.4s, #7
+ushr v6.2d, v7.2d, #9
+sshr v8.16b, v9.16b, #3
+sshr v10.8h, v11.8h, #5
+sshr v12.4s, v13.4s, #7
+sshr v14.2d, v15.2d, #9
+ushl v16.16b, v17.16b, v18.16b
+ushl v19.8h, v20.8h, v21.8h
+ushl v22.4s, v23.4s, v24.4s
+ushl v25.2d, v26.2d, v27.2d
+sshl v0.16b, v1.16b, v2.16b
+sshl v3.8h, v4.8h, v5.8h
+sshl v6.4s, v7.4s, v8.4s
+sshl v9.2d, v10.2d, v11.2d
+mul v12.16b, v13.16b, v14.16b
+mul v15.8h, v16.8h, v17.8h
+mul v18.4s, v19.4s, v20.4s

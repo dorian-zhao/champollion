@@ -1346,29 +1346,89 @@ impl Tx {
         if mask {
             return false;
         }
+        let bits = bytes * 8;
         // Decide before emitting anything that guest state depends on.
         let supported = matches!(
             op,
-            VArithOp::Add | VArithOp::Rsub | VArithOp::And | VArithOp::Or | VArithOp::Xor
+            VArithOp::Add
+                | VArithOp::Rsub
+                | VArithOp::Sub
+                | VArithOp::And
+                | VArithOp::Or
+                | VArithOp::Xor
+                | VArithOp::Mul
+                | VArithOp::Srl
+                | VArithOp::Sra
         );
         if !supported {
             return false;
         }
+        if op == VArithOp::Mul && bits == 64 {
+            return false; // NEON's MUL tops out at 4s
+        }
         self.v_addr(vs2);
         self.a.ldr_q(FA, ADDR);
-        if !self.vector_operand(src, FB, bytes) {
-            return false; // only scratch (FA) was touched
-        }
-        match op {
-            VArithOp::Add => self.a.vec_add(bytes * 8, FA, FA, FB),
-            VArithOp::Rsub => self.a.vec_sub(bytes * 8, FA, FB, FA),
-            VArithOp::And => self.a.vec_and(FA, FA, FB),
-            VArithOp::Or => self.a.vec_orr(FA, FA, FB),
-            _ => self.a.vec_eor(FA, FA, FB),
+        match (op, src) {
+            // Shifts want the immediate zero-extended and the scalar masked to
+            // log2(SEW) bits, neither of which `vector_operand` does.
+            (VArithOp::Srl | VArithOp::Sra, VSel::I(imm)) => {
+                let k = u32::from(imm) & (bits - 1);
+                if k > 0 {
+                    if op == VArithOp::Srl {
+                        self.a.vec_ushr_imm(bits, FA, FA, k);
+                    } else {
+                        self.a.vec_sshr_imm(bits, FA, FA, k);
+                    }
+                }
+            }
+            // NEON's USHL/SSHL take a *signed* byte per lane: a negative amount
+            // shifts right (SSHL sign-fills), so the masked amount is negated and
+            // broadcast. RVV's `.vx` shift amount is the scalar modulo SEW.
+            (VArithOp::Srl | VArithOp::Sra, VSel::X(r)) => {
+                let x = self.src(r, SRC0);
+                self.a.mov_imm(SRC1, u64::from(bits - 1));
+                self.a.and(SRC1, x, SRC1);
+                self.a.sub(SRC1, XZR, SRC1);
+                self.a.vec_dup(FB, SRC1, bytes);
+                self.vector_shift(op, bits);
+            }
+            (VArithOp::Srl | VArithOp::Sra, VSel::V(vs1)) => {
+                self.v_addr(vs1);
+                self.a.ldr_q(FB, ADDR);
+                self.a.mov_imm(SRC0, u64::from(bits - 1));
+                self.a.vec_dup(FC, SRC0, bytes);
+                self.a.vec_and(FB, FB, FC);
+                self.a.vec_dup(FC, XZR, bytes);
+                self.a.vec_sub(bits, FB, FC, FB);
+                self.vector_shift(op, bits);
+            }
+            _ => {
+                if !self.vector_operand(src, FB, bytes) {
+                    return false; // only scratch (FA) was touched
+                }
+                match op {
+                    VArithOp::Add => self.a.vec_add(bits, FA, FA, FB),
+                    VArithOp::Sub => self.a.vec_sub(bits, FA, FA, FB),
+                    VArithOp::Rsub => self.a.vec_sub(bits, FA, FB, FA),
+                    VArithOp::And => self.a.vec_and(FA, FA, FB),
+                    VArithOp::Or => self.a.vec_orr(FA, FA, FB),
+                    VArithOp::Mul => self.a.vec_mul(bits, FA, FA, FB),
+                    _ => self.a.vec_eor(FA, FA, FB),
+                }
+            }
         }
         self.v_addr(vd);
         self.a.str_q(FA, ADDR);
         true
+    }
+
+    /// The right shift for a prepared per-lane amount in `FB`.
+    fn vector_shift(&mut self, op: VArithOp, bits: u32) {
+        if op == VArithOp::Srl {
+            self.a.vec_ushl(bits, FA, FA, FB);
+        } else {
+            self.a.vec_sshl(bits, FA, FA, FB);
+        }
     }
 
     /// `vmv.v.*`: the whole register becomes the broadcast of the source.

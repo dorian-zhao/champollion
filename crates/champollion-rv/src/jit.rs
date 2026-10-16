@@ -895,6 +895,198 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vector_shift_sub_mul_match_the_interpreter() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle =
+            |wf3: u32, vd: u32, rs1: u32| (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |wf3: u32, vs3: u32, rs1: u32| {
+            (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vx = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (rs1 << 15) | (0b100 << 12) | (vd << 7) | 0x57
+        };
+        let vi = |f6: u32, vd: u32, vs2: u32, imm: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (imm << 15) | (0b011 << 12) | (vd << 7) | 0x57
+        };
+        let mvv = |vd: u32, vs2: u32, vs1: u32| {
+            (0b100101 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (vs1 << 15)
+                | (0b010 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let mvx = |vd: u32, vs2: u32, rs1: u32| {
+            (0b100101 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (rs1 << 15)
+                | (0b110 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+
+        // e8: every lane active; the amounts cover the log2(SEW) masking (8..15 wrap
+        // to 0..7) and the scalar 9 wraps to 1. v1 and v2 are the two inputs, the
+        // seven results go to a3 upward in 16-byte slats.
+        let data = |mem: &GuestMemory| {
+            mem.write_privileged(
+                DATA,
+                &[
+                    0xff, 0x80, 0x7f, 0x01, 0xfe, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+                    0x90, 0xa0, 0xb0,
+                ],
+            )
+            .unwrap();
+            mem.write_privileged(
+                DATA + 16,
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            )
+            .unwrap();
+        };
+        let prog = [
+            vsetivli(0, 16, 0xc0), // e8, m1, ta, ma
+            vle(0b000, 1, 11),
+            vle(0b000, 2, 12),
+            vi(0b101000, 3, 1, 3),  // vsrl.vi v3, v1, 3
+            vx(0b101001, 4, 1, 14), // vsra.vx v4, v1, a4 (9 wraps to 1)
+            vv(0b101000, 5, 1, 2),  // vsrl.vv v5, v1, v2
+            vv(0b101001, 6, 1, 2),  // vsra.vv v6, v1, v2
+            vv(0b000010, 7, 1, 2),  // vsub.vv v7, v1, v2
+            mvv(8, 1, 2),           // vmul.vv v8, v1, v2
+            mvx(9, 1, 15),          // vmul.vx v9, v1, a5 (= 3)
+            vse(0b000, 3, 13),
+            addi(13, 13, 16),
+            vse(0b000, 4, 13),
+            addi(13, 13, 16),
+            vse(0b000, 5, 13),
+            addi(13, 13, 16),
+            vse(0b000, 6, 13),
+            addi(13, 13, 16),
+            vse(0b000, 7, 13),
+            addi(13, 13, 16),
+            vse(0b000, 8, 13),
+            addi(13, 13, 16),
+            vse(0b000, 9, 13),
+            ECALL,
+        ];
+        let want_rows: [[u8; 16]; 7] = [
+            [
+                0x1f, 0x10, 0x0f, 0x00, 0x1f, 0x02, 0x04, 0x06, 0x08, 0x0a, 0x0c, 0x0e, 0x10, 0x12,
+                0x14, 0x16,
+            ],
+            [
+                0xff, 0xc0, 0x3f, 0x00, 0xff, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0xc0, 0xc8,
+                0xd0, 0xd8,
+            ],
+            [
+                0xff, 0x40, 0x1f, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x40, 0x28, 0x18, 0x0e, 0x08, 0x04,
+                0x02, 0x01,
+            ],
+            [
+                0xff, 0xc0, 0x1f, 0x00, 0xff, 0x00, 0x00, 0x00, 0x40, 0x28, 0x18, 0x0e, 0xf8, 0xfc,
+                0xfe, 0xff,
+            ],
+            [
+                0xff, 0x7f, 0x7d, 0xfe, 0xfa, 0x0b, 0x1a, 0x29, 0x38, 0x47, 0x56, 0x65, 0x74, 0x83,
+                0x92, 0xa1,
+            ],
+            [
+                0x00, 0x80, 0xfe, 0x03, 0xf8, 0x50, 0xc0, 0x50, 0x00, 0xd0, 0xc0, 0xd0, 0x00, 0x50,
+                0xc0, 0x50,
+            ],
+            [
+                0xfd, 0x80, 0x7d, 0x03, 0xfa, 0x30, 0x60, 0x90, 0xc0, 0xf0, 0x20, 0x50, 0x80, 0xb0,
+                0xe0, 0x10,
+            ],
+        ];
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 48), (14, 9), (15, 3)] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem_i = setup(&prog);
+        data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want, "e8: trap");
+        assert_eq!(cpu, oracle, "e8: state");
+        assert_eq!(
+            jit.stats.interpreted.get("VArith"),
+            None,
+            "e8: every arithmetic op should stay in the JIT"
+        );
+        for (row, want) in want_rows.iter().enumerate() {
+            let mut b = [0u8; 16];
+            mem_j.read_privileged(DATA + 48 + 16 * row as u64, &mut b).unwrap();
+            assert_eq!(&b, want, "e8: row {row}");
+        }
+
+        // e64 exercises the 2d forms: one logical and one arithmetic shift.
+        let prog64 = [
+            vsetivli(0, 2, 0xd8), // e64, m1, ta, ma
+            vle(0b111, 1, 11),
+            vx(0b101000, 2, 1, 14), // vsrl.vx v2, v1, a4 (65 wraps to 1)
+            vi(0b101001, 3, 1, 5),  // vsra.vi v3, v1, 5
+            vse(0b111, 2, 13),
+            addi(13, 13, 16),
+            vse(0b111, 3, 13),
+            ECALL,
+        ];
+        let data64 = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &u64::MAX.to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 8, &(1u64 << 63).to_le_bytes()).unwrap();
+        };
+        let init64 = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (13, DATA + 48), (14, 65)] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem_i = setup(&prog64);
+        data64(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init64(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog64);
+        data64(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init64(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want, "e64: trap");
+        assert_eq!(cpu, oracle, "e64: state");
+        assert_eq!(jit.stats.interpreted.get("VArith"), None, "e64: in the JIT");
+        let mut b = [0u8; 16];
+        mem_j.read_privileged(DATA + 48, &mut b).unwrap();
+        assert_eq!(u64::from_le_bytes(b[..8].try_into().unwrap()), 0x7fff_ffff_ffff_ffff);
+        assert_eq!(u64::from_le_bytes(b[8..].try_into().unwrap()), 1u64 << 62);
+        mem_j.read_privileged(DATA + 64, &mut b).unwrap();
+        assert_eq!(u64::from_le_bytes(b[..8].try_into().unwrap()), u64::MAX);
+        assert_eq!(u64::from_le_bytes(b[8..].try_into().unwrap()), 0xfc00_0000_0000_0000);
+    }
+
     /// A loop whose head is a `vsetivli`: the whole body translates as one block (the
     /// constant vset is emitted inline), and the engines must agree after every trip.
     #[test]

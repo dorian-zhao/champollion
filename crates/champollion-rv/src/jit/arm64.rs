@@ -960,6 +960,34 @@ impl Asm {
     pub fn vec_dup(&mut self, rd: Reg, rn: Reg, bytes: u32) {
         self.emit(0x4e00_0c00 | bytes << 16 | (rn as u32) << 5 | rd as u32);
     }
+    /// `ushr v.16b/8h/4s/2d, vn, #imm`: shift each element right by an immediate,
+    /// zero fill. Bits 22:16 hold `2*size - imm`.
+    pub fn vec_ushr_imm(&mut self, size: u32, rd: Reg, rn: Reg, imm: u32) {
+        self.emit(0x6f00_0400 | (2 * size - imm) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `sshr`: the sign-filling counterpart of `vec_ushr_imm`.
+    pub fn vec_sshr_imm(&mut self, size: u32, rd: Reg, rn: Reg, imm: u32) {
+        self.emit(0x4f00_0400 | (2 * size - imm) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `ushl vd, vn, vm`: per-element shift; the amount is a signed byte, so a
+    /// negative one shifts right and zero-fills.
+    pub fn vec_ushl(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x6e20_4400 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// `sshl`: as `vec_ushl`, but a right shift sign-fills.
+    pub fn vec_sshl(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x4e20_4400 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// `mul vd.16b/8h/4s, ...`: the low half of each product. There is no 64-bit form.
+    pub fn vec_mul(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x4e20_9c00 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
     /// `cmn wn, #imm` (sets flags for wn + imm).
     pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
         self.imm12(0x3100_0000, XZR, rn, imm);
