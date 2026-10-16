@@ -988,6 +988,11 @@ impl Asm {
             0x4e20_9c00 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
         );
     }
+    /// `ins vd.s[0], vn.s[0]`: write lane 0 only. Unlike a scalar FP op, an element
+    /// insert leaves the other bits alone — the NaN box above the single survives.
+    pub fn vec_ins_s0(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x6e04_0400 | (rn as u32) << 5 | rd as u32);
+    }
     /// `cmn wn, #imm` (sets flags for wn + imm).
     pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
         self.imm12(0x3100_0000, XZR, rn, imm);

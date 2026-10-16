@@ -253,6 +253,7 @@ fn matches_assembler() {
     a.vec_mul(8, 12, 13, 14);
     a.vec_mul(16, 15, 16, 17);
     a.vec_mul(32, 18, 19, 20);
+    a.vec_ins_s0(14, 19);
     let len = a.code.len();
     assert!(!a.ldr_imm(Mem::U64, 0, 17, 32768));
     assert!(!a.str_imm(Mem::U8, 0, 17, -257));

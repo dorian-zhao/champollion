@@ -530,6 +530,57 @@ mod tests {
     }
 
     #[test]
+    fn f32_boxing_elision_matches_the_interpreter() {
+        // The known-boxed fast path must agree with the interpreter's per-operand
+        // canonical-NaN rule in both directions: a single this block boxed itself
+        // skips the check, a double read as a single and a raw half still take it.
+        let prog = [
+            fload(0b010, 0, 11, 0),           // flw ft0, 0(a1): -Inf
+            fload(0b010, 1, 11, 4),           // flw ft1, 4(a1): 3.0
+            op_fp(0b00010, 0b00, 7, 1, 1, 0), // fmul.s ft1, ft1, ft0: a boxed chain
+            fload(0b011, 2, 11, 8),           // fld ft2, 8(a1): a double, not a boxed single
+            op_fp(0b00000, 0b00, 7, 3, 2, 1), // fadd.s ft3, ft2, ft1: reads canonical NaN
+            op_fp(0b00000, 0b01, 7, 4, 2, 3), // fadd.d ft4, ft2, ft3: raw doubles
+            op_fp(0b11010, 0b00, 7, 5, 0, 0), // fcvt.s.w ft5, zero: +0.0, boxed
+            op_fp(0b00010, 0b00, 7, 6, 5, 1), // fmul.s ft6, ft5, ft1: 0 * -Inf raises NV
+            ECALL,
+        ];
+        let setup_data = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &(-f32::INFINITY).to_bits().to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 4, &3.0f32.to_bits().to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 8, &1.0f64.to_bits().to_le_bytes()).unwrap();
+        };
+        let mem_i = setup(&prog);
+        setup_data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        setup_data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(
+            cpu.f[0..7],
+            [
+                0xffff_ffff_ff80_0000, // -Inf, boxed
+                0xffff_ffff_ff80_0000, // 3 * -Inf
+                1.0f64.to_bits(),      // the double as stored
+                0xffff_ffff_7fc0_0000, // canonical NaN: the double is not a boxed single
+                f64::NAN.to_bits(),    // and as a double operand it stays canonical
+                0xffff_ffff_0000_0000, // +0.0, boxed
+                0xffff_ffff_7fc0_0000, // 0 * -Inf, canonical NaN, NV
+            ]
+        );
+        assert_eq!(cpu, oracle, "whole state");
+    }
+
+    #[test]
     fn faults_are_precise() {
         // Pinned (a0, s0) and unpinned (t0) registers written before the fault must be
         // visible; the instruction after the fault must not run; instret counts 3.

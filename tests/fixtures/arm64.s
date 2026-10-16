@@ -237,3 +237,4 @@ sshl v9.2d, v10.2d, v11.2d
 mul v12.16b, v13.16b, v14.16b
 mul v15.8h, v16.8h, v17.8h
 mul v18.4s, v19.4s, v20.4s
+ins v14.s[0], v19.s[0]

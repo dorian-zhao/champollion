@@ -59,7 +59,8 @@ fn run_test(path: &Path) -> Result<(), String> {
     check_exit("jit", &cpu, (Some(trap), cpu.instret))?;
     if cpu != oracle {
         return Err(format!(
-            "jit diverged from the interpreter\njit:\n{cpu:?}\ninterpreter:\n{oracle:?}"
+            "jit diverged from the interpreter\njit:\n{cpu:?}\ninterpreter:\n{oracle:?}\njit f: {:016x?}\noracle f: {:016x?}",
+            cpu.f, oracle.f
         ));
     }
     Ok(())

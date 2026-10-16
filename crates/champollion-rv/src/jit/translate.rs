@@ -250,6 +250,11 @@ struct Tx {
     /// it translates vector instructions: the block's entry guard requires the guest to
     /// still be in exactly this configuration (vl == vlmax, m1) or it interprets instead.
     vec: Option<(u32, u32)>,
+    /// Bit `r` set: f[r] is known to hold a properly NaN-boxed single at this point of
+    /// the block. The block's straight-line shape makes this exact: an `S` result boxes
+    /// and a `D` result clears it, so the canonical-NaN check can be skipped for singles
+    /// the block itself produced.
+    fboxed: u32,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -493,6 +498,7 @@ impl Tx {
                         self.fraw_store(rd, DST);
                     }
                 }
+                self.set_fboxed(rd, width == FWidth::S);
             }
             Inst::FStore { width, rs1, rs2, offset } => {
                 let size = fp(width);
@@ -576,6 +582,7 @@ impl Tx {
                     self.a.orr_imm(DST, v, NAN_BOX).unwrap();
                     self.fraw_store(rd, DST);
                 }
+                self.set_fboxed(rd, width == FWidth::S);
             }
             Inst::FMvToInt { width, rd, rs1 } => {
                 if rd != 0 {
@@ -616,6 +623,7 @@ impl Tx {
                 self.a.and_imm(SRC0, SRC0, !SIGN64).unwrap();
                 self.a.orr(DST, SRC0, SRC1);
                 self.fraw_store(rd, DST);
+                self.set_fboxed(rd, false);
             }
             Inst::Lr { width, rd, rs1, .. } => {
                 let base = self.src(rs1, SRC0);
@@ -786,8 +794,18 @@ impl Tx {
 
     /// Host v-register holding `f[r]` as an operand of width `w`, loading it into `scratch`
     /// if needed. Singles must be properly NaN-boxed; anything else reads as the canonical
-    /// NaN, as the spec requires, so singles always go through the check.
+    /// NaN, as the spec requires, so singles go through the check unless this block is
+    /// the one that boxed the value (see `Tx::fboxed`).
     fn fsrc(&mut self, w: FWidth, r: u8, scratch: Reg) -> Reg {
+        if w == FWidth::S && self.fboxed(r) {
+            return match FHOST_REG[r as usize] {
+                Some(h) => h,
+                None => {
+                    self.a.ldr_fp(Fp::D, scratch, CTX, f_offset(r));
+                    scratch
+                }
+            };
+        }
         match (w, FHOST_REG[r as usize]) {
             (FWidth::D, Some(h)) => h,
             (FWidth::D, None) => {
@@ -798,8 +816,11 @@ impl Tx {
                 self.fraw_load(r, SRC0);
                 self.a.lsr_imm(SRC1, SRC0, 32);
                 self.a.cmn_imm_w(SRC1, 1); // upper half == 0xffffffff?
-                self.a.mov_imm(ADDR, 0x7fc0_0000);
-                self.a.csel(SRC0, SRC0, ADDR, Cond::Eq);
+                // SRC1, not ADDR: the checked path must not disturb the cached base in
+                // ADDR (see `keeps_addr`), or an FP operand would drop an address a
+                // later access could still reuse.
+                self.a.mov_imm(SRC1, 0x7fc0_0000);
+                self.a.csel(SRC0, SRC0, SRC1, Cond::Eq);
                 self.a.fmov_from_gpr(Fp::S, scratch, SRC0);
                 scratch
             }
@@ -820,11 +841,29 @@ impl Tx {
         match (w, FHOST_REG[r as usize]) {
             (FWidth::D, Some(_)) => {}
             (FWidth::D, None) => self.a.str_fp(Fp::D, v, CTX, f_offset(r)),
+            // A register this block already boxed only needs lane 0 updated: a scalar
+            // op would zero bits 63:32 (taking the box with it), an element insert
+            // leaves them alone.
+            (FWidth::S, Some(h)) if self.fboxed(r) => self.a.vec_ins_s0(h, v),
             (FWidth::S, _) => {
                 self.a.fmov_to_gpr(Fp::S, SRC0, v);
                 self.a.orr_imm(SRC0, SRC0, NAN_BOX).unwrap();
                 self.fraw_store(r, SRC0);
             }
+        }
+        self.set_fboxed(r, w == FWidth::S);
+    }
+
+    /// Whether f[`r`] is known to hold a NaN-boxed single (see `Tx::fboxed`).
+    fn fboxed(&self, r: u8) -> bool {
+        self.fboxed >> r & 1 != 0
+    }
+
+    fn set_fboxed(&mut self, r: u8, boxed: bool) {
+        if boxed {
+            self.fboxed |= 1 << r;
+        } else {
+            self.fboxed &= !(1 << r);
         }
     }
 
@@ -1776,6 +1815,18 @@ fn keeps_addr(inst: Inst) -> bool {
             op,
             AluOp32::Div | AluOp32::Divu | AluOp32::Rem | AluOp32::Remu | AluOp32::Rol
         ),
+        // The FP arms never emit through ADDR: operands load into SRC0/SRC1 (the
+        // singles' canonical-NaN fixup included) and results commit through CTX.
+        Inst::FArith { .. }
+        | Inst::FSqrt { .. }
+        | Inst::FFma { .. }
+        | Inst::FCmp { .. }
+        | Inst::FCvtFloat { .. }
+        | Inst::FCvtToInt { .. }
+        | Inst::FCvtFromInt { .. }
+        | Inst::FMvFromInt { .. }
+        | Inst::FMvToInt { .. }
+        | Inst::FSgnj { .. } => true,
         _ => mem_base(inst).is_some(),
     }
 }
@@ -1867,6 +1918,7 @@ pub fn translate(
         interrupt_slot,
         identity,
         vec,
+        fboxed: 0,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
