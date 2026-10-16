@@ -445,7 +445,12 @@ impl Jit {
                     if self.stats.detailed
                         && let Ok(block) = decode_block(mem, cpu.pc, false)
                     {
-                        *self.stats.interpreted.entry(kind(&block[0].0)).or_default() += 1;
+                        let k = kind(&block[0].0);
+                        *self.stats.interpreted.entry(k).or_default() += 1;
+                        // One line per fallback: which instruction keeps leaving generated code.
+                        if std::env::var_os("RVRUN_DIAG_PC").is_some() {
+                            eprintln!("[interp] pc={:#x} kind={k}", cpu.pc);
+                        }
                     }
                     let batch = self.batch;
                     self.batch = (batch * 4).min(4096);
@@ -1575,6 +1580,91 @@ mod tests {
         assert_eq!(cpu, oracle);
         assert_eq!(cpu.x[5], 2, "t0 = vl = min(9, vlmax)");
         assert_eq!(cpu.x[14], 0, "three trips");
+    }
+
+    /// `vslidedown.vi` and `vfslide1down.vf` (the shapes the gelu's scalar expf calls
+    /// live around), against the interpreter: the aliased and zero-filled slides, and a
+    /// boxed and an unboxed scalar for the float form.
+    #[test]
+    fn vector_slides_match_the_interpreter() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle32 = |vd: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse32 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        // Encodings from the assembler: the down-slides have funct6 = 001111
+        // (vslidedown.vi funct3 = 011, vfslide1down.vf funct3 = 101); the up forms
+        // use 001110.
+        let vslidedown_vi = |vd: u32, vs2: u32, imm: u32| {
+            (0b001111 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (imm << 15)
+                | (0b011 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let vfslide1down_vf = |vd: u32, vs2: u32, rs1: u32| {
+            (0b001111 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (rs1 << 15)
+                | (0b101 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let prog = [
+            vsetivli(0, 4, 0xd0),    // e32, m1, ta, ma: vl = 4
+            vle32(8, 11),            // v8 = {1.0, 2.0, 3.0, 4.0}
+            vslidedown_vi(8, 8, 1),  // v8 = {2, 3, 4, 0}, aliased vd == vs2
+            vslidedown_vi(9, 8, 2),  // v9 = {4, 0, 0, 0}
+            vslidedown_vi(10, 8, 5), // v10 = {0, 0, 0, 0}: offset past VLMAX
+            addi(12, 11, 32),
+            vse32(8, 12),
+            addi(12, 11, 48),
+            vse32(9, 12),
+            addi(12, 11, 64),
+            vse32(10, 12),
+            fload(0b010, 0, 11, 16),   // flw ft0, 16(a1): 2.5, a boxed single
+            fload(0b011, 1, 11, 24),   // fld ft1, 24(a1): a raw double, not boxed
+            vfslide1down_vf(16, 9, 0), // v16 = {v9[1..4], 2.5} = {0, 0, 0, 2.5}
+            vfslide1down_vf(17, 9, 1), // v17 = {0, 0, 0, canonical NaN}
+            addi(12, 11, 80),
+            vse32(16, 12),
+            addi(12, 11, 96),
+            vse32(17, 12),
+            ECALL,
+        ];
+        let setup_data = |mem: &GuestMemory| {
+            for (i, v) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+                mem.write_privileged(DATA + 4 * i as u64, &v.to_bits().to_le_bytes()).unwrap();
+            }
+            mem.write_privileged(DATA + 16, &2.5f32.to_bits().to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 24, &1.0f64.to_bits().to_le_bytes()).unwrap();
+        };
+        let mem_i = setup(&prog);
+        setup_data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        setup_data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "whole state");
+        let elem = |reg: usize, lane: usize| {
+            u32::from_le_bytes(cpu.v[reg][4 * lane..4 * lane + 4].try_into().unwrap())
+        };
+        assert_eq!(elem(8, 0), 2.0f32.to_bits()); // the aliased slide's low element
+        assert_eq!(elem(16, 3), 2.5f32.to_bits()); // the inserted scalar
+        assert_eq!(elem(17, 3), 0x7fc0_0000); // canonical NaN: the double is not boxed
     }
 
     /// The glibc scanner shape: `vle8ff.v`, `vmsne.vi`, `vmor.mm`, `vfirst.m`, and

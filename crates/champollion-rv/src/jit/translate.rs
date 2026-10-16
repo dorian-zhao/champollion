@@ -599,6 +599,14 @@ impl Tx {
                     return false;
                 }
             }
+            // vfslide1down.vf: like the integer slide, dropping the float scalar into
+            // the freed top element. The up form stays on the interpreter until
+            // something needs it.
+            Inst::VFSlide1 { down: true, vd, vs2, rs1, mask: false } => {
+                if !self.vector_fslide1(vd, vs2, rs1) {
+                    return false;
+                }
+            }
             // The float-scalar moves; the general arms below only take integer sources.
             Inst::Vmv { vd, src: VSel::F(rs1) } => {
                 if !self.vector_fmv_vf(vd, rs1) {
@@ -1532,6 +1540,21 @@ impl Tx {
         if mask || self.vec_regs != 1 {
             return false;
         }
+        // vslidedown: elements move down by a constant, the top zero-filled. The guard
+        // pins vl to VLMAX, where the spec's "source read bounded by VLMAX" is just the
+        // register's own elements - one byte-extract against a zero register.
+        if let (VArithOp::SlideDown, VSel::I(imm)) = (op, src) {
+            let elems = 16 / bytes;
+            self.v_ldr(FA, vs2);
+            if u32::from(imm) >= elems {
+                self.a.vec_movi_zero(FA);
+            } else if imm > 0 {
+                self.a.vec_movi_zero(FB);
+                self.a.vec_ext(FA, FA, FB, u32::from(imm) * bytes);
+            }
+            self.v_str(FA, vd);
+            return true;
+        }
         let bits = bytes * 8;
         // Decide before emitting anything that guest state depends on.
         let supported = matches!(
@@ -1772,6 +1795,23 @@ impl Tx {
         }
         self.fraw_store(rd, SRC0);
         self.set_fboxed(rd, bytes == 4);
+        true
+    }
+
+    /// `vfslide1down.vf` under the pinned configuration: the elements move down one and
+    /// the float scalar (read with the NaN-box rule) drops into the freed top element.
+    fn vector_fslide1(&mut self, vd: u8, vs2: u8, rs1: u8) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if self.vec_regs != 1 || bytes < 4 {
+            return false;
+        }
+        self.v_ldr(FA, vs2);
+        self.a.vec_movi_zero(FB);
+        self.a.vec_ext(FA, FA, FB, bytes);
+        let s =
+            if bytes == 4 { self.fsrc(FWidth::S, rs1, FB) } else { self.fsrc(FWidth::D, rs1, FB) };
+        self.a.vec_ins_last(FA, s, bytes);
+        self.v_str(FA, vd);
         true
     }
 
@@ -2170,6 +2210,7 @@ fn is_vector(inst: Inst) -> bool {
         Inst::VLoad { .. }
             | Inst::VStore { .. }
             | Inst::VArith { .. }
+            | Inst::VFSlide1 { .. }
             | Inst::VCmp { .. }
             | Inst::VMask { .. }
             | Inst::Vmv { .. }

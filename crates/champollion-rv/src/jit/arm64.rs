@@ -964,6 +964,21 @@ impl Asm {
     pub fn vec_movi_sign(&mut self, rd: Reg) {
         self.emit(0x4f04_6400 | rd as u32);
     }
+    /// `movi vd.4s, #0`.
+    pub fn vec_movi_zero(&mut self, rd: Reg) {
+        self.emit(0x4f00_0400 | rd as u32);
+    }
+    /// `ext vd.16b, vn.16b, vm.16b, #imm`: the 32-byte concatenation `vn:vm` shifted
+    /// right by `imm` bytes (0..=15), taking its low 16.
+    pub fn vec_ext(&mut self, rd: Reg, rn: Reg, rm: Reg, imm: u32) {
+        assert!(imm < 16, "ext byte offset {imm}");
+        self.emit(0x6e00_0000 | (rm as u32) << 16 | imm << 11 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `ins vd.<T>[last], vn.<T>[0]`: the source's lane 0 into the top element.
+    pub fn vec_ins_last(&mut self, rd: Reg, rn: Reg, bytes: u32) {
+        assert!(matches!(bytes, 1 | 2 | 4 | 8), "element size {bytes}");
+        self.emit(0x6e00_0400 | (32 - bytes) << 16 | (rn as u32) << 5 | rd as u32);
+    }
     /// `dup v, wn`: broadcast the low `bytes` bytes of `rn` (a W register for 1/2/4,
     /// an X register for 8) to every lane.
     pub fn vec_dup(&mut self, rd: Reg, rn: Reg, bytes: u32) {
