@@ -172,6 +172,12 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             let v = cpu.f[rs1 as usize];
             cpu.set_x(rd, if width == FWidth::S { v as i32 as u64 } else { v });
         }
+        Inst::Fli { width, rd, imm } => {
+            cpu.f[rd as usize] = match width {
+                FWidth::S => nan_box(u64::from(FLI_S[imm as usize])),
+                FWidth::D => FLI_D[imm as usize],
+            };
+        }
         Inst::FMvFromInt { width, rd, rs1 } => {
             let v = cpu.x(rs1);
             cpu.f[rd as usize] = if width == FWidth::S { nan_box(v as u32 as u64) } else { v };
@@ -495,6 +501,81 @@ fn fset(cpu: &mut CpuState, w: FWidth, r: u8, v: u64, flags: fpu::Fflags) {
     };
     cpu.fcsr |= flags as u32;
 }
+
+/// The Zfa `fli.s` constants as raw bits, indexed by the 5-bit immediate: -1.0, the
+/// minimum positive normal, a ladder of small constants, then inf and the canonical
+/// NaN. The ACT suite's `Zfa-fli.s` test walks the same table.
+const FLI_S: [u32; 32] = [
+    0xbf80_0000,
+    0x0080_0000,
+    0x3780_0000,
+    0x3800_0000,
+    0x3b80_0000,
+    0x3c00_0000,
+    0x3d80_0000,
+    0x3e00_0000,
+    0x3e80_0000,
+    0x3ea0_0000,
+    0x3ec0_0000,
+    0x3ee0_0000,
+    0x3f00_0000,
+    0x3f20_0000,
+    0x3f40_0000,
+    0x3f60_0000,
+    0x3f80_0000,
+    0x3fa0_0000,
+    0x3fc0_0000,
+    0x3fe0_0000,
+    0x4000_0000,
+    0x4020_0000,
+    0x4040_0000,
+    0x4080_0000,
+    0x4100_0000,
+    0x4180_0000,
+    0x4300_0000,
+    0x4380_0000,
+    0x4700_0000,
+    0x4780_0000,
+    0x7f80_0000,
+    0x7fc0_0000,
+];
+
+/// The Zfa `fli.d` constants: the same values at double width (index 1 is the double
+/// minimum positive normal, 2⁻¹⁰²²).
+const FLI_D: [u64; 32] = [
+    0xbff0_0000_0000_0000,
+    0x0010_0000_0000_0000,
+    0x3ef0_0000_0000_0000,
+    0x3f00_0000_0000_0000,
+    0x3f70_0000_0000_0000,
+    0x3f80_0000_0000_0000,
+    0x3fb0_0000_0000_0000,
+    0x3fc0_0000_0000_0000,
+    0x3fd0_0000_0000_0000,
+    0x3fd4_0000_0000_0000,
+    0x3fd8_0000_0000_0000,
+    0x3fdc_0000_0000_0000,
+    0x3fe0_0000_0000_0000,
+    0x3fe4_0000_0000_0000,
+    0x3fe8_0000_0000_0000,
+    0x3fec_0000_0000_0000,
+    0x3ff0_0000_0000_0000,
+    0x3ff4_0000_0000_0000,
+    0x3ff8_0000_0000_0000,
+    0x3ffc_0000_0000_0000,
+    0x4000_0000_0000_0000,
+    0x4004_0000_0000_0000,
+    0x4008_0000_0000_0000,
+    0x4010_0000_0000_0000,
+    0x4020_0000_0000_0000,
+    0x4030_0000_0000_0000,
+    0x4060_0000_0000_0000,
+    0x4070_0000_0000_0000,
+    0x40e0_0000_0000_0000,
+    0x40f0_0000_0000_0000,
+    0x7ff0_0000_0000_0000,
+    0x7ff8_0000_0000_0000,
+];
 
 /// NaN-box a single-precision value (in the low 32 bits) for an `f` register.
 fn nan_box(v: u64) -> u64 {
@@ -1115,6 +1196,31 @@ mod tests {
         assert_eq!(cpu.x[12], 0xffff_ffff_c000_0000);
         assert_eq!(cpu.f[3], 0xffff_ffff_3f80_0000);
         assert_eq!(cpu.f[4], 0x1234_5678_3f80_0000);
+    }
+
+    #[test]
+    fn fli_loads_the_zfa_table() {
+        // The Zfa constant table, in immediate order (ACT's Zfa-fli.s walks the same
+        // one). The double entries keep the single-precision *values* at double width,
+        // so 2^-16 is 0x3EF… there and 0x378… here.
+        let fli = |fmt: u32, rd: u32, imm: u32| op_fp(0b11110, fmt, 0, rd, imm, 1);
+        let (cpu, _) = exec(
+            &[
+                fli(0b00, 1, 0),  // fli.s f1, -1.0
+                fli(0b00, 2, 2),  // fli.s f2, 2^-16
+                fli(0b00, 3, 31), // fli.s f3, canonical NaN
+                fli(0b01, 4, 2),  // fli.d f4, 2^-16
+                fli(0b01, 5, 5),  // fli.d f5, 2^-7
+                fli(0b01, 6, 18), // fli.d f6, 1.5
+            ],
+            &[],
+        );
+        assert_eq!(cpu.f[1], 0xffff_ffff_bf80_0000);
+        assert_eq!(cpu.f[2], 0xffff_ffff_3780_0000);
+        assert_eq!(cpu.f[3], 0xffff_ffff_7fc0_0000);
+        assert_eq!(cpu.f[4], 0x3ef0_0000_0000_0000);
+        assert_eq!(cpu.f[5], 0x3f80_0000_0000_0000);
+        assert_eq!(cpu.f[6], 1.5f64.to_bits());
     }
 
     #[test]

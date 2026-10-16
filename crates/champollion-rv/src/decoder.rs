@@ -138,6 +138,12 @@ pub enum Inst {
         rd: u8,
         rs1: u8,
     },
+    /// Zfa `fli.s`/`fli.d`: load a floating-point constant by index (0–31).
+    Fli {
+        width: FWidth,
+        rd: u8,
+        imm: u8,
+    },
     FMvFromInt {
         width: FWidth,
         rd: u8,
@@ -1052,6 +1058,9 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b11100, 0b000, 0) => Inst::FMvToInt { width, rd, rs1 },
                 (0b11100, 0b001, 0) => Inst::FClass { width, rd, rs1 },
                 (0b11110, 0b000, 0) => Inst::FMvFromInt { width, rd, rs1 },
+                // Zfa fli.s/fli.d: fmv.w.x/fmv.d.x with rs2 = 00001; the constant
+                // index rides in the rs1 field.
+                (0b11110, 0b000, 1) => Inst::Fli { width, rd, imm: rs1 },
                 _ => return illegal,
             }
         }

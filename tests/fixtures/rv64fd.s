@@ -1,6 +1,9 @@
 # F/D data-movement subset, one instruction per line; see
 # crates/champollion-rv/tests/decode.rs.
 .option norvc
+.option arch, +f,+d,+zfa
+fli.s fa0, -1.0
+fli.d fa1, 1.5
 flw fa0, -4(sp)
 fld fs11, 2040(a0)
 fsw ft0, 0(a1)

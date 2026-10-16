@@ -311,6 +311,8 @@ fn rv64fd() {
 
     const T2: u8 = 7;
     let expected = [
+        ("fli.s fa0, -1.0", Fli { width: S, rd: FA0, imm: 0 }),
+        ("fli.d fa1, 1.5", Fli { width: D, rd: FA1, imm: 18 }),
         ("flw fa0, -4(sp)", FLoad { width: S, rd: FA0, rs1: SP, offset: -4 }),
         ("fld fs11, 2040(a0)", FLoad { width: D, rd: FS11, rs1: A0, offset: 2040 }),
         ("fsw ft0, 0(a1)", FStore { width: S, rs1: A1, rs2: FT0, offset: 0 }),
