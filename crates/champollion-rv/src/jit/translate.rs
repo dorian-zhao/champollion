@@ -1290,6 +1290,10 @@ impl Tx {
         let Some((_, bytes)) = self.vec else {
             return false;
         };
+        // The base-register cache assumes the previous access left its masked base in
+        // ADDR and that `keeps_addr` held since; this arm clobbers ADDR with vector-class
+        // scratch (`v_addr`), so it neither trusts a cached base nor leaves one behind.
+        self.addr_base = None;
         match inst {
             Inst::VLoad { width, kind, vd, rs1, mask: false, nf: 0, .. }
                 if matches!(kind, VMemKind::Unit | VMemKind::FaultOnlyFirst)
@@ -1310,6 +1314,7 @@ impl Tx {
                 }
                 self.v_addr(vd);
                 self.a.str_q(FA, ADDR);
+                self.addr_base = None;
                 true
             }
             Inst::VStore {
@@ -1323,6 +1328,7 @@ impl Tx {
                     Some(_) => self.a.str_q(FA, ADDR),
                     None => self.a.str_q_reg(FA, self.base_reg(), self.index_reg()),
                 }
+                self.addr_base = None;
                 true
             }
             _ => false,

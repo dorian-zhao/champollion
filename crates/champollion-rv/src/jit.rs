@@ -1129,6 +1129,55 @@ mod tests {
         assert_eq!(stored, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
+    /// Two vector accesses sharing a base register in one block: the second used to
+    /// trust the base-register cache, but the first left `ADDR` holding the address of a
+    /// guest vector register instead of the base. (Coreutils caught this one: `uname`
+    /// crashed with a load fault at address 8 before the fix.)
+    #[test]
+    fn vector_accesses_do_not_reuse_a_stale_cached_base() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle64 = |vd: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse64 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let prog = [
+            vsetivli(0, 2, 0x0d8),
+            vle64(1, 11), // v1 = [a1]
+            vle64(2, 11), // v2 = [a1]: the second access must recompute the address
+            vse64(2, 12), // [a2] = v2
+        ];
+        let fill = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &0x1111_2222_3333_4444u64.to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 8, &0x5555_6666_7777_8888u64.to_le_bytes()).unwrap();
+        };
+        let init = |cpu: &mut CpuState| {
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 16);
+        };
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "stale-base reuse");
+        assert_eq!(cpu.v[1], cpu.v[2], "both loads read the same guest bytes");
+        let mut stored = [0u8; 16];
+        mem_j.read_privileged(DATA + 16, &mut stored).unwrap();
+        assert_eq!(u64::from_le_bytes(stored[..8].try_into().unwrap()), 0x1111_2222_3333_4444);
+        assert_eq!(u64::from_le_bytes(stored[8..].try_into().unwrap()), 0x5555_6666_7777_8888);
+    }
+
     #[test]
     fn untranslated_instructions_fall_back_to_the_interpreter() {
         // CSR accesses are not translated: they run on the interpreter mid-stream, and
