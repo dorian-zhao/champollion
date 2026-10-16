@@ -172,3 +172,22 @@ str s5, [x17, #16380]
 str d6, [x17, #32760]
 stur s7, [x17, #-4]
 stur d8, [x17, #3]
+bic x0, x1, x2
+orn x3, x4, x5
+eon x6, x7, x8
+clz x9, x10
+clz w11, w12
+rbit x13, x14
+rev x15, x16
+rorv x17, x19, x20
+rorv w21, w22, w23
+ror x24, x25, #26
+ror w27, w28, #29
+add x0, x1, w2, uxtw
+add x3, x4, w5, uxtw #1
+add x6, x7, w8, uxtw #2
+add x9, x10, w11, uxtw #3
+cnt v16.16b, v17.16b
+addv b18, v19.16b
+cmeq v20.16b, v21.16b, #0
+mvn v22.16b, v23.16b

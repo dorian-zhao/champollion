@@ -830,22 +830,11 @@ impl Tx {
                 AluOp::Add | AluOp::Xor | AluOp::Or => v,
                 AluOp::Slt => (0 < imm as i64) as u64,
                 AluOp::Sltu => (0 < v) as u64,
-                // Zba/Zbb/Zbs/Zicond immediate forms are interpreted only for now.
-                AluOp::SllUw
-                | AluOp::Clz
-                | AluOp::Ctz
-                | AluOp::Cpop
-                | AluOp::SextB
-                | AluOp::SextH
-                | AluOp::ZextH
-                | AluOp::Rev8
-                | AluOp::OrcB
-                | AluOp::Ror
-                | AluOp::Bclr
-                | AluOp::Bext
-                | AluOp::Binv
-                | AluOp::Bset => return false,
-                _ => 0, // and, shifts of zero
+                // The Zb* ops on x0 (zero): the counts are 64, and the bit-writing
+                // immediates plant their bit in the zero. The rest stay zero.
+                AluOp::Clz | AluOp::Ctz => 64,
+                AluOp::Bset | AluOp::Binv => 1u64 << (imm & 63),
+                _ => 0, // and, shifts of zero, and the other Zb* ops
             };
             self.constant(rd, r);
             return true;
@@ -888,21 +877,41 @@ impl Tx {
             AluOp::Sll => self.a.lsl_imm(d, a, imm as u32),
             AluOp::Srl => self.a.lsr_imm(d, a, imm as u32),
             AluOp::Sra => self.a.asr_imm(d, a, imm as u32),
-            // Zba/Zbb/Zbs/Zicond immediate forms are interpreted only for now.
-            AluOp::SllUw
-            | AluOp::Clz
+            // Zba slli.uw: the zero-extended low word, shifted (0..=63).
+            AluOp::SllUw => {
+                self.a.ubfm(d, a, 0, 31);
+                if imm != 0 {
+                    self.a.lsl_imm(d, d, imm as u32 & 63);
+                }
+            }
+            AluOp::Ror => self.a.ror_imm(d, a, imm as u32 & 63),
+            // Zbs: the 6-bit shamt is the bit index. `and_imm` refuses nothing here (a
+            // run with one hole wraps, and a single bit is a run too), but falling back
+            // before anything is emitted is free.
+            AluOp::Bclr => {
+                if self.a.and_imm(d, a, !(1u64 << (imm & 63))).is_none() {
+                    return false;
+                }
+            }
+            AluOp::Bext => self.a.ubfm(d, a, imm as u32 & 63, imm as u32 & 63),
+            AluOp::Binv => {
+                if self.a.eor_imm(d, a, 1u64 << (imm & 63)).is_none() {
+                    return false;
+                }
+            }
+            AluOp::Bset => {
+                if self.a.orr_imm(d, a, 1u64 << (imm & 63)).is_none() {
+                    return false;
+                }
+            }
+            AluOp::Clz
             | AluOp::Ctz
             | AluOp::Cpop
             | AluOp::SextB
             | AluOp::SextH
             | AluOp::ZextH
             | AluOp::Rev8
-            | AluOp::OrcB
-            | AluOp::Ror
-            | AluOp::Bclr
-            | AluOp::Bext
-            | AluOp::Binv
-            | AluOp::Bset => return false,
+            | AluOp::OrcB => self.bit_unary(op, d, a),
             _ => unreachable!("no immediate form of {op:?}"),
         }
         self.commit(rd, d);
@@ -914,10 +923,11 @@ impl Tx {
             return true;
         }
         if rs1 == 0 {
-            if matches!(op, AluOp32::Clz | AluOp32::Ctz | AluOp32::Cpop) {
-                return false; // clzw(0) = 32, not a foldable zero
-            }
-            let r = if op == AluOp32::Add { sext(imm) } else { 0 };
+            let r = match op {
+                AluOp32::Add => sext(imm),
+                AluOp32::Clz | AluOp32::Ctz => 32, // clzw(0) = ctzw(0) = 32
+                _ => 0,                            // a rotation of zero, and cpopw(0)
+            };
             self.constant(rd, r);
             return true;
         }
@@ -929,8 +939,16 @@ impl Tx {
             AluOp32::Sll => self.a.lsl_imm_w(d, a, imm as u32),
             AluOp32::Srl => self.a.lsr_imm_w(d, a, imm as u32),
             AluOp32::Sra => self.a.asr_imm_w(d, a, imm as u32),
-            // Zbb word rotates and counts are interpreted only for now.
-            AluOp32::Ror | AluOp32::Clz | AluOp32::Ctz | AluOp32::Cpop => return false,
+            AluOp32::Ror => self.a.ror_imm_w(d, a, imm as u32 & 31),
+            AluOp32::Clz => self.a.clz_w(d, a),
+            AluOp32::Ctz => {
+                self.a.rbit_w(d, a);
+                self.a.clz_w(d, d);
+            }
+            AluOp32::Cpop => {
+                self.a.ubfm(d, a, 0, 31); // the count covers the low word
+                self.cpop(d, d);
+            }
             _ => unreachable!("no immediate form of {op:?}"),
         }
         self.a.sxtw(d, d);
@@ -990,39 +1008,87 @@ impl Tx {
                 }
                 self.a.msub(d, ADDR, b, a);
             }
-            // Zba/Zbb/Zbs/Zicond (the immediate-only variants never reach here) are
-            // interpreted only for now; the block falls back as a whole.
-            AluOp::Sh1Add
-            | AluOp::Sh2Add
-            | AluOp::Sh3Add
-            | AluOp::AddUw
-            | AluOp::Sh1AddUw
-            | AluOp::Sh2AddUw
-            | AluOp::Sh3AddUw
-            | AluOp::SllUw
-            | AluOp::Andn
-            | AluOp::Orn
-            | AluOp::Xnor
-            | AluOp::Max
-            | AluOp::Maxu
-            | AluOp::Min
-            | AluOp::Minu
-            | AluOp::Rol
-            | AluOp::Ror
-            | AluOp::Bclr
-            | AluOp::Bext
-            | AluOp::Binv
-            | AluOp::Bset
-            | AluOp::CzeroEqz
-            | AluOp::CzeroNez
-            | AluOp::Clz
+            // Zba: `b + (a << n)`, and the word-sourced forms, where the shift comes
+            // from the zero-extending address mode.
+            AluOp::Sh1Add => self.a.add_lsl(d, b, a, 1),
+            AluOp::Sh2Add => self.a.add_lsl(d, b, a, 2),
+            AluOp::Sh3Add => self.a.add_lsl(d, b, a, 3),
+            AluOp::AddUw => self.add_uw(d, b, a, 0),
+            AluOp::Sh1AddUw => self.add_uw(d, b, a, 1),
+            AluOp::Sh2AddUw => self.add_uw(d, b, a, 2),
+            AluOp::Sh3AddUw => self.add_uw(d, b, a, 3),
+            AluOp::SllUw => return false, // immediate-only; the decoder never builds this
+            AluOp::Andn => self.a.bic(d, a, b),
+            AluOp::Orn => self.a.orn(d, a, b),
+            AluOp::Xnor => self.a.eon(d, a, b),
+            // RISC-V min/max are "select on the comparison"; the plain ARM min/max need
+            // FEAT_CSSC, which base hardware does not have.
+            AluOp::Max => {
+                self.a.cmp(a, b);
+                self.a.csel(d, a, b, Cond::Gt);
+            }
+            AluOp::Maxu => {
+                self.a.cmp(a, b);
+                self.a.csel(d, a, b, Cond::Hi);
+            }
+            AluOp::Min => {
+                self.a.cmp(a, b);
+                self.a.csel(d, a, b, Cond::Lt);
+            }
+            AluOp::Minu => {
+                self.a.cmp(a, b);
+                self.a.csel(d, a, b, Cond::Lo);
+            }
+            // ARM rotates only right; -shamt (mod 64) is the same rotation.
+            AluOp::Rol => {
+                self.a.sub(ADDR, XZR, b);
+                self.a.rorv(d, a, ADDR);
+            }
+            AluOp::Ror => self.a.rorv(d, a, b),
+            // Zbs: the register forms build `1 << (b & 63)`, then clear, flip, or set.
+            AluOp::Bclr => {
+                self.bit_shift(ADDR, b);
+                self.a.bic(d, a, ADDR);
+            }
+            AluOp::Binv => {
+                self.bit_shift(ADDR, b);
+                self.a.eor(d, a, ADDR);
+            }
+            AluOp::Bset => {
+                self.bit_shift(ADDR, b);
+                self.a.orr(d, a, ADDR);
+            }
+            AluOp::Bext => {
+                self.a.lsrv(d, a, b);
+                assert!(self.a.and_imm(d, d, 1).is_some(), "1 is a bitmask immediate");
+            }
+            // Zicond: keep the value or zero, on whether the condition is zero. A zero
+            // condition register fixes the result, and it must not go through the compare:
+            // in the immediate form register 31 is SP, so `cmp xzr, #0` is not encodable.
+            AluOp::CzeroEqz => {
+                if b == XZR {
+                    self.a.mov(d, XZR);
+                } else {
+                    self.a.cmp_imm(b, 0);
+                    self.a.csel(d, a, XZR, Cond::Ne);
+                }
+            }
+            AluOp::CzeroNez => {
+                if b == XZR {
+                    self.a.mov(d, a);
+                } else {
+                    self.a.cmp_imm(b, 0);
+                    self.a.csel(d, a, XZR, Cond::Eq);
+                }
+            }
+            AluOp::Clz
             | AluOp::Ctz
             | AluOp::Cpop
             | AluOp::SextB
             | AluOp::SextH
             | AluOp::ZextH
             | AluOp::Rev8
-            | AluOp::OrcB => return false,
+            | AluOp::OrcB => self.bit_unary(op, d, a),
         }
         self.commit(rd, d);
         true
@@ -1062,14 +1128,80 @@ impl Tx {
                 }
                 self.a.msub_w(d, ADDR, b, a);
             }
-            // Zbb word rotations and counts are interpreted only for now.
-            AluOp32::Rol | AluOp32::Ror | AluOp32::Clz | AluOp32::Ctz | AluOp32::Cpop => {
-                return false;
+            AluOp32::Rol => {
+                self.a.sub(ADDR, XZR, b);
+                self.a.rorv_w(d, a, ADDR);
+            }
+            AluOp32::Ror => self.a.rorv_w(d, a, b),
+            AluOp32::Clz => self.a.clz_w(d, a),
+            AluOp32::Ctz => {
+                self.a.rbit_w(d, a);
+                self.a.clz_w(d, d);
+            }
+            AluOp32::Cpop => {
+                self.a.ubfm(d, a, 0, 31); // the count covers the low word
+                self.cpop(d, d);
             }
         }
         self.a.sxtw(d, d);
         self.commit(rd, d);
         true
+    }
+
+    /// The unary Zbb/Zbs bit-manipulation ops, shared by their register and immediate
+    /// forms. `cpop` and `orc.b` go through NEON with `FA` as scratch: the guest's f
+    /// registers live in v0–v15 and v20–v31, so the FP scratch registers are free here.
+    fn bit_unary(&mut self, op: AluOp, d: Reg, a: Reg) {
+        match op {
+            AluOp::Clz => self.a.clz(d, a),
+            AluOp::Ctz => {
+                self.a.rbit(d, a);
+                self.a.clz(d, d);
+            }
+            AluOp::Cpop => self.cpop(d, a),
+            AluOp::SextB => self.a.sbfm(d, a, 0, 7),
+            AluOp::SextH => self.a.sbfm(d, a, 0, 15),
+            AluOp::ZextH => self.a.ubfm(d, a, 0, 15),
+            AluOp::Rev8 => self.a.rev(d, a),
+            AluOp::OrcB => {
+                self.a.fmov_from_gpr(Fp::D, FA, a);
+                self.a.cmeq_zero16b(FA, FA);
+                self.a.mvn16b(FA, FA);
+                self.a.fmov_to_gpr(Fp::D, d, FA);
+            }
+            _ => unreachable!("{op:?} is not unary"),
+        }
+    }
+
+    /// `cpop`: NEON byte counts summed across the register (writing the scalar zeroes the
+    /// upper half of the vector, so the eight zero bytes do not add anything).
+    fn cpop(&mut self, d: Reg, a: Reg) {
+        self.a.fmov_from_gpr(Fp::D, FA, a);
+        self.a.cnt16b(FA, FA);
+        self.a.addv16b(FA, FA);
+        self.a.fmov_to_gpr(Fp::D, d, FA);
+    }
+
+    /// `tmp = 1 << (b & 63)`, the mask the register forms of the single-bit ops use.
+    fn bit_shift(&mut self, tmp: Reg, b: Reg) {
+        self.a.mov_imm(tmp, 1);
+        self.a.lslv(tmp, tmp, b);
+    }
+
+    /// Zba word adds: `b + (zero-extended a << shift)`. In the ARM extended-register
+    /// form register 31 reads as SP, not XZR, so a zero `b` cannot take the one-instruction
+    /// form — the zero-extended source is the whole result then.
+    fn add_uw(&mut self, d: Reg, b: Reg, a: Reg, shift: u32) {
+        if b == XZR {
+            self.a.ubfm(d, a, 0, 31);
+            if shift != 0 {
+                self.a.lsl_imm(d, d, shift);
+            }
+        } else if shift == 0 {
+            self.a.add_uxtw(d, b, a);
+        } else {
+            self.a.add_uxtw_lsl(d, b, a, shift);
+        }
     }
 
     /// Write the link register of `jal`/`jalr`.
@@ -1141,17 +1273,22 @@ fn mem_base(inst: Inst) -> Option<u8> {
 /// Whether translating `inst` leaves `ADDR` alone, apart from [`Tx::mem_operand`], so the
 /// base-register cache survives it (unless it writes the base register, see [`int_dest`]).
 fn keeps_addr(inst: Inst) -> bool {
-    use AluOp::{Div, Divu, Mulhsu, Rem, Remu};
+    // `ADDR` is scratch: the instructions whose translation writes it must say so, or a
+    // later access would reuse a stale cached base.
+    use AluOp::{Bclr, Binv, Bset, Div, Divu, Mulhsu, Rem, Remu, Rol};
     match inst {
         Inst::Lui { .. }
         | Inst::Auipc { .. }
         | Inst::OpImm { .. }
         | Inst::OpImm32 { .. }
         | Inst::Branch { .. } => true,
-        Inst::Op { op, .. } => !matches!(op, Mulhsu | Div | Divu | Rem | Remu),
-        Inst::Op32 { op, .. } => {
-            !matches!(op, AluOp32::Div | AluOp32::Divu | AluOp32::Rem | AluOp32::Remu)
+        Inst::Op { op, .. } => {
+            !matches!(op, Mulhsu | Div | Divu | Rem | Remu | Rol | Bclr | Binv | Bset)
         }
+        Inst::Op32 { op, .. } => !matches!(
+            op,
+            AluOp32::Div | AluOp32::Divu | AluOp32::Rem | AluOp32::Remu | AluOp32::Rol
+        ),
         _ => mem_base(inst).is_some(),
     }
 }

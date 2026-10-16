@@ -813,6 +813,72 @@ impl Asm {
     pub fn rbit_w(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x5ac0_0000 | (rn as u32) << 5 | rd as u32);
     }
+    /// `rbit xd, xn`: reverse the bits of a 64-bit value.
+    pub fn rbit(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0xdac0_0000 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `rev xd, xn`: reverse the byte order (RISC-V `rev8`).
+    pub fn rev(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0xdac0_0c00 | (rn as u32) << 5 | rd as u32);
+    }
+
+    // ---- bit manipulation, for the Zba/Zbb/Zbs/Zicond instructions ----
+
+    /// `bic rd, rn, rm`: `rd = rn & !rm` (RISC-V `andn`).
+    pub fn bic(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.r3(0x8a20_0000, rd, rn, rm);
+    }
+    /// `orn rd, rn, rm`: `rd = rn | !rm`.
+    pub fn orn(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.r3(0xaa20_0000, rd, rn, rm);
+    }
+    /// `eon rd, rn, rm`: `rd = !(rn ^ rm)` (RISC-V `xnor`).
+    pub fn eon(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.r3(0xca20_0000, rd, rn, rm);
+    }
+    pub fn clz(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0xdac0_1000 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn clz_w(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x5ac0_1000 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `rorv rd, rn, rm`: rotate right by the low 6 (`_w`: 5) bits of `rm`.
+    pub fn rorv(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.r3(0x9ac0_2c00, rd, rn, rm);
+    }
+    pub fn rorv_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.r3(0x1ac0_2c00, rd, rn, rm);
+    }
+    /// `ror rd, rn, #shift` (EXTR with both sources the same).
+    pub fn ror_imm(&mut self, rd: Reg, rn: Reg, shift: u32) {
+        self.emit(0x93c0_0000 | (rn as u32) << 16 | shift << 10 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn ror_imm_w(&mut self, rd: Reg, rn: Reg, shift: u32) {
+        self.emit(0x1380_0000 | (rn as u32) << 16 | shift << 10 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `add rd, rn, w_rm, uxtw`: `rd = rn + zero-extended rm` (RISC-V `add.uw`; the
+    /// zero-extension is of `rm`'s low word, which is why the 32-bit form adds it).
+    pub fn add_uxtw(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.add_uxtw_lsl(rd, rn, rm, 0);
+    }
+    pub fn add_uxtw_lsl(&mut self, rd: Reg, rn: Reg, rm: Reg, shift: u32) {
+        self.emit(0x8b20_4000 | (rm as u32) << 16 | shift << 10 | (rn as u32) << 5 | rd as u32);
+    }
+    /// NEON scratch calls for `cpop` and `orc.b`: `cnt`/`addv` sum 16 byte counts (the
+    /// upper 8 bytes of the vector are zeroed by writing the scalar register), `cmeq`
+    /// against zero plus `mvn` plus counts non-zero bytes.
+    pub fn cnt16b(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e20_5800 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn addv16b(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e31_b800 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn cmeq_zero16b(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e20_9800 | (rn as u32) << 5 | rd as u32);
+    }
+    pub fn mvn16b(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x6e20_5800 | (rn as u32) << 5 | rd as u32);
+    }
     /// `cmn wn, #imm` (sets flags for wn + imm).
     pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
         self.imm12(0x3100_0000, XZR, rn, imm);

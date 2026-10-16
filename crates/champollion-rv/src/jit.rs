@@ -841,12 +841,47 @@ mod tests {
                         (5, 1),
                         (6, 1),
                         (7, 1),
+                        // Zba, Zbb, Zbs, and Zicond register forms.
+                        (2, 0x10),
+                        (4, 0x10),
+                        (6, 0x10),
+                        (7, 0x10),
+                        (6, 0x20),
+                        (4, 0x20),
+                        (4, 0x5),
+                        (5, 0x5),
+                        (6, 0x5),
+                        (7, 0x5),
+                        (1, 0x30),
+                        (5, 0x30),
+                        (1, 0x14),
+                        (1, 0x24),
+                        (5, 0x24),
+                        (1, 0x34),
+                        (5, 0x7),
+                        (7, 0x7),
                     ]);
                     Plain(op(f3, f7, int_dest(rng), reg(rng), reg(rng)))
                 }
                 5..=7 => {
                     let f3 = rng.below(8) as u32;
                     let imm = match f3 {
+                        // The Zbb/Zbs unary and immediate forms pack a funct6 above a
+                        // 5-bit rs2/shift field; slli.uw is funct6 000100 over a 6-bit
+                        // shift.
+                        1 if rng.chance(2) => match rng.below(5) {
+                            0 => (0b011_000 << 6) | rng.pick(&[0, 1, 2, 4, 5]),
+                            1 => (0b010_010 << 6) | rng.below(64) as i32,
+                            2 => (0b011_010 << 6) | rng.below(64) as i32,
+                            3 => (0b001_010 << 6) | rng.below(64) as i32,
+                            _ => (0b000_100 << 6) | rng.below(64) as i32,
+                        },
+                        5 if rng.chance(2) => match rng.below(4) {
+                            0 => (0b011_000 << 6) | rng.below(64) as i32, // rori
+                            1 => (0b001_010 << 6) | 0b00111,              // orc.b
+                            2 => (0b011_010 << 6) | 0b11000,              // rev8
+                            _ => (0b010_010 << 6) | rng.below(64) as i32, // bexti
+                        },
                         1 => rng.below(64) as i32,
                         5 => rng.below(64) as i32 | if rng.chance(2) { 0x400 } else { 0 },
                         _ => rng.below(4096) as i32 - 2048,
@@ -865,11 +900,24 @@ mod tests {
                         (5, 1),
                         (6, 1),
                         (7, 1),
+                        // Zba word adds, Zbb zext.h, and the Zbb word rotates.
+                        (2, 0x10),
+                        (4, 0x10),
+                        (6, 0x10),
+                        (0, 0x4),
+                        (4, 0x4),
+                        (1, 0x30),
+                        (5, 0x30),
                     ]);
                     if rng.chance(2) {
-                        Plain(op_32(f3, f7, int_dest(rng), reg(rng), reg(rng)))
+                        // zext.h keeps its second source at zero.
+                        let rs2 = if (f3, f7) == (4, 0x4) { 0 } else { reg(rng) };
+                        Plain(op_32(f3, f7, int_dest(rng), reg(rng), rs2))
                     } else {
                         let (f3, imm) = match f3 {
+                            // clzw/ctzw/cpopw and roriw share a funct6 011000 selector.
+                            1 if rng.chance(2) => (1, 0x600 | rng.below(3) as i32),
+                            5 if rng.chance(2) => (5, 0x600 | rng.below(32) as i32),
                             1 => (1, rng.below(32) as i32),
                             5 => (5, rng.below(32) as i32 | if f7 != 0 { 0x400 } else { 0 }),
                             _ => (0, rng.below(4096) as i32 - 2048),
