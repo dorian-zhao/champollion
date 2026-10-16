@@ -17,8 +17,6 @@ pub struct CpuState {
     /// NaN-boxed (upper 32 bits all ones), as required by the D extension.
     pub f: [u64; 32],
     pub pc: u64,
-    /// `fcsr`: `frm` in bits 7:5, `fflags` in bits 4:0.
-    pub fcsr: u32,
     /// Address loaded by the last `lr` ([`NO_RESERVATION`] if none), cleared by any `sc`.
     /// `sc` succeeds only if memory still holds `reserved_value` (checked with a host
     /// compare-and-swap), so stores by other threads in between make it fail, as on real
@@ -28,14 +26,23 @@ pub struct CpuState {
     /// Instructions retired (the `instret` CSR; also what `cycle` reports).
     pub instret: u64,
     /// Vector registers `v0..v31`. VLEN is 128 bits; only the low `vl` elements (of the
-    /// byte width `vtype` selects) are ever read or written.
+    /// byte width `vtype` selects) are ever read or written. 16-byte aligned so the JIT
+    /// can reach a whole register with one load/store immediate offset.
     pub v: [[u8; 16]; 32],
     /// `vl`, from the last `vset*`.
     pub vl: u64,
     /// `vtype` as written: `vma` bit 7, `vta` bit 6, `vsew` bits 5:3, `vlmul` bits 2:0.
     /// `vstart` is not modeled and always reads zero.
     pub vtype: u64,
+    /// `fcsr`: `frm` in bits 7:5, `fflags` in bits 4:0. Kept last so `v`'s offset stays
+    /// a multiple of 16 before it.
+    pub fcsr: u32,
 }
+
+/// The JIT reaches whole vector registers with `LDR/STR Q` immediate offsets, which must
+/// be multiples of 16: that only works while `v` itself stays 16-byte aligned, so keep
+/// any new trailing field behind these too.
+const _: () = assert!(std::mem::offset_of!(CpuState, v) % 16 == 0);
 
 impl CpuState {
     pub fn new(pc: u64) -> Self {
@@ -43,13 +50,13 @@ impl CpuState {
             x: [0; 32],
             f: [0; 32],
             pc,
-            fcsr: 0,
             reserved_addr: NO_RESERVATION,
             reserved_value: 0,
             instret: 0,
             v: [[0; 16]; 32],
             vl: 0,
             vtype: 0,
+            fcsr: 0,
         }
     }
 

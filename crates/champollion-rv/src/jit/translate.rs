@@ -1380,8 +1380,9 @@ impl Tx {
             return false;
         };
         // The base-register cache assumes the previous access left its masked base in
-        // ADDR and that `keeps_addr` held since; this arm clobbers ADDR with vector-class
-        // scratch (`v_addr`), so it neither trusts a cached base nor leaves one behind.
+        // ADDR and that `keeps_addr` held since; the vector arms below address memory
+        // through their own registers, so they neither trust a cached base nor leave one
+        // behind.
         self.addr_base = None;
         match inst {
             Inst::VLoad { width, kind, vd, rs1, mask: false, nf: 0, .. }
@@ -1416,8 +1417,7 @@ impl Tx {
                             self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg());
                         }
                     }
-                    self.v_addr((vd + r as u8) & 31);
-                    self.a.str_q(FA, ADDR);
+                    self.v_str(FA, (vd + r as u8) & 31);
                 }
                 self.addr_base = None;
                 true
@@ -1428,7 +1428,7 @@ impl Tx {
             Inst::VLoad { kind: VMemKind::WholeRegister, vd, rs1, mask: false, nf, .. } => {
                 let n = u32::from(nf) + 1;
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.a.mov(SRC0, ADDR); // v_addr below reuses ADDR
+                self.a.mov(SRC0, ADDR); // the guest address, kept across the v-file stores
                 for k in 0..n {
                     match operand {
                         Some(_) => {
@@ -1441,8 +1441,7 @@ impl Tx {
                             self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg());
                         }
                     }
-                    self.v_addr((vd + k as u8) & 31);
-                    self.a.str_q(FA, ADDR);
+                    self.v_str(FA, (vd + k as u8) & 31);
                 }
                 self.addr_base = None;
                 true
@@ -1452,8 +1451,7 @@ impl Tx {
                 let operand = self.mem_operand(rs1, 0, 16);
                 self.a.mov(SRC0, ADDR);
                 for k in 0..n {
-                    self.v_addr((vs3 + k as u8) & 31);
-                    self.a.ldr_q(FA, ADDR);
+                    self.v_ldr(FA, (vs3 + k as u8) & 31);
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
@@ -1476,8 +1474,7 @@ impl Tx {
                 let operand = self.mem_operand(rs1, 0, 16);
                 self.a.mov(SRC0, ADDR);
                 for r in 0..regs {
-                    self.v_addr((vs3 + r as u8) & 31);
-                    self.a.ldr_q(FA, ADDR);
+                    self.v_ldr(FA, (vs3 + r as u8) & 31);
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
@@ -1524,8 +1521,7 @@ impl Tx {
         if op == VArithOp::Mul && bits == 64 {
             return false; // NEON's MUL tops out at 4s
         }
-        self.v_addr(vs2);
-        self.a.ldr_q(FA, ADDR);
+        self.v_ldr(FA, vs2);
         match (op, src) {
             // Shifts want the immediate zero-extended and the scalar masked to
             // log2(SEW) bits, neither of which `vector_operand` does.
@@ -1551,8 +1547,7 @@ impl Tx {
                 self.vector_shift(op, bits);
             }
             (VArithOp::Srl | VArithOp::Sra, VSel::V(vs1)) => {
-                self.v_addr(vs1);
-                self.a.ldr_q(FB, ADDR);
+                self.v_ldr(FB, vs1);
                 self.a.mov_imm(SRC0, u64::from(bits - 1));
                 self.a.vec_dup(FC, SRC0, bytes);
                 self.a.vec_and(FB, FB, FC);
@@ -1575,8 +1570,7 @@ impl Tx {
                 }
             }
         }
-        self.v_addr(vd);
-        self.a.str_q(FA, ADDR);
+        self.v_str(FA, vd);
         true
     }
 
@@ -1632,11 +1626,9 @@ impl Tx {
             _ => return false,
         };
         for r in 0..regs {
-            self.v_addr((vs2 + r as u8) & 31);
-            self.a.ldr_q(FA, ADDR);
+            self.v_ldr(FA, (vs2 + r as u8) & 31);
             if let Some(vs1) = vs1 {
-                self.v_addr((vs1 + r as u8) & 31);
-                self.a.ldr_q(FB, ADDR);
+                self.v_ldr(FB, (vs1 + r as u8) & 31);
             }
             match op {
                 VFArithOp::Add => self.a.vec_fadd(bits, FA, FA, FB),
@@ -1644,8 +1636,7 @@ impl Tx {
                 VFArithOp::Mul => self.a.vec_fmul(bits, FA, FA, FB),
                 _ => self.a.vec_fdiv(bits, FA, FA, FB),
             }
-            self.v_addr((vd + r as u8) & 31);
-            self.a.str_q(FA, ADDR);
+            self.v_str(FA, (vd + r as u8) & 31);
         }
         true
     }
@@ -1670,13 +1661,10 @@ impl Tx {
             _ => return false,
         };
         for r in 0..regs {
-            self.v_addr((vs2 + r as u8) & 31);
-            self.a.ldr_q(FC, ADDR); // a
-            self.v_addr((vd + r as u8) & 31);
-            self.a.ldr_q(FA, ADDR); // d
+            self.v_ldr(FC, (vs2 + r as u8) & 31); // a
+            self.v_ldr(FA, (vd + r as u8) & 31); // d
             if let Some(vs1) = vs1 {
-                self.v_addr((vs1 + r as u8) & 31);
-                self.a.ldr_q(FB, ADDR);
+                self.v_ldr(FB, (vs1 + r as u8) & 31);
             }
             let out = match op {
                 VFMaOp::Macc => {
@@ -1719,8 +1707,7 @@ impl Tx {
                     FC
                 }
             };
-            self.v_addr((vd + r as u8) & 31);
-            self.a.str_q(out, ADDR);
+            self.v_str(out, (vd + r as u8) & 31);
         }
         true
     }
@@ -1734,8 +1721,7 @@ impl Tx {
         let regs = self.vec_regs;
         self.vector_fscalar(rs1, FA, bytes);
         for r in 0..regs {
-            self.v_addr((vd + r as u8) & 31);
-            self.a.str_q(FA, ADDR);
+            self.v_str(FA, (vd + r as u8) & 31);
         }
         true
     }
@@ -1746,8 +1732,7 @@ impl Tx {
         if bytes < 4 {
             return false;
         }
-        self.v_addr(vs2);
-        self.a.ldr_q(FA, ADDR);
+        self.v_ldr(FA, vs2);
         if bytes == 4 {
             self.a.fmov_to_gpr(Fp::S, SRC0, FA);
             self.a.orr_imm(SRC0, SRC0, NAN_BOX).unwrap();
@@ -1767,10 +1752,8 @@ impl Tx {
             // A register source moves each group register too.
             VSel::V(vs1) => {
                 for r in 0..regs {
-                    self.v_addr((vs1 + r as u8) & 31);
-                    self.a.ldr_q(FA, ADDR);
-                    self.v_addr((vd + r as u8) & 31);
-                    self.a.str_q(FA, ADDR);
+                    self.v_ldr(FA, (vs1 + r as u8) & 31);
+                    self.v_str(FA, (vd + r as u8) & 31);
                 }
             }
             _ => {
@@ -1778,8 +1761,7 @@ impl Tx {
                     return false;
                 }
                 for r in 0..regs {
-                    self.v_addr((vd + r as u8) & 31);
-                    self.a.str_q(FA, ADDR);
+                    self.v_str(FA, (vd + r as u8) & 31);
                 }
             }
         }
@@ -1798,8 +1780,7 @@ impl Tx {
         if !matches!(op, VCmpOp::Eq | VCmpOp::Ne) {
             return false;
         }
-        self.v_addr(vs2);
-        self.a.ldr_q(FA, ADDR);
+        self.v_ldr(FA, vs2);
         if !self.vector_operand(src, FB, 1) {
             return false;
         }
@@ -1821,8 +1802,7 @@ impl Tx {
         self.a.lsr_imm(ADDR, ADDR, 56);
         self.a.lsl_imm(ADDR, ADDR, 8);
         self.a.orr(DST, DST, ADDR);
-        self.v_addr(vd);
-        assert!(self.a.str_imm(Mem::U16, DST, ADDR, 0));
+        assert!(self.a.str_imm(Mem::U16, DST, CTX, v_offset(vd) as i32));
         true
     }
 
@@ -1835,12 +1815,9 @@ impl Tx {
             return false;
         }
         let mask = (1u64 << self.vec_vl()) - 1;
-        self.v_addr(vd);
-        self.a.ldr_off(DST, ADDR, 0);
-        self.v_addr(vs2);
-        self.a.ldr_off(SRC0, ADDR, 0);
-        self.v_addr(vs1);
-        self.a.ldr_off(SRC1, ADDR, 0);
+        self.a.ldr_off(DST, CTX, v_offset(vd));
+        self.a.ldr_off(SRC0, CTX, v_offset(vs2));
+        self.a.ldr_off(SRC1, CTX, v_offset(vs1));
         match op {
             VMaskOp::And => self.a.and(SRC0, SRC0, SRC1),
             VMaskOp::Andn => self.a.bic(SRC0, SRC0, SRC1),
@@ -1864,8 +1841,7 @@ impl Tx {
         self.a.and(SRC0, SRC0, SRC1);
         self.a.bic(DST, DST, SRC1);
         self.a.orr(DST, DST, SRC0);
-        self.v_addr(vd);
-        self.a.str_off(DST, ADDR, 0);
+        self.a.str_off(DST, CTX, v_offset(vd));
         true
     }
 
@@ -1877,8 +1853,7 @@ impl Tx {
             return false;
         }
         let mask = (1u64 << self.vec_vl()) - 1;
-        self.v_addr(vs2);
-        self.a.ldr_off(DST, ADDR, 0);
+        self.a.ldr_off(DST, CTX, v_offset(vs2));
         self.a.mov_imm(SRC1, mask);
         self.a.and(DST, DST, SRC1);
         self.a.rbit(DST, DST);
@@ -1951,8 +1926,7 @@ impl Tx {
     fn vector_operand(&mut self, src: VSel, dst: Reg, bytes: u32) -> bool {
         match src {
             VSel::V(vs1) => {
-                self.v_addr(vs1);
-                self.a.ldr_q(dst, ADDR);
+                self.v_ldr(dst, vs1);
             }
             VSel::X(rs1) => {
                 let x = self.src(rs1, SRC0);
@@ -1968,19 +1942,15 @@ impl Tx {
         true
     }
 
-    /// Put the address of guest vector register `v` in `ADDR`. The register file is a
-    /// plain byte array (no 16-byte alignment to lean on), so it is addressed through a
-    /// base register rather than the load/store immediate forms.
-    fn v_addr(&mut self, v: u8) {
-        let off = v_offset(v);
-        if off <= 4095 {
-            self.a.add_imm(ADDR, CTX, off);
-        } else {
-            self.a.add_imm_lsl12(ADDR, CTX, off & !0xfff);
-            if off & 0xfff != 0 {
-                self.a.add_imm(ADDR, ADDR, off & 0xfff);
-            }
-        }
+    /// Load one 16-byte chunk of guest vector register `v` into `dst`. The register file
+    /// is 16-byte aligned (see `CpuState`), so a single immediate-offset move reaches it.
+    fn v_ldr(&mut self, dst: Reg, v: u8) {
+        assert!(self.a.ldr_q_off(dst, CTX, v_offset(v)));
+    }
+
+    /// Store `src` into guest vector register `v` (see [`Tx::v_ldr`]).
+    fn v_str(&mut self, src: Reg, v: u8) {
+        assert!(self.a.str_q_off(src, CTX, v_offset(v)));
     }
 
     /// Zba word adds: `b + (zero-extended a << shift)`. In the ARM extended-register
