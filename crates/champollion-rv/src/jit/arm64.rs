@@ -155,7 +155,9 @@ pub fn logical_imm(value: u64, width: u32) -> Option<(u32, u32, u32)> {
     let elem = value & mask;
     // The element must be a run of ones rotated by some amount (as in LLVM): either a
     // contiguous run, or one that wraps around the element's top and bottom.
-    let shifted_mask = |v: u64| v != 0 && ((v | (v - 1)) + 1) & (v | (v - 1)) == 0;
+    // A run reaching bit 63 makes `v | (v - 1)` all ones, so the + 1 must wrap: 2^64 is
+    // still a power of two for the test below (and a debug build must not panic).
+    let shifted_mask = |v: u64| v != 0 && (v | (v - 1)).wrapping_add(1) & (v | (v - 1)) == 0;
     let (rot, ones) = if shifted_mask(elem) {
         let rot = elem.trailing_zeros();
         (rot, (elem >> rot).trailing_ones())
