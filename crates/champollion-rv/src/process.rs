@@ -32,6 +32,7 @@ use crate::engine::Engine;
 use crate::interpreter::Trap;
 use crate::jit::Jit;
 use crate::loader::{self, LoadError, StackInit, auxv};
+use crate::machine;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -56,19 +57,6 @@ pub const SIGRETURN_TRAMPOLINE: u64 = MMAP_TOP;
 /// Load base of a dynamically linked program's interpreter (the dynamic loader), at the
 /// top of the mmap region as on Linux; the libraries it maps go below.
 pub const INTERP_BASE: u64 = MMAP_TOP - (64 << 20);
-
-/// `AT_HWCAP`: one bit per single-letter extension we implement (bit n = letter 'a' + n).
-const HWCAP: u64 = hwcap(b"imafdc");
-
-const fn hwcap(letters: &[u8]) -> u64 {
-    let mut bits = 0;
-    let mut i = 0;
-    while i < letters.len() {
-        bits |= 1 << (letters[i] - b'a');
-        i += 1;
-    }
-    bits
-}
 
 #[derive(Debug)]
 pub enum SpawnError {
@@ -453,7 +441,7 @@ impl Process {
             (auxv::AT_EUID, id.euid as u64),
             (auxv::AT_GID, id.gid as u64),
             (auxv::AT_EGID, id.egid as u64),
-            (auxv::AT_HWCAP, HWCAP),
+            (auxv::AT_HWCAP, machine::Machine::current().hwcap()),
             (auxv::AT_CLKTCK, 100),
             (auxv::AT_SECURE, 0),
         ];

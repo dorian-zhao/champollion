@@ -22,6 +22,7 @@ pub mod host;
 pub mod interpreter;
 pub mod jit;
 pub mod loader;
+pub mod machine;
 pub mod memory;
 pub mod process;
 pub mod signal;

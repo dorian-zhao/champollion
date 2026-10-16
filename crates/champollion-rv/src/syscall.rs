@@ -13,6 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
 use crate::futex;
+use crate::machine;
 use crate::memory::{GuestBuf, MemFault, Memory, Prot};
 use crate::process::{Process, Thread};
 use crate::signal;
@@ -601,19 +602,11 @@ fn signal_number(sig: u64) -> Result<i32, i32> {
     if (0..=signal::NSIG).contains(&sig) { Ok(sig) } else { Err(errno::EINVAL) }
 }
 
-/// `riscv_hwprobe(pairs, count, cpusetsize, cpus, flags)`: describe the hart we emulate.
+/// `riscv_hwprobe(pairs, count, cpusetsize, cpus, flags)`: describe the hart we emulate
+/// (the extensions and their absence come from [`crate::machine`] and nowhere else).
 /// Each pair is `(key: i64, value: u64)`; unknown keys get key -1.
 fn hwprobe(p: &Process, a: [u64; 6]) -> SysResult {
     const BASE_BEHAVIOR_IMA: u64 = 1;
-    const IMA_FD: u64 = 1 << 0;
-    const IMA_C: u64 = 1 << 1;
-    // The bit-manipulation extensions the decoder supports, and Zicond. V is absent on
-    // purpose: software (glibc's ifuncs in particular) must keep choosing its scalar
-    // paths, because there is no vector support yet.
-    const ZBA: u64 = 1 << 3;
-    const ZBB: u64 = 1 << 4;
-    const ZBS: u64 = 1 << 5;
-    const ZICOND: u64 = 1 << 35;
     if a[4] != 0 {
         return Err(errno::EINVAL);
     }
@@ -624,7 +617,7 @@ fn hwprobe(p: &Process, a: [u64; 6]) -> SysResult {
         let value = match i64::from_le_bytes(b) {
             0..=2 => Some(0), // mvendorid, marchid, mimpid
             3 => Some(BASE_BEHAVIOR_IMA),
-            4 => Some(IMA_FD | IMA_C | ZBA | ZBB | ZBS | ZICOND),
+            4 => Some(machine::Machine::current().hwprobe_extensions()),
             _ => None,
         };
         match value {
@@ -1371,12 +1364,12 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
         }
         nr::GETRANDOM => host.getrandom(buf(a[0], a[1], Prot::WRITE)?),
         nr::SCHED_GETAFFINITY => {
-            // Every host CPU, up to 64. Linux returns the number of bytes it wrote: one
-            // `unsigned long` of mask.
+            // Every host CPU, up to 64 (the count `/proc/cpuinfo` reports too). Linux
+            // returns the number of bytes it wrote: one `unsigned long` of mask.
             if a[1] < 8 || !a[1].is_multiple_of(8) {
                 return Err(errno::EINVAL);
             }
-            let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
+            let cpus = machine::harts();
             let mask = if cpus == 64 { u64::MAX } else { (1u64 << cpus) - 1 };
             put(p, a[2], &mask.to_le_bytes())?;
             Ok(8)
@@ -1402,8 +1395,8 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             let fields: [&[u8]; 6] = [
                 b"Linux",
                 &host.hostname(),
-                b"6.12.0-champollion",
-                b"#1 SMP champollion",
+                machine::KERNEL_RELEASE.as_bytes(),
+                machine::KERNEL_VERSION.as_bytes(),
                 b"riscv64",
                 b"(none)",
             ];
