@@ -250,6 +250,10 @@ struct Tx {
     /// it translates vector instructions: the block's entry guard requires the guest to
     /// still be in exactly this configuration (vl == vlmax, m1) or it interprets instead.
     vec: Option<(u32, u32)>,
+    /// Registers per vector group in that configuration (1 for m1, 2 for m2 - the
+    /// widest the translated subset expresses). Ops that cannot span a group must
+    /// refuse when this is not 1.
+    vec_regs: u32,
     /// Bit `r` set: f[r] is known to hold a properly NaN-boxed single at this point of
     /// the block. The block's straight-line shape makes this exact: an `S` result boxes
     /// and a `D` result clears it, so the canonical-NaN check can be skipped for singles
@@ -1363,21 +1367,37 @@ impl Tx {
                 if matches!(kind, VMemKind::Unit | VMemKind::FaultOnlyFirst)
                     && width.bytes() == u64::from(bytes) =>
             {
+                let regs = self.vec_regs;
+                // The fault-only-first prefix shortening is modelled per element; a
+                // group would need it on top of the multi-register move.
+                if kind == VMemKind::FaultOnlyFirst && regs != 1 {
+                    return false;
+                }
                 // With EEW == SEW the whole active set is vlmax * eew = VLEN bits, one
-                // 16-byte move (an EEW the configuration does not cover interprets).
+                // 16-byte move per register of the group (an EEW the configuration
+                // does not cover interprets).
                 let access = if kind == VMemKind::FaultOnlyFirst {
                     Access::FaultOnlyFirst { base: rs1, eew: bytes as u8, vd }
                 } else {
                     Access::Load
                 };
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.accesses.push((self.a.pos(), pc, self.retired, access));
-                match operand {
-                    Some(_) => self.a.ldr_q(FA, ADDR),
-                    None => self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg()),
+                self.a.mov(SRC0, ADDR);
+                for r in 0..regs {
+                    match operand {
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, access));
+                            assert!(self.a.ldr_q_off(FA, SRC0, r * 16));
+                        }
+                        None => {
+                            self.a.add_imm(ADDR, SRC0, r * 16);
+                            self.accesses.push((self.a.pos(), pc, self.retired, access));
+                            self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg());
+                        }
+                    }
+                    self.v_addr((vd + r as u8) & 31);
+                    self.a.str_q(FA, ADDR);
                 }
-                self.v_addr(vd);
-                self.a.str_q(FA, ADDR);
                 self.addr_base = None;
                 true
             }
@@ -1389,11 +1409,14 @@ impl Tx {
                 let operand = self.mem_operand(rs1, 0, 16);
                 self.a.mov(SRC0, ADDR); // v_addr below reuses ADDR
                 for k in 0..n {
-                    self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
                     match operand {
-                        Some(_) => assert!(self.a.ldr_q_off(FA, SRC0, k * 16)),
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
+                            assert!(self.a.ldr_q_off(FA, SRC0, k * 16));
+                        }
                         None => {
                             self.a.add_imm(ADDR, SRC0, k * 16);
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
                             self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg());
                         }
                     }
@@ -1410,11 +1433,14 @@ impl Tx {
                 for k in 0..n {
                     self.v_addr((vs3 + k as u8) & 31);
                     self.a.ldr_q(FA, ADDR);
-                    self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                     match operand {
-                        Some(_) => assert!(self.a.str_q_off(FA, SRC0, k * 16)),
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                            assert!(self.a.str_q_off(FA, SRC0, k * 16));
+                        }
                         None => {
                             self.a.add_imm(ADDR, SRC0, k * 16);
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                             self.a.str_q_reg(FA, self.base_reg(), self.index_reg());
                         }
                     }
@@ -1425,13 +1451,23 @@ impl Tx {
             Inst::VStore {
                 width, kind: VStoreKind::Unit, vs3, rs1, mask: false, nf: 0, ..
             } if width.bytes() == u64::from(bytes) => {
-                self.v_addr(vs3);
-                self.a.ldr_q(FA, ADDR);
+                let regs = self.vec_regs;
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
-                match operand {
-                    Some(_) => self.a.str_q(FA, ADDR),
-                    None => self.a.str_q_reg(FA, self.base_reg(), self.index_reg()),
+                self.a.mov(SRC0, ADDR);
+                for r in 0..regs {
+                    self.v_addr((vs3 + r as u8) & 31);
+                    self.a.ldr_q(FA, ADDR);
+                    match operand {
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                            assert!(self.a.str_q_off(FA, SRC0, r * 16));
+                        }
+                        None => {
+                            self.a.add_imm(ADDR, SRC0, r * 16);
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                            self.a.str_q_reg(FA, self.base_reg(), self.index_reg());
+                        }
+                    }
                 }
                 self.addr_base = None;
                 true
@@ -1444,7 +1480,7 @@ impl Tx {
     /// bitwise ones are element-size independent and use the byte forms).
     fn vector_arith(&mut self, op: VArithOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
-        if mask {
+        if mask || self.vec_regs != 1 {
             return false;
         }
         let bits = bytes * 8;
@@ -1564,24 +1600,32 @@ impl Tx {
             return false;
         }
         let bits = bytes * 8;
-        self.v_addr(vs2);
-        self.a.ldr_q(FA, ADDR);
-        match src {
-            VSel::V(vs1) => {
-                self.v_addr(vs1);
+        let regs = self.vec_regs;
+        // The `.vf` scalar broadcasts once; register operands move per group register.
+        let vs1 = match src {
+            VSel::F(rs1) => {
+                self.vector_fscalar(rs1, FB, bytes);
+                None
+            }
+            VSel::V(vs1) => Some(vs1),
+            _ => return false,
+        };
+        for r in 0..regs {
+            self.v_addr((vs2 + r as u8) & 31);
+            self.a.ldr_q(FA, ADDR);
+            if let Some(vs1) = vs1 {
+                self.v_addr((vs1 + r as u8) & 31);
                 self.a.ldr_q(FB, ADDR);
             }
-            VSel::F(rs1) => self.vector_fscalar(rs1, FB, bytes),
-            _ => return false,
+            match op {
+                VFArithOp::Add => self.a.vec_fadd(bits, FA, FA, FB),
+                VFArithOp::Sub => self.a.vec_fsub(bits, FA, FA, FB),
+                VFArithOp::Mul => self.a.vec_fmul(bits, FA, FA, FB),
+                _ => self.a.vec_fdiv(bits, FA, FA, FB),
+            }
+            self.v_addr((vd + r as u8) & 31);
+            self.a.str_q(FA, ADDR);
         }
-        match op {
-            VFArithOp::Add => self.a.vec_fadd(bits, FA, FA, FB),
-            VFArithOp::Sub => self.a.vec_fsub(bits, FA, FA, FB),
-            VFArithOp::Mul => self.a.vec_fmul(bits, FA, FA, FB),
-            _ => self.a.vec_fdiv(bits, FA, FA, FB),
-        }
-        self.v_addr(vd);
-        self.a.str_q(FA, ADDR);
         true
     }
 
@@ -1595,61 +1639,68 @@ impl Tx {
             return false;
         }
         let bits = bytes * 8;
-        self.v_addr(vs2);
-        self.a.ldr_q(FC, ADDR); // a
-        self.v_addr(vd);
-        self.a.ldr_q(FA, ADDR); // d
-        match src {
-            VSel::V(vs1) => {
-                self.v_addr(vs1);
+        let regs = self.vec_regs;
+        let vs1 = match src {
+            VSel::F(rs1) => {
+                self.vector_fscalar(rs1, FB, bytes);
+                None
+            }
+            VSel::V(vs1) => Some(vs1),
+            _ => return false,
+        };
+        for r in 0..regs {
+            self.v_addr((vs2 + r as u8) & 31);
+            self.a.ldr_q(FC, ADDR); // a
+            self.v_addr((vd + r as u8) & 31);
+            self.a.ldr_q(FA, ADDR); // d
+            if let Some(vs1) = vs1 {
+                self.v_addr((vs1 + r as u8) & 31);
                 self.a.ldr_q(FB, ADDR);
             }
-            VSel::F(rs1) => self.vector_fscalar(rs1, FB, bytes),
-            _ => return false,
+            let out = match op {
+                VFMaOp::Macc => {
+                    self.a.vec_fmla(bits, FA, FC, FB); // d + a×b
+                    FA
+                }
+                VFMaOp::Nmacc => {
+                    self.a.vec_fneg(bits, FA, FA);
+                    self.a.vec_fneg(bits, FC, FC);
+                    self.a.vec_fmla(bits, FA, FC, FB); // -d + -a×b
+                    FA
+                }
+                VFMaOp::Msac => {
+                    self.a.vec_fmls(bits, FA, FC, FB); // d - a×b
+                    self.a.vec_fneg(bits, FA, FA); // -(d - a×b)
+                    FA
+                }
+                VFMaOp::Nmsac => {
+                    self.a.vec_fmls(bits, FA, FC, FB); // d - a×b
+                    FA
+                }
+                VFMaOp::Madd => {
+                    self.a.vec_fmla(bits, FC, FA, FB); // a + d×b
+                    FC
+                }
+                VFMaOp::Nmadd => {
+                    self.a.vec_fneg(bits, FC, FC);
+                    self.a.vec_fneg(bits, FA, FA);
+                    self.a.vec_fmla(bits, FC, FA, FB); // -a + -d×b
+                    FC
+                }
+                VFMaOp::Msub => {
+                    self.a.vec_fneg(bits, FC, FC);
+                    self.a.vec_fmla(bits, FC, FA, FB); // -a + d×b
+                    FC
+                }
+                VFMaOp::Nmsub => {
+                    self.a.vec_fneg(bits, FA, FA);
+                    self.a.vec_fmla(bits, FC, FA, FB); // a + -d×b
+                    FC
+                }
+            };
+            self.v_addr((vd + r as u8) & 31);
+            self.a.str_q(out, ADDR);
         }
-        let out = match op {
-            VFMaOp::Macc => {
-                self.a.vec_fmla(bits, FA, FC, FB); // d + a×b
-                FA
-            }
-            VFMaOp::Nmacc => {
-                self.a.vec_fneg(bits, FA, FA);
-                self.a.vec_fneg(bits, FC, FC);
-                self.a.vec_fmla(bits, FA, FC, FB); // -d + -a×b
-                FA
-            }
-            VFMaOp::Msac => {
-                self.a.vec_fmls(bits, FA, FC, FB); // d - a×b
-                self.a.vec_fneg(bits, FA, FA); // -(d - a×b)
-                FA
-            }
-            VFMaOp::Nmsac => {
-                self.a.vec_fmls(bits, FA, FC, FB); // d - a×b
-                FA
-            }
-            VFMaOp::Madd => {
-                self.a.vec_fmla(bits, FC, FA, FB); // a + d×b
-                FC
-            }
-            VFMaOp::Nmadd => {
-                self.a.vec_fneg(bits, FC, FC);
-                self.a.vec_fneg(bits, FA, FA);
-                self.a.vec_fmla(bits, FC, FA, FB); // -a + -d×b
-                FC
-            }
-            VFMaOp::Msub => {
-                self.a.vec_fneg(bits, FC, FC);
-                self.a.vec_fmla(bits, FC, FA, FB); // -a + d×b
-                FC
-            }
-            VFMaOp::Nmsub => {
-                self.a.vec_fneg(bits, FA, FA);
-                self.a.vec_fmla(bits, FC, FA, FB); // a + -d×b
-                FC
-            }
-        };
-        self.v_addr(vd);
-        self.a.str_q(out, ADDR);
         true
     }
 
@@ -1659,9 +1710,12 @@ impl Tx {
         if bytes < 4 {
             return false;
         }
+        let regs = self.vec_regs;
         self.vector_fscalar(rs1, FA, bytes);
-        self.v_addr(vd);
-        self.a.str_q(FA, ADDR);
+        for r in 0..regs {
+            self.v_addr((vd + r as u8) & 31);
+            self.a.str_q(FA, ADDR);
+        }
         true
     }
 
@@ -1687,11 +1741,27 @@ impl Tx {
     /// `vmv.v.*`: the whole register becomes the broadcast of the source.
     fn vector_mv(&mut self, vd: u8, src: VSel) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
-        if !self.vector_operand(src, FA, bytes) {
-            return false;
+        let regs = self.vec_regs;
+        match src {
+            // A register source moves each group register too.
+            VSel::V(vs1) => {
+                for r in 0..regs {
+                    self.v_addr((vs1 + r as u8) & 31);
+                    self.a.ldr_q(FA, ADDR);
+                    self.v_addr((vd + r as u8) & 31);
+                    self.a.str_q(FA, ADDR);
+                }
+            }
+            _ => {
+                if !self.vector_operand(src, FA, bytes) {
+                    return false;
+                }
+                for r in 0..regs {
+                    self.v_addr((vd + r as u8) & 31);
+                    self.a.str_q(FA, ADDR);
+                }
+            }
         }
-        self.v_addr(vd);
-        self.a.str_q(FA, ADDR);
         true
     }
 
@@ -1701,7 +1771,7 @@ impl Tx {
     /// they were, exactly as the interpreter leaves them.
     fn vector_cmp(&mut self, op: VCmpOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
         let Some((sew, bytes)) = self.vec else { return false };
-        if mask || sew != 0 || bytes != 1 {
+        if mask || sew != 0 || bytes != 1 || self.vec_regs != 1 {
             return false;
         }
         if !matches!(op, VCmpOp::Eq | VCmpOp::Ne) {
@@ -1740,6 +1810,9 @@ impl Tx {
     /// below `vl`, matching the interpreter's per-bit update.
     fn vector_mask(&mut self, op: VMaskOp, vd: u8, vs1: u8, vs2: u8) -> bool {
         let Some((_, _)) = self.vec else { return false };
+        if self.vec_regs != 1 {
+            return false;
+        }
         let mask = (1u64 << self.vec_vl()) - 1;
         self.v_addr(vd);
         self.a.ldr_off(DST, ADDR, 0);
@@ -1779,6 +1852,9 @@ impl Tx {
     /// work once the mask word is in a GPR: `clz(rbit(m))`.
     fn vector_first(&mut self, rd: u8, vs2: u8) -> bool {
         let Some((_, _)) = self.vec else { return false };
+        if self.vec_regs != 1 {
+            return false;
+        }
         let mask = (1u64 << self.vec_vl()) - 1;
         self.v_addr(vs2);
         self.a.ldr_off(DST, ADDR, 0);
@@ -1813,7 +1889,9 @@ impl Tx {
         // Later vector ops in this block run under the new configuration; if it is not
         // one this subset can express, the first of them ends the block for the
         // interpreter (the state write above stays, as it must).
-        self.vec = vector_config((vtype, vl));
+        let (vec, regs) = vector_config((vtype, vl)).map_or((None, 1), |(v, r)| (Some(v), r));
+        self.vec = vec;
+        self.vec_regs = regs;
         true
     }
 
@@ -1971,13 +2049,19 @@ fn mem_base(inst: Inst) -> Option<u8> {
 /// The vector configuration `(sew log2, element bytes)` a translation may assume for
 /// `(vtype, vl)`: m1 with no `vill`, a supported element width, and `vl` at its maximum
 /// (VLEN = 128 bits, one NEON register). Anything else must interpret.
-fn vector_config((vtype, vl): (u64, u64)) -> Option<(u32, u32)> {
+fn vector_config((vtype, vl): (u64, u64)) -> Option<((u32, u32), u32)> {
     let sew = (vtype >> 3) & 7;
-    if vtype >> 63 != 0 || vtype & 7 != 0 || sew > 3 {
+    if vtype >> 63 != 0 || sew > 3 {
         return None;
     }
+    // m1 and m2 are the LMULs the translated subset handles; m4/m8 interpret.
+    let lmul = vtype & 7;
+    if lmul > 1 {
+        return None;
+    }
+    let regs = 1u32 << lmul;
     let bytes = 1u32 << sew;
-    if vl == u64::from(16 / bytes) { Some((sew as u32, bytes)) } else { None }
+    if vl == u64::from(16 / bytes * regs) { Some(((sew as u32, bytes), regs)) } else { None }
 }
 
 /// Whether the instruction reads or writes vector state, so its translation has to pin
@@ -2106,8 +2190,11 @@ pub fn translate(
     // time. A configuration the subset cannot express leaves `vec` empty: the scalar
     // prefix still translates (and is cached), and the first vector instruction ends the
     // block, exactly as untranslated instructions always have.
-    let vec =
-        if block.iter().any(|&(inst, _)| is_vector(inst)) { vector_config(vstate) } else { None };
+    let (vec, vec_regs) = if block.iter().any(|&(inst, _)| is_vector(inst)) {
+        vector_config(vstate).map_or((None, 1), |(v, r)| (Some(v), r))
+    } else {
+        (None, 1)
+    };
     // The entry guard is only needed while a translated vector op can run under the
     // entry's vector state: a `vsetivli` in the block re-establishes it from constants.
     let guard = vec.is_some()
@@ -2134,6 +2221,7 @@ pub fn translate(
         interrupt_slot,
         identity,
         vec,
+        vec_regs,
         fboxed: 0,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is

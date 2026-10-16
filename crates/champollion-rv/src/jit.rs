@@ -637,6 +637,76 @@ mod tests {
     }
 
     #[test]
+    fn vector_m2_groups_match_the_interpreter() {
+        // The axpy shape clang emits for `a += s * b`: e32/m2 with whole-register
+        // moves and a vfmacc.vf over the two-register group.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vl2re32 = |vd: u32, rs1: u32| {
+            (1 << 29) | (1 << 25) | (0b01000 << 20) | (rs1 << 15) | (vd << 7) | 0x07
+        };
+        let vs2r32 = |vs3: u32, rs1: u32| {
+            (1 << 29) | (1 << 25) | (0b01000 << 20) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let vfmacc_vf = |vd: u32, vs2: u32, f: u32| {
+            (0x2c << 26) | (1 << 25) | (vs2 << 20) | (f << 15) | (0b101 << 12) | (vd << 7) | 0x57
+        };
+        let vle32 = |vd: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse32 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let prog = [
+            vsetivli(0, 8, 0xd1),              // e32, m2, ta, ma (VLMAX = 8)
+            op_fp(0b11110, 0b00, 0, 0, 10, 0), // fmv.w.x f0, a0 (2.0)
+            vl2re32(8, 11),                    // v8-v9 = b
+            vl2re32(10, 12),                   // v10-v11 = a
+            vfmacc_vf(10, 8, 0),               // v10-v11 += f0 × v8-v9
+            vs2r32(10, 12),                    // store back over a
+            vle32(2, 11),                      // both unit-stride forms too
+            vse32(2, 13),
+        ];
+        let setup_data = |mem: &GuestMemory| {
+            let b: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let a: [f32; 8] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
+            for (i, v) in b.iter().chain(a.iter()).enumerate() {
+                mem.write_privileged(DATA + 4 * i as u64, &v.to_bits().to_le_bytes()).unwrap();
+            }
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in
+                [(11u8, DATA), (12, DATA + 32), (13, DATA + 128), (10, 2.0f32.to_bits() as u64)]
+            {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem_i = setup(&prog);
+        setup_data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        setup_data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        assert_eq!(jit.stats.interpreted.get("VFMa"), None, "m2 fma stayed in the JIT");
+        let mut out = [0u8; 16];
+        mem_j.read_privileged(DATA + 32, &mut out).unwrap();
+        assert_eq!(f32::from_le_bytes(out[..4].try_into().unwrap()), 2.5);
+        assert_eq!(f32::from_le_bytes(out[12..16].try_into().unwrap()), 10.0);
+        let mut unit = [0u8; 4];
+        mem_j.read_privileged(DATA + 128, &mut unit).unwrap();
+        assert_eq!(f32::from_le_bytes(unit), 1.0, "unit-stride group load");
+    }
+
+    #[test]
     fn f32_boxing_elision_matches_the_interpreter() {
         // The known-boxed fast path must agree with the interpreter's per-operand
         // canonical-NaN rule in both directions: a single this block boxed itself
