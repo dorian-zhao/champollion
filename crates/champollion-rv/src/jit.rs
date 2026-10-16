@@ -951,6 +951,48 @@ mod tests {
     }
 
     #[test]
+    fn internal_back_edges_match_the_interpreter() {
+        // A backward branch to an instruction of the same block re-enters the loop body
+        // in place instead of a side exit through the block head. instret must stay
+        // exact across passes (the loop leaves through its fall-through exit), the
+        // prefix before the loop head runs once, and the entry guard's facts must
+        // survive without re-running it.
+        let (_, cpu) = same_as_interpreter(&[
+            addi(9, 0, 7),   // 0x00: a1 = 7 (before the loop head: runs once)
+            addi(10, 10, 1), // 0x04: a0 += 1 <- loop head
+            addi(12, 12, 2), // 0x08: a2 += 2
+            b(1, 10, 9, -8), // 0x0c: bne a0, a1 -> 0x04 (the internalized back edge)
+            ECALL,           // 0x10: leaves through the fall-through exit
+        ]);
+        assert_eq!((cpu.x[10], cpu.x[12]), (7, 14));
+
+        // The same shape with singles the block boxed itself: ft5 and ft6 are read in
+        // every pass, but only written once before the loop head, so the carried boxed
+        // facts must hold again on each re-entry.
+        let (_, cpu) = same_as_interpreter(&[
+            op_fp(0b11010, 0b00, 7, 5, 0, 0), // 0x00: fcvt.s.w ft5, zero: +0.0, boxed
+            op_fp(0b11010, 0b00, 7, 6, 0, 0), // 0x04: fcvt.s.w ft6, zero: +0.0, boxed
+            addi(9, 0, 4),                    // 0x08: a1 = 4
+            op_fp(0b00000, 0b00, 7, 6, 6, 5), // 0x0c: fadd.s ft6, ft6, ft5 <- loop head
+            addi(10, 10, 1),                  // 0x10: a0 += 1
+            b(1, 10, 9, -8),                  // 0x14: bne a0, a1 -> 0x0c
+            ECALL,                            // 0x18
+        ]);
+        let zero = 0xffff_ffff_0000_0000; // +0.0, NaN-boxed
+        assert_eq!((cpu.x[10], cpu.f[5], cpu.f[6]), (4, zero, zero));
+
+        // And with the branch as the block's last instruction (decode stops at the
+        // 64-instruction limit): the edge replaces the taken exit entirely.
+        let mut prog = vec![addi(9, 0, 4)]; // a1 = 4
+        prog.extend(vec![addi(0, 0, 0); 61]); // pad the block up to the limit
+        prog.push(addi(10, 10, 1)); // 0x100f8: a0 += 1 <- loop head
+        prog.push(b(1, 10, 9, -4)); // 0x100fc: bne -> 0x100f8 (64th instruction)
+        prog.push(ECALL); // 0x10100: a block of its own
+        let (_, cpu) = same_as_interpreter(&prog);
+        assert_eq!(cpu.x[10], 4);
+    }
+
+    #[test]
     fn base_register_cache_matches_the_interpreter() {
         let (_, cpu) = same_as_interpreter(&[
             addi(10, 0, 0x55),     // a0 = 0x55

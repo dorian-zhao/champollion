@@ -196,6 +196,24 @@ enum Tail {
     Dynamic { code: u64 },
 }
 
+/// A backward branch internalized into its own block: the taken path re-enters the loop
+/// body in place (see [`Tx::emit_edge`]) instead of leaving through a side exit, which
+/// would re-run the block's entry guards (boxed singles, the vector configuration) and
+/// its instret charge on every iteration.
+#[derive(Clone, Copy)]
+struct Edge {
+    /// The `b.cond` site, patched to the landing pad.
+    bcond: usize,
+    /// The target instruction's index in the block.
+    t: u32,
+    /// Instructions one pass retires (`branch index + 1 - t`), for the instret fix-ups.
+    m: u32,
+    /// The loop head's guest pc: where an interrupt resumes.
+    pc: u64,
+    /// Word index of the loop body's first instruction (the pad's jump target).
+    lt: usize,
+}
+
 /// Number of entries in the jump cache (a power of two): `(guest pc, host code address)`
 /// pairs indexed by guest pc bits 1..=16. 4096 entries thrashed on Lua (600k misses for 3.4k
 /// blocks, from conflicting targets); 65536 (1 MiB) leaves only cold misses.
@@ -259,6 +277,9 @@ struct Tx {
     /// and a `D` result clears it, so the canonical-NaN check can be skipped for singles
     /// the block itself produced.
     fboxed: u32,
+    /// The block's internalized backward edge, if any: emitted at the very end, after
+    /// the body it jumps back into (see [`Tx::emit_edge`]).
+    edge: Option<Edge>,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -1983,6 +2004,29 @@ impl Tx {
         self.constant(rd, value);
     }
 
+    /// Emit the landing pad of an internalized backward edge (see [`Edge`]): scale the
+    /// optimistic instret charge down to what this pass retired, check for interrupts
+    /// with the count exact, then re-charge the block like a fresh entry and jump back
+    /// to the loop body's first instruction.
+    ///
+    /// One pass retires `m` instructions, but the entry charged the whole block: each
+    /// edge nets `+m`, the same as the dispatcher re-entry used to (undo down to the
+    /// branch, full charge back), so every exit's static `retired - retired_before`
+    /// correction stays valid. The entry guards need not run again: what they establish
+    /// is either re-materialized by the block's own writes every pass (boxed singles) or
+    /// a value this re-entry never touches (`vsetvl` blocks never internalize).
+    fn emit_edge(&mut self, edge: Edge) {
+        let here = self.a.pos();
+        self.a.patch(edge.bcond, here);
+        let skipped = self.retired - (edge.t + edge.m);
+        if skipped > 0 {
+            self.a.sub_imm(INSTRET_REG, INSTRET_REG, skipped);
+        }
+        self.interrupt_check(Some(edge.pc));
+        self.a.add_imm(INSTRET_REG, INSTRET_REG, self.retired - edge.t);
+        self.a.b(edge.lt);
+    }
+
     fn emit_tails(&mut self) {
         // Tails may add tails (a side exit's interrupt check), so iterate by index.
         let mut i = 0;
@@ -2220,6 +2264,26 @@ fn base_reuse(block: &[(Inst, u8)]) -> Vec<bool> {
     reused
 }
 
+/// The block index a backward branch's target names, if the branch can re-enter the
+/// body in place (see [`Tx::emit_edge`]): the target is an instruction of this very
+/// block, no `vsetvl` intervenes (it would change the vector state across a pass), and
+/// the translation carried no register fact (`known`, `ADDR`) into the target - a fresh
+/// entry and a re-entry after a pass then start from the same translation state.
+fn internal_edge(
+    pcs: &[u64],
+    carry_clean: &[bool],
+    target: u64,
+    upto: usize,
+    has_vset: bool,
+    already: Option<Edge>,
+) -> Option<usize> {
+    if has_vset || already.is_some() {
+        return None;
+    }
+    let t = pcs[..upto].iter().position(|&p| p == target)?;
+    carry_clean[t].then_some(t)
+}
+
 /// Translate `block` (as decoded at `pc`) into code that will live at word index
 /// `block_word` of the code buffer, whose exit stub is at word index `stub_word`. Returns
 /// `None` if not even the first instruction can be translated. Indirect jumps probe the
@@ -2260,6 +2324,9 @@ pub fn translate(
                 )
             })
             .any(|&(inst, _)| is_vector(inst));
+    // A `vsetvl` changes the vector state within the block, so an internalized edge must
+    // not skip the entry guard: such blocks keep the dispatcher re-entry.
+    let has_vset = block.iter().any(|&(inst, _)| matches!(inst, Inst::VSetvl { .. }));
     let mut tx = Tx {
         a: Asm::new(),
         tails: Vec::new(),
@@ -2276,6 +2343,7 @@ pub fn translate(
         vec,
         vec_regs,
         fboxed: 0,
+        edge: None,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
@@ -2324,7 +2392,16 @@ pub fn translate(
     // The register the previous instruction set to a constant (`lui`, `auipc`), and its value.
     let mut known: Option<(u8, u64)> = None;
     let reused = base_reuse(block);
+    // Per-instruction translation state, for internalizing a backward branch (see
+    // [`Edge`]): each instruction's guest pc and code position, and whether the
+    // translation carried no register fact (`ADDR` or `known`) into it.
+    let mut pcs: Vec<u64> = Vec::with_capacity(block.len());
+    let mut code_pos: Vec<usize> = Vec::with_capacity(block.len());
+    let mut carry_clean: Vec<bool> = Vec::with_capacity(block.len());
     for (i, &(inst, len)) in block.iter().enumerate() {
+        pcs.push(at);
+        code_pos.push(tx.a.pos());
+        carry_clean.push(tx.addr_base.is_none() && known.is_none());
         tx.base_reused = reused[i];
         let len = len as u64;
         let next = at + len;
@@ -2386,27 +2463,60 @@ pub fn translate(
                 let target = at.wrapping_add(sext(offset));
                 if i + 1 < block.len() {
                     // Not the end of the block: fall through into the rest of it, and
-                    // leave through a side exit when taken.
+                    // leave through a side exit when taken. A target inside the block
+                    // is the loop's back edge: re-enter the body in place instead.
+                    let t = internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge);
                     let bcond = tx.a.pos();
-                    tx.a.b_cond(c, bcond); // patched once the tail exists
-                    let side =
-                        Tail::Side { pc: target, retired_before: retired, back: target <= at };
-                    tx.tails.push((bcond, side));
+                    tx.a.b_cond(c, bcond); // patched to the tail or the edge code
+                    match t {
+                        Some(t) => {
+                            tx.edge = Some(Edge {
+                                bcond,
+                                t: t as u32,
+                                m: retired - t as u32,
+                                pc: target,
+                                lt: code_pos[t],
+                            });
+                        }
+                        None => {
+                            let side = Tail::Side {
+                                pc: target,
+                                retired_before: retired,
+                                back: target <= at,
+                            };
+                            tx.tails.push((bcond, side));
+                        }
+                    }
                     tx.retired = retired;
                     known = None;
                     at = next;
                     continue;
                 }
-                // b.cond taken; b fallthrough-tail; taken: b taken-tail
+                // b.cond taken; b fallthrough-tail; taken: the edge, or a taken-tail
+                let t = internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge);
                 let bcond = tx.a.pos();
-                tx.a.b_cond(c, bcond + 2);
+                match t {
+                    Some(t) => {
+                        tx.a.b_cond(c, bcond); // patched to the edge code
+                        tx.edge = Some(Edge {
+                            bcond,
+                            t: t as u32,
+                            m: retired - t as u32,
+                            pc: target,
+                            lt: code_pos[t],
+                        });
+                    }
+                    None => tx.a.b_cond(c, bcond + 2),
+                }
                 exits.push((tx.a.pos(), Some(next)));
                 tx.exit(Tail::Static { pc: next, code: exit::NEXT });
-                if target <= at {
-                    tx.interrupt_check(Some(target));
+                if t.is_none() {
+                    if target <= at {
+                        tx.interrupt_check(Some(target));
+                    }
+                    exits.push((tx.a.pos(), Some(target)));
+                    tx.exit(Tail::Static { pc: target, code: exit::NEXT });
                 }
-                exits.push((tx.a.pos(), Some(target)));
-                tx.exit(Tail::Static { pc: target, code: exit::NEXT });
                 ended = true;
                 break;
             }
@@ -2471,6 +2581,12 @@ pub fn translate(
         a.add_imm(INSTRET_REG, INSTRET_REG, retired);
         a.code[0]
     };
+    // The landing pad of an internalized backward edge sits behind the body (the tails
+    // follow it): a taken back edge lands here, corrects instret, checks interrupts,
+    // re-charges the block, and jumps back into the loop body.
+    if let Some(edge) = tx.edge {
+        tx.emit_edge(edge);
+    }
     tx.emit_tails();
     exits.append(&mut tx.tail_exits);
     for &b in &tx.stub_branches {
