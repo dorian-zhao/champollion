@@ -214,6 +214,19 @@ struct Edge {
     lt: usize,
 }
 
+/// A loop body emitted twice (see `translate`): the first copy's back edge continues
+/// into the second, and only the second's leaves to the landing pad, so the pad's
+/// charge/check runs once per two iterations.
+struct Unroll {
+    /// Index of the back-edge branch ending one pass.
+    b: usize,
+    /// The loop body's first instruction.
+    t: usize,
+    /// Fall-through jumps out of each copy, patched to the code after the bodies.
+    after0: Option<usize>,
+    after1: Option<usize>,
+}
+
 /// Number of entries in the jump cache (a power of two): `(guest pc, host code address)`
 /// pairs indexed by guest pc bits 1..=16. 4096 entries thrashed on Lua (600k misses for 3.4k
 /// blocks, from conflicting targets); 65536 (1 MiB) leaves only cold misses.
@@ -2428,25 +2441,55 @@ pub fn translate(
     }
 
     let mut retired = 0u32;
-    let mut at = pc;
     let mut exits = Vec::new();
     let mut ended = false;
     // The register the previous instruction set to a constant (`lui`, `auipc`), and its value.
     let mut known: Option<(u8, u64)> = None;
     let reused = base_reuse(block);
     // Per-instruction translation state, for internalizing a backward branch (see
-    // [`Edge`]): each instruction's guest pc and code position, and whether the
-    // translation carried no register fact (`ADDR` or `known`) into it.
+    // [`Edge`]) and for unrolling its body ([`Unroll`]): each instruction's guest pc
+    // and code position, whether the translation carried no register fact (`ADDR` or
+    // `known`) into it, and which `f` registers were known boxed there.
     let mut pcs: Vec<u64> = Vec::with_capacity(block.len());
-    let mut code_pos: Vec<usize> = Vec::with_capacity(block.len());
-    let mut carry_clean: Vec<bool> = Vec::with_capacity(block.len());
-    for (i, &(inst, len)) in block.iter().enumerate() {
-        pcs.push(at);
-        code_pos.push(tx.a.pos());
-        carry_clean.push(tx.addr_base.is_none() && known.is_none());
-        tx.base_reused = reused[i];
-        let len = len as u64;
+    {
+        let mut a = pc;
+        for &(_, len) in block {
+            pcs.push(a);
+            a += u64::from(len);
+        }
+    }
+    let mut code_pos = vec![0usize; block.len()];
+    let mut carry_clean = vec![false; block.len()];
+    let mut fboxed_at = vec![0u32; block.len()];
+    // The emission runs the block's instructions in order, except that an unrolled back
+    // edge sends it back over the loop body for a second copy (`pass` 1); the tracker
+    // resets to the loop head's entry state so the copy translates exactly like the
+    // first, and the counters line back up when the main pass resumes after the body.
+    let mut i = 0usize;
+    let mut pass = 0u8;
+    let mut unroll: Option<Unroll> = None;
+    while i < block.len() {
+        if pass == 1 && unroll.as_ref().is_some_and(|u| i == u.b + 1) {
+            // The second copy is done: the main pass resumes, and both copies' exit
+            // jumps land here.
+            pass = 0;
+            if let Some(u) = &unroll {
+                let after = tx.a.pos();
+                for site in [u.after0, u.after1].into_iter().flatten() {
+                    tx.a.patch(site, after);
+                }
+            }
+        }
+        let (inst, len) = block[i];
+        let len = u64::from(len);
+        let at = pcs[i];
         let next = at + len;
+        if pass == 0 {
+            code_pos[i] = tx.a.pos();
+            carry_clean[i] = tx.addr_base.is_none() && known.is_none();
+            fboxed_at[i] = tx.fboxed;
+        }
+        tx.base_reused = reused[i];
         match inst {
             Inst::Jal { rd, offset } => {
                 tx.link(rd, next);
@@ -2506,47 +2549,97 @@ pub fn translate(
                 if i + 1 < block.len() {
                     // Not the end of the block: fall through into the rest of it, and
                     // leave through a side exit when taken. A target inside the block
-                    // is the loop's back edge: re-enter the body in place instead.
-                    let t = internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge);
+                    // is the loop's back edge: emit the body a second time and re-enter
+                    // in place instead (see [`Unroll`] and [`Tx::emit_edge`]).
                     let bcond = tx.a.pos();
-                    tx.a.b_cond(c, bcond); // patched to the tail or the edge code
-                    match t {
-                        Some(t) => {
-                            tx.edge = Some(Edge {
-                                bcond,
-                                t: t as u32,
-                                m: retired - t as u32,
-                                pc: target,
-                                lt: code_pos[t],
-                            });
-                        }
-                        None => {
-                            let side = Tail::Side {
-                                pc: target,
-                                retired_before: retired,
-                                back: target <= at,
-                            };
-                            tx.tails.push((bcond, side));
-                        }
+                    if pass == 1 && unroll.as_ref().is_some_and(|u| i == u.b) {
+                        // The second copy's back edge: taken -> the landing pad,
+                        // fall-through -> the code after the bodies.
+                        tx.a.b_cond(c, bcond); // patched by `emit_edge`
+                        let after = tx.a.pos();
+                        tx.a.b(after); // patched to the code after the bodies
+                        unroll.as_mut().unwrap().after1 = Some(after);
+                        let u = unroll.as_ref().unwrap();
+                        tx.edge = Some(Edge {
+                            bcond,
+                            t: u.t as u32,
+                            m: retired - u.t as u32,
+                            pc: target,
+                            lt: code_pos[u.t],
+                        });
+                    } else if let Some(t) = if unroll.is_none() {
+                        internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge)
+                    } else {
+                        None
+                    } {
+                        // The loop's back edge, discovered here: the first copy's taken
+                        // path continues into the second copy right below it.
+                        tx.a.b_cond(c, bcond + 2); // over the fall-through jump
+                        let after = tx.a.pos();
+                        tx.a.b(after); // patched to the code after the bodies
+                        tx.a.add_imm(INSTRET_REG, INSTRET_REG, retired - t as u32);
+                        unroll = Some(Unroll { b: i, t, after0: Some(after), after1: None });
+                        tx.fboxed = fboxed_at[t];
+                        tx.addr_base = None;
+                        known = None;
+                        retired = t as u32;
+                        pass = 1;
+                        i = t;
+                        tx.retired = retired;
+                        continue;
+                    } else {
+                        tx.a.b_cond(c, bcond); // patched once the tail exists
+                        let side =
+                            Tail::Side { pc: target, retired_before: retired, back: target <= at };
+                        tx.tails.push((bcond, side));
                     }
                     tx.retired = retired;
                     known = None;
-                    at = next;
+                    i += 1;
                     continue;
                 }
-                // b.cond taken; b fallthrough-tail; taken: the edge, or a taken-tail
-                let t = internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge);
+                // b.cond taken; b fallthrough-tail; taken: the second copy (the first
+                // copy's back edge), the landing pad (the second copy's), or a tail.
                 let bcond = tx.a.pos();
+                if pass == 1 && unroll.as_ref().is_some_and(|u| i == u.b) {
+                    tx.a.b_cond(c, bcond); // patched by `emit_edge`
+                    let u = unroll.as_ref().unwrap();
+                    tx.edge = Some(Edge {
+                        bcond,
+                        t: u.t as u32,
+                        m: retired - u.t as u32,
+                        pc: target,
+                        lt: code_pos[u.t],
+                    });
+                    exits.push((tx.a.pos(), Some(next)));
+                    tx.exit(Tail::Static { pc: next, code: exit::NEXT });
+                    ended = true;
+                    break;
+                }
+                let t = if unroll.is_none() {
+                    internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge)
+                } else {
+                    None
+                };
                 match t {
                     Some(t) => {
-                        tx.a.b_cond(c, bcond); // patched to the edge code
-                        tx.edge = Some(Edge {
-                            bcond,
-                            t: t as u32,
-                            m: retired - t as u32,
-                            pc: target,
-                            lt: code_pos[t],
-                        });
+                        // The loop's back edge, discovered here: taken -> the second
+                        // copy below the fall-through exit.
+                        tx.a.b_cond(c, bcond); // patched to the second copy
+                        exits.push((tx.a.pos(), Some(next)));
+                        tx.exit(Tail::Static { pc: next, code: exit::NEXT });
+                        let copy2 = tx.a.pos();
+                        tx.a.patch(bcond, copy2);
+                        tx.a.add_imm(INSTRET_REG, INSTRET_REG, retired - t as u32);
+                        unroll = Some(Unroll { b: i, t, after0: None, after1: None });
+                        tx.fboxed = fboxed_at[t];
+                        tx.addr_base = None;
+                        known = None;
+                        retired = t as u32;
+                        pass = 1;
+                        i = t;
+                        tx.retired = retired;
+                        continue;
                     }
                     None => tx.a.b_cond(c, bcond + 2),
                 }
@@ -2610,12 +2703,14 @@ pub fn translate(
             Inst::Auipc { rd, imm } if rd != 0 => Some((rd, at.wrapping_add(sext(imm)))),
             _ => None,
         };
-        at = next;
+        i += 1;
     }
     if !ended {
         // The block stopped at a length or page limit: fall through to the next one.
-        exits.push((tx.a.pos(), Some(at)));
-        tx.exit(Tail::Static { pc: at, code: exit::NEXT });
+        let (_, last_len) = block[block.len() - 1];
+        let after = pcs[block.len() - 1] + u64::from(last_len);
+        exits.push((tx.a.pos(), Some(after)));
+        tx.exit(Tail::Static { pc: after, code: exit::NEXT });
     }
     tx.retired = retired;
     tx.a.code[instret_at] = {

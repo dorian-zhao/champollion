@@ -1043,6 +1043,27 @@ mod tests {
     }
 
     #[test]
+    fn unrolled_loops_match_the_interpreter() {
+        // A mid-body side exit inside the unrolled loop: firing from the first and from
+        // the second copy, with the instret corrections both copies' exits rely on.
+        let prog = |target: i32| {
+            vec![
+                addi(9, 0, 10),      // 0x00: a1 = 10, counting passes
+                addi(12, 0, target), // 0x04: a2 = the a0 the loop exits on
+                addi(10, 10, 1),     // 0x08: a0 += 1 <- loop head
+                beq(10, 12, 12),     // 0x0c: a0 == a2 -> 0x18 (the side exit)
+                addi(9, 9, -1),      // 0x10: a1 -= 1
+                b(1, 9, 0, -12),     // 0x14: bne a1, zero -> 0x08 (the back edge)
+                ECALL,               // 0x18
+            ]
+        };
+        let (_, cpu) = same_as_interpreter(&prog(3)); // exits from the first copy
+        assert_eq!((cpu.x[10], cpu.x[9]), (3, 8));
+        let (_, cpu) = same_as_interpreter(&prog(2)); // exits from the second copy
+        assert_eq!((cpu.x[10], cpu.x[9]), (2, 9));
+    }
+
+    #[test]
     fn base_register_cache_matches_the_interpreter() {
         let (_, cpu) = same_as_interpreter(&[
             addi(10, 0, 0x55),     // a0 = 0x55
