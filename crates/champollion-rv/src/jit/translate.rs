@@ -513,6 +513,9 @@ impl Tx {
                     return false;
                 }
             }
+            Inst::VSetvl { rd, rs1, rs2, kind: VSetKind::RegisterAvl } => {
+                self.vsetvli(rd, rs1, u64::from(rs2));
+            }
             Inst::VArith { op, vd, vs2, src, mask } => {
                 if !self.vector_arith(op, vd, vs2, src, mask) {
                     return false;
@@ -1330,6 +1333,30 @@ impl Tx {
         true
     }
 
+    /// `vsetvli` with a register AVL (the shape every glibc loop head uses): the state
+    /// write is a saturating minimum against vlmax. The resulting configuration is
+    /// dynamic, so no vector op after it in this block may translate (they end the
+    /// block, and the interpreter runs them under the freshly written state).
+    fn vsetvli(&mut self, rd: u8, rs1: u8, bits: u64) {
+        let (vtype, vlmax) = crate::vector::vset_compute(u64::MAX, bits);
+        self.a.mov_imm(SRC0, vlmax);
+        if rs1 != 0 {
+            // AVL = x0 asks for the largest available (vlmax, which SRC0 already holds).
+            let avl = self.src(rs1, SRC1);
+            self.a.cmp(avl, SRC0);
+            self.a.csel(SRC0, avl, SRC0, Cond::Lo);
+        }
+        let d = self.dst(rd);
+        if d != SRC0 {
+            self.a.mov(d, SRC0);
+        }
+        self.a.mov_imm(SRC1, vtype);
+        self.a.str_off(SRC1, CTX, VTYPE_OFF);
+        self.a.str_off(SRC0, CTX, VL_OFF);
+        self.commit(rd, d);
+        self.vec = None;
+    }
+
     /// The vector instruction's source: another register, a broadcast scalar from an x
     /// register, or the sign-extended 5-bit immediate (arithmetic forms).
     fn vector_operand(&mut self, src: VSel, dst: Reg, bytes: u32) -> bool {
@@ -1576,7 +1603,10 @@ pub fn translate(
         && block
             .iter()
             .take_while(|&&(inst, _)| {
-                !matches!(inst, Inst::VSetvl { kind: VSetKind::ImmediateAvl, .. })
+                !matches!(
+                    inst,
+                    Inst::VSetvl { kind: VSetKind::ImmediateAvl | VSetKind::RegisterAvl, .. }
+                )
             })
             .any(|&(inst, _)| is_vector(inst));
     let mut tx = Tx {

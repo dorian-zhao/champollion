@@ -58,6 +58,11 @@ pub struct Jit {
     stub_word: usize,
     /// Guest pc -> byte offset of its translation.
     blocks: HashMap<u64, usize, BuildHasherDefault<PcHasher>>,
+    /// Guest pc -> the vector state its translation was refused under: RVV-heavy code
+    /// re-enters such pcs every iteration (a block whose first instruction never
+    /// translates), and re-decoding them each time dominated the dispatcher. Cleared
+    /// with the translations.
+    refused: HashMap<u64, (u64, u64), BuildHasherDefault<PcHasher>>,
     /// `GuestMemory::code_generation` the translations are valid for.
     generation: u64,
     /// Instruction fetch for translation, valid for `GuestMemory::generation` `tlb_generation`.
@@ -162,6 +167,7 @@ impl Jit {
             enter,
             stub_word: 0,
             blocks: HashMap::default(),
+            refused: HashMap::default(),
             generation: 0,
             tlb: Tlb::default(),
             tlb_generation: u64::MAX,
@@ -190,6 +196,7 @@ impl Jit {
             p.reset();
         }
         self.blocks.clear();
+        self.refused.clear();
         self.unchained.clear();
         self.jump_cache().fill([1, 0]);
         let (words, stub) = translate::trampoline();
@@ -211,6 +218,9 @@ impl Jit {
     ) -> Result<Option<usize>, Trap> {
         if let Some(&at) = self.blocks.get(&pc) {
             return Ok(Some(at));
+        }
+        if self.refused.get(&pc) == Some(&vstate) {
+            return Ok(None); // decoded and refused already, for this very state
         }
         self.stats.misses += 1;
         // Fetch through a TLB: a lookup per instruction in the mapping table showed up as
@@ -234,6 +244,7 @@ impl Jit {
                 translate::translate(&block, pc, word, stub, cache, slot, identity, vstate)
             else {
                 self.stats.refused += 1;
+                self.refused.insert(pc, vstate);
                 return Ok(None);
             };
             match self.code.append(&t.code) {
@@ -864,6 +875,56 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(u64::from_le_bytes(a), 2, "v2 = v1 + v1");
         assert_eq!(cpu.x[13], 0, "three trips");
+    }
+
+    /// The glibc loop-head shape: `vsetvli` with a register AVL. The vset translates
+    /// (a saturating min against vlmax) and the body translates under whatever state it
+    /// wrote, so after the first round the whole loop runs natively.
+    #[test]
+    fn vector_loop_with_vsetvli_head_matches_the_interpreter() {
+        let vsetvli = |rd: u32, rs1: u32, vtype: u32| {
+            (vtype << 20) | (rs1 << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle64 = |vd: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse64 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vadd_vv =
+            |vd: u32, vs2: u32, vs1: u32| (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57;
+        // vsetvli t0, a3, e64, m1; v2 = v1 + v1; [a2] = v2; a4 -= 1; bne a4, x0, -20
+        let prog = [
+            vsetvli(5, 13, 0x0d8),
+            vle64(1, 11),
+            vadd_vv(2, 1, 1),
+            vse64(2, 12),
+            addi(14, 14, -1),
+            b(0b001, 14, 0, -20),
+        ];
+        let init = |cpu: &mut CpuState| {
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 16);
+            cpu.set_x(13, 9); // AVL 9 saturates to vlmax = 2
+            cpu.set_x(14, 3);
+        };
+        let mem_i = setup(&prog);
+        mem_i.write_privileged(DATA, &0x0000_0000_0000_0001u64.to_le_bytes()).unwrap();
+        mem_i.write_privileged(DATA + 8, &0x0000_0000_0000_0002u64.to_le_bytes()).unwrap();
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        mem_j.write_privileged(DATA, &0x0000_0000_0000_0001u64.to_le_bytes()).unwrap();
+        mem_j.write_privileged(DATA + 8, &0x0000_0000_0000_0002u64.to_le_bytes()).unwrap();
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        assert_eq!(cpu.x[5], 2, "t0 = vl = min(9, vlmax)");
+        assert_eq!(cpu.x[14], 0, "three trips");
     }
 
     #[test]
