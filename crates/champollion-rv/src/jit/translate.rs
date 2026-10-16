@@ -33,8 +33,8 @@ use super::arm64::{Asm, AtomicOp, Cond, FmaKind, Fp, FpOp, FpRound, Mem, Reg, XZ
 use crate::cpu::CpuState;
 use crate::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, FArithOp, FCmpOp, FWidth, FmaOp, Inst,
-    IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VMaskOp, VMemKind, VSel,
-    VSetKind, VStoreKind,
+    IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VFArithOp, VFMaOp, VMaskOp,
+    VMemKind, VSel, VSetKind, VStoreKind,
 };
 use crate::memory::{CONTROL_OFFSET, GUARD_SIZE, GUEST_SIZE};
 const _: () = assert!(CONTROL_OFFSET.is_multiple_of(4096) && CONTROL_OFFSET >> 12 < 4096);
@@ -561,6 +561,27 @@ impl Tx {
             }
             Inst::VMask { op, vd, vs1, vs2 } => {
                 if !self.vector_mask(op, vd, vs1, vs2) {
+                    return false;
+                }
+            }
+            Inst::VFArith { op, vd, vs2, src, mask: false } => {
+                if !self.vector_farith(op, vd, vs2, src, false) {
+                    return false;
+                }
+            }
+            Inst::VFMa { op, vd, vs2, src, mask: false } => {
+                if !self.vector_fma(op, vd, vs2, src, false) {
+                    return false;
+                }
+            }
+            // The float-scalar moves; the general arms below only take integer sources.
+            Inst::Vmv { vd, src: VSel::F(rs1) } => {
+                if !self.vector_fmv_vf(vd, rs1) {
+                    return false;
+                }
+            }
+            Inst::VFmvFS { rd, vs2 } => {
+                if !self.vector_fmv_fs(rd, vs2) {
                     return false;
                 }
             }
@@ -1360,6 +1381,47 @@ impl Tx {
                 self.addr_base = None;
                 true
             }
+            // Whole-register moves carry `nf` 16-byte registers whatever vl and vtype
+            // say, so they translate with or without a pinned configuration - the
+            // memcpy-shaped loops in vectorized code are built on them.
+            Inst::VLoad { kind: VMemKind::WholeRegister, vd, rs1, mask: false, nf, .. } => {
+                let n = u32::from(nf) + 1;
+                let operand = self.mem_operand(rs1, 0, 16);
+                self.a.mov(SRC0, ADDR); // v_addr below reuses ADDR
+                for k in 0..n {
+                    self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
+                    match operand {
+                        Some(_) => assert!(self.a.ldr_q_off(FA, SRC0, k * 16)),
+                        None => {
+                            self.a.add_imm(ADDR, SRC0, k * 16);
+                            self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg());
+                        }
+                    }
+                    self.v_addr((vd + k as u8) & 31);
+                    self.a.str_q(FA, ADDR);
+                }
+                self.addr_base = None;
+                true
+            }
+            Inst::VStore { kind: VStoreKind::WholeRegister, vs3, rs1, mask: false, nf, .. } => {
+                let n = u32::from(nf) + 1;
+                let operand = self.mem_operand(rs1, 0, 16);
+                self.a.mov(SRC0, ADDR);
+                for k in 0..n {
+                    self.v_addr((vs3 + k as u8) & 31);
+                    self.a.ldr_q(FA, ADDR);
+                    self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                    match operand {
+                        Some(_) => assert!(self.a.str_q_off(FA, SRC0, k * 16)),
+                        None => {
+                            self.a.add_imm(ADDR, SRC0, k * 16);
+                            self.a.str_q_reg(FA, self.base_reg(), self.index_reg());
+                        }
+                    }
+                }
+                self.addr_base = None;
+                true
+            }
             Inst::VStore {
                 width, kind: VStoreKind::Unit, vs3, rs1, mask: false, nf: 0, ..
             } if width.bytes() == u64::from(bytes) => {
@@ -1468,6 +1530,158 @@ impl Tx {
         } else {
             self.a.vec_sshl(bits, FA, FA, FB);
         }
+    }
+
+    /// The `.vf` scalar as a per-lane broadcast in `dst`, with the F extension's
+    /// boxing rule: a scalar this block boxed is one lane-0 dup (the pinned `f`
+    /// registers are host vector registers), anything else needs the check.
+    fn vector_fscalar(&mut self, rs1: u8, dst: Reg, bytes: u32) {
+        let bits = bytes * 8;
+        if bytes == 8 || self.fboxed(rs1) {
+            match FHOST_REG[rs1 as usize] {
+                Some(h) => self.a.vec_dup_lane0(bits, dst, h),
+                None => {
+                    self.a.ldr_fp(Fp::D, dst, CTX, f_offset(rs1));
+                    self.a.vec_dup_lane0(bits, dst, dst);
+                }
+            }
+            return;
+        }
+        self.fraw_load(rs1, SRC0);
+        self.a.lsr_imm(SRC1, SRC0, 32);
+        self.a.cmn_imm_w(SRC1, 1);
+        self.a.mov_imm(SRC1, 0x7fc0_0000);
+        self.a.csel(SRC0, SRC0, SRC1, Cond::Eq);
+        self.a.vec_dup(dst, SRC0, 4);
+    }
+
+    /// Float vector arithmetic (`vfadd` ... `vfdiv`, `.vv` or `.vf`) at the pinned
+    /// configuration. The block-level FPCR (guest rounding, default NaN) is what the
+    /// NEON ops run under, exactly like the translated scalar FP.
+    fn vector_farith(&mut self, op: VFArithOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if mask || bytes < 4 {
+            return false;
+        }
+        let bits = bytes * 8;
+        self.v_addr(vs2);
+        self.a.ldr_q(FA, ADDR);
+        match src {
+            VSel::V(vs1) => {
+                self.v_addr(vs1);
+                self.a.ldr_q(FB, ADDR);
+            }
+            VSel::F(rs1) => self.vector_fscalar(rs1, FB, bytes),
+            _ => return false,
+        }
+        match op {
+            VFArithOp::Add => self.a.vec_fadd(bits, FA, FA, FB),
+            VFArithOp::Sub => self.a.vec_fsub(bits, FA, FA, FB),
+            VFArithOp::Mul => self.a.vec_fmul(bits, FA, FA, FB),
+            _ => self.a.vec_fdiv(bits, FA, FA, FB),
+        }
+        self.v_addr(vd);
+        self.a.str_q(FA, ADDR);
+        true
+    }
+
+    /// The eight fused multiply-adds, each rebuilt from FMLA/FMLS (both fused, matching
+    /// the spec's single rounding) plus exact sign flips. With `a` = vs2, `b` = the
+    /// scalar or vs1, `d` = the old vd: the macc family computes `±a×b ± d` into d's
+    /// register, the madd family `±d×b ± a` into vs2's.
+    fn vector_fma(&mut self, op: VFMaOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if mask || bytes < 4 {
+            return false;
+        }
+        let bits = bytes * 8;
+        self.v_addr(vs2);
+        self.a.ldr_q(FC, ADDR); // a
+        self.v_addr(vd);
+        self.a.ldr_q(FA, ADDR); // d
+        match src {
+            VSel::V(vs1) => {
+                self.v_addr(vs1);
+                self.a.ldr_q(FB, ADDR);
+            }
+            VSel::F(rs1) => self.vector_fscalar(rs1, FB, bytes),
+            _ => return false,
+        }
+        let out = match op {
+            VFMaOp::Macc => {
+                self.a.vec_fmla(bits, FA, FC, FB); // d + a×b
+                FA
+            }
+            VFMaOp::Nmacc => {
+                self.a.vec_fneg(bits, FA, FA);
+                self.a.vec_fneg(bits, FC, FC);
+                self.a.vec_fmla(bits, FA, FC, FB); // -d + -a×b
+                FA
+            }
+            VFMaOp::Msac => {
+                self.a.vec_fmls(bits, FA, FC, FB); // d - a×b
+                self.a.vec_fneg(bits, FA, FA); // -(d - a×b)
+                FA
+            }
+            VFMaOp::Nmsac => {
+                self.a.vec_fmls(bits, FA, FC, FB); // d - a×b
+                FA
+            }
+            VFMaOp::Madd => {
+                self.a.vec_fmla(bits, FC, FA, FB); // a + d×b
+                FC
+            }
+            VFMaOp::Nmadd => {
+                self.a.vec_fneg(bits, FC, FC);
+                self.a.vec_fneg(bits, FA, FA);
+                self.a.vec_fmla(bits, FC, FA, FB); // -a + -d×b
+                FC
+            }
+            VFMaOp::Msub => {
+                self.a.vec_fneg(bits, FC, FC);
+                self.a.vec_fmla(bits, FC, FA, FB); // -a + d×b
+                FC
+            }
+            VFMaOp::Nmsub => {
+                self.a.vec_fneg(bits, FA, FA);
+                self.a.vec_fmla(bits, FC, FA, FB); // a + -d×b
+                FC
+            }
+        };
+        self.v_addr(vd);
+        self.a.str_q(out, ADDR);
+        true
+    }
+
+    /// `vfmv.v.f`: broadcast the scalar to every lane.
+    fn vector_fmv_vf(&mut self, vd: u8, rs1: u8) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if bytes < 4 {
+            return false;
+        }
+        self.vector_fscalar(rs1, FA, bytes);
+        self.v_addr(vd);
+        self.a.str_q(FA, ADDR);
+        true
+    }
+
+    /// `vfmv.f.s`: lane 0 into an `f` register, boxed for singles.
+    fn vector_fmv_fs(&mut self, rd: u8, vs2: u8) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if bytes < 4 {
+            return false;
+        }
+        self.v_addr(vs2);
+        self.a.ldr_q(FA, ADDR);
+        if bytes == 4 {
+            self.a.fmov_to_gpr(Fp::S, SRC0, FA);
+            self.a.orr_imm(SRC0, SRC0, NAN_BOX).unwrap();
+        } else {
+            self.a.fmov_to_gpr(Fp::D, SRC0, FA);
+        }
+        self.fraw_store(rd, SRC0);
+        self.set_fboxed(rd, bytes == 4);
+        true
     }
 
     /// `vmv.v.*`: the whole register becomes the broadcast of the source.
@@ -2040,6 +2254,19 @@ pub fn translate(
             Inst::Ecall => {
                 exits.push((tx.a.pos(), None));
                 tx.exit(Tail::Static { pc: at, code: exit::ECALL });
+                ended = true;
+                break;
+            }
+            // A register-AVL `vsetvli` leaves a runtime configuration (compilers
+            // strip-mine with it). End the block right here: the dispatcher looks the
+            // body's first pc up under the just-written vtype/vl and translates it with
+            // that configuration, so the whole loop stays in generated code instead of
+            // being interpreted up to its first vector instruction.
+            Inst::VSetvl { rd, rs1, rs2, kind: VSetKind::RegisterAvl } => {
+                tx.vsetvli(rd, rs1, u64::from(rs2));
+                retired += 1;
+                exits.push((tx.a.pos(), Some(next)));
+                tx.exit(Tail::Static { pc: next, code: exit::NEXT });
                 ended = true;
                 break;
             }

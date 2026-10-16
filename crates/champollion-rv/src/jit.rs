@@ -359,7 +359,7 @@ impl Jit {
         engine: &mut crate::engine::Engine,
         mem: &GuestMemory,
     ) -> Option<Trap> {
-        const BATCH: u64 = 32;
+        const BATCH: u64 = 1024;
         engine.run(cpu, mem, BATCH).0
     }
 
@@ -527,6 +527,113 @@ mod tests {
         assert_eq!(got, want);
         assert_eq!(cpu, oracle);
         (got, cpu)
+    }
+
+    #[test]
+    fn vector_float_ops_match_the_interpreter() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle32 = |vd: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse32 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (0b001 << 12) | (vd << 7) | 0x57
+        };
+        let vf = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (rs1 << 15) | (0b101 << 12) | (vd << 7) | 0x57
+        };
+        const VT: u32 = 0xd0; // e32, m1, ta, ma
+        let prog = [
+            vsetivli(0, 4, VT),
+            vle32(1, 11),                      // v1 = a
+            vle32(2, 12),                      // v2 = b
+            op_fp(0b11110, 0b00, 0, 0, 10, 0), // fmv.w.x f0, a0 (2.0): boxed in this block
+            vv(0b000000, 3, 1, 2),             // vfadd.vv v3, v1, v2
+            vse32(3, 13),
+            vv(0b000010, 4, 1, 2), // vfsub.vv v4, v1, v2
+            vse32(4, 14),
+            vv(0b100000, 5, 1, 2), // vfdiv.vv v5, v1, v2
+            vse32(5, 15),
+            vf(0b100100, 6, 1, 0), // vfmul.vf v6, v1, f0
+            vse32(6, 16),
+            vv(0b101100, 7, 1, 2), // vfmacc.vv v7, v1, v2 (v7 starts 0)
+            vse32(7, 17),
+            vf(0b101100, 8, 1, 0), // vfmacc.vf v8, f0, v1
+            vse32(8, 18),
+            vv(0b101010, 9, 2, 1), // vfmsub.vv v9, v1, v2
+            vse32(9, 19),
+            // vfmv.v.f v10, f0 (vs2 = 0 selects the broadcast).
+            (0x17 << 26) | (1 << 25) | (0b101 << 12) | (10 << 7) | 0x57,
+            vse32(10, 20),
+            vv(0b101101, 11, 2, 1), // vfnmacc.vv v11, v1, v2
+            vse32(11, 21),
+            (0x10 << 26) | (1 << 25) | (1 << 20) | (0b001 << 12) | (5 << 7) | 0x57, // vfmv.f.s f5, v1
+            fstore(0b011, 22, 5, 0),                                                // fsd f5, 0(a6)
+        ];
+        let setup_data = |mem: &GuestMemory| {
+            let a: [f32; 4] = [1.5, -2.5, 0.5, 8.0];
+            let b: [f32; 4] = [4.0, 2.0, -0.5, 2.0];
+            for (i, v) in a.iter().chain(b.iter()).enumerate() {
+                mem.write_privileged(DATA + 4 * i as u64, &v.to_bits().to_le_bytes()).unwrap();
+            }
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in [
+                (11u8, DATA),
+                (12, DATA + 16),
+                (13, DATA + 64),
+                (14, DATA + 80),
+                (15, DATA + 96),
+                (16, DATA + 112),
+                (17, DATA + 128),
+                (18, DATA + 144),
+                (19, DATA + 160),
+                (20, DATA + 176),
+                (21, DATA + 192),
+                (22, DATA + 208),
+                (10, 2.0f32.to_bits() as u64),
+            ] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem_i = setup(&prog);
+        setup_data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        setup_data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "state");
+        for name in ["VFArith", "VFMa", "VFmvFS"] {
+            assert_eq!(jit.stats.interpreted.get(name), None, "{name} stayed in the JIT");
+        }
+        let get = |off: u64| {
+            let mut b = [0u8; 4];
+            mem_j.read_privileged(DATA + off, &mut b).unwrap();
+            f32::from_bits(u32::from_le_bytes(b))
+        };
+        assert_eq!(get(64), 5.5, "1.5 + 4.0");
+        assert_eq!(get(80), -2.5, "1.5 - 4.0");
+        assert_eq!(get(96), 0.375, "1.5 / 4.0");
+        assert_eq!(get(112), 3.0, "1.5 × 2.0");
+        assert_eq!(get(128), 6.0, "1.5 × 4.0");
+        assert_eq!(get(144), 3.0, "2.0 × 1.5");
+        assert_eq!(get(160), -4.0, "vfmsub: -vs2");
+        assert_eq!(get(176), 2.0, "vfmv.v.f");
+        assert_eq!(get(192), -6.0, "vfnmacc: -(vs2 × vs1)");
+        let mut b = [0u8; 8];
+        mem_j.read_privileged(DATA + 208, &mut b).unwrap();
+        assert_eq!(u64::from_le_bytes(b), 0xffff_ffff_3fc0_0000, "vfmv.f.s boxes");
     }
 
     #[test]

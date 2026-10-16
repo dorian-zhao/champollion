@@ -238,3 +238,19 @@ mul v12.16b, v13.16b, v14.16b
 mul v15.8h, v16.8h, v17.8h
 mul v18.4s, v19.4s, v20.4s
 ins v14.s[0], v19.s[0]
+fadd v0.4s, v1.4s, v2.4s
+fadd v3.2d, v4.2d, v5.2d
+fsub v6.4s, v7.4s, v8.4s
+fsub v9.2d, v10.2d, v11.2d
+fmul v12.4s, v13.4s, v14.4s
+fmul v15.2d, v16.2d, v17.2d
+fdiv v18.4s, v19.4s, v20.4s
+fdiv v21.2d, v22.2d, v23.2d
+fmla v24.4s, v25.4s, v26.4s
+fmla v27.2d, v28.2d, v29.2d
+fmls v30.4s, v31.4s, v0.4s
+fmls v1.2d, v2.2d, v3.2d
+fneg v4.4s, v5.4s
+fneg v6.2d, v7.2d
+dup v8.4s, v9.s[0]
+dup v10.2d, v11.d[0]

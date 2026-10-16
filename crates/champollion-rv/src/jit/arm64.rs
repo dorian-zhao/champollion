@@ -993,6 +993,52 @@ impl Asm {
     pub fn vec_ins_s0(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x6e04_0400 | (rn as u32) << 5 | rd as u32);
     }
+    /// `.4s` vs `.2d` for the float vector ops: bit 22 of the size field.
+    const fn fp_size(size: u32) -> u32 {
+        if size == 64 { 0x0040_0000 } else { 0 }
+    }
+    pub fn vec_fadd(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x4e20_d400 | Self::fp_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    pub fn vec_fsub(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x4ea0_d400 | Self::fp_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    pub fn vec_fmul(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x6e20_dc00 | Self::fp_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    pub fn vec_fdiv(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x6e20_fc00 | Self::fp_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// `fmla vd, vn, vm`: `vd += vn × vm`, fused (one rounding).
+    pub fn vec_fmla(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x4e20_cc00 | Self::fp_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// `fmls vd, vn, vm`: `vd -= vn × vm`, fused.
+    pub fn vec_fmls(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x4ea0_cc00 | Self::fp_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// `fneg vd, vn`: exact sign flip, no exceptions.
+    pub fn vec_fneg(&mut self, size: u32, rd: Reg, rn: Reg) {
+        self.emit(0x6ea0_f800 | Self::fp_size(size) | (rn as u32) << 5 | rd as u32);
+    }
+    /// `dup vd.4s/2d, vn.s/d[0]`: broadcast lane 0 of another vector register (the
+    /// pinned scalar `f` registers live in this file, so a `.vf` scalar is one op).
+    pub fn vec_dup_lane0(&mut self, size: u32, rd: Reg, rn: Reg) {
+        let imm5 = if size == 64 { 8 } else { 4 };
+        self.emit(0x4e00_0400 | imm5 << 16 | (rn as u32) << 5 | rd as u32);
+    }
     /// `cmn wn, #imm` (sets flags for wn + imm).
     pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
         self.imm12(0x3100_0000, XZR, rn, imm);
