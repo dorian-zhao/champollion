@@ -26,9 +26,17 @@ const A3: u8 = 13;
 const A4: u8 = 14;
 const A5: u8 = 15;
 const A6: u8 = 16;
+const A7: u8 = 17;
 const S2: u8 = 18;
 const S3: u8 = 19;
 const S4: u8 = 20;
+const S5: u8 = 21;
+const S6: u8 = 22;
+const S7: u8 = 23;
+const S8: u8 = 24;
+const S9: u8 = 25;
+const S10: u8 = 26;
+const S11: u8 = 27;
 const T4: u8 = 29;
 const T5: u8 = 30;
 const T6: u8 = 31;
@@ -403,6 +411,78 @@ fn zicsr() {
     check(
         include_str!("../../../tests/fixtures/zicsr.s"),
         include_bytes!("../../../tests/fixtures/zicsr.bin"),
+        &expected,
+    );
+}
+
+#[test]
+fn rv64zb() {
+    use AluOp as A;
+    use AluOp32 as W;
+    use Inst::*;
+    use LoadWidth as L;
+    use StoreWidth as S;
+    let expected = [
+        // Zba
+        ("sh1add a0, a1, a2", Op { op: A::Sh1Add, rd: A0, rs1: A1, rs2: A2 }),
+        ("sh2add a3, a4, a5", Op { op: A::Sh2Add, rd: A3, rs1: A4, rs2: A5 }),
+        ("sh3add a6, a7, s0", Op { op: A::Sh3Add, rd: A6, rs1: A7, rs2: S0 }),
+        ("sh1add.uw s1, s2, s3", Op { op: A::Sh1AddUw, rd: S1, rs1: S2, rs2: S3 }),
+        ("sh2add.uw s4, s5, s6", Op { op: A::Sh2AddUw, rd: S4, rs1: S5, rs2: S6 }),
+        ("sh3add.uw s7, s8, s9", Op { op: A::Sh3AddUw, rd: S7, rs1: S8, rs2: S9 }),
+        ("add.uw s10, s11, a0", Op { op: A::AddUw, rd: S10, rs1: S11, rs2: A0 }),
+        ("slli.uw a1, a2, 40", OpImm { op: A::SllUw, rd: A1, rs1: A2, imm: 40 }),
+        // Zbb register-register
+        ("andn a0, a1, a2", Op { op: A::Andn, rd: A0, rs1: A1, rs2: A2 }),
+        ("orn a3, a4, a5", Op { op: A::Orn, rd: A3, rs1: A4, rs2: A5 }),
+        ("xnor a6, a7, s0", Op { op: A::Xnor, rd: A6, rs1: A7, rs2: S0 }),
+        ("max s7, s8, s9", Op { op: A::Max, rd: S7, rs1: S8, rs2: S9 }),
+        ("maxu s10, s11, a0", Op { op: A::Maxu, rd: S10, rs1: S11, rs2: A0 }),
+        ("min a1, a2, a3", Op { op: A::Min, rd: A1, rs1: A2, rs2: A3 }),
+        ("minu a4, a5, a6", Op { op: A::Minu, rd: A4, rs1: A5, rs2: A6 }),
+        ("rol s9, s10, s11", Op { op: A::Rol, rd: S9, rs1: S10, rs2: S11 }),
+        ("ror a0, a1, a2", Op { op: A::Ror, rd: A0, rs1: A1, rs2: A2 }),
+        // Zbb unary and immediate
+        ("clz s1, s2", OpImm { op: A::Clz, rd: S1, rs1: S2, imm: 0 }),
+        ("ctz s3, s4", OpImm { op: A::Ctz, rd: S3, rs1: S4, imm: 0 }),
+        ("cpop s5, s6", OpImm { op: A::Cpop, rd: S5, rs1: S6, imm: 0 }),
+        ("sext.b a7, s0", OpImm { op: A::SextB, rd: A7, rs1: S0, imm: 0 }),
+        ("sext.h s1, s2", OpImm { op: A::SextH, rd: S1, rs1: S2, imm: 0 }),
+        ("zext.h s3, s4", Op { op: A::ZextH, rd: S3, rs1: S4, rs2: 0 }),
+        ("rev8 s5, s6", OpImm { op: A::Rev8, rd: S5, rs1: S6, imm: 0 }),
+        ("orc.b s7, s8", OpImm { op: A::OrcB, rd: S7, rs1: S8, imm: 0 }),
+        ("rori a3, a4, 60", OpImm { op: A::Ror, rd: A3, rs1: A4, imm: 60 }),
+        ("rolw a5, a6, a7", Op32 { op: W::Rol, rd: A5, rs1: A6, rs2: A7 }),
+        ("rorw s0, s1, s2", Op32 { op: W::Ror, rd: S0, rs1: S1, rs2: S2 }),
+        ("roriw s3, s4, 25", OpImm32 { op: W::Ror, rd: S3, rs1: S4, imm: 25 }),
+        // Zbs
+        ("bclr s5, s6, s7", Op { op: A::Bclr, rd: S5, rs1: S6, rs2: S7 }),
+        ("bext s8, s9, s10", Op { op: A::Bext, rd: S8, rs1: S9, rs2: S10 }),
+        ("binv s11, a0, a1", Op { op: A::Binv, rd: S11, rs1: A0, rs2: A1 }),
+        ("bset a2, a3, a4", Op { op: A::Bset, rd: A2, rs1: A3, rs2: A4 }),
+        ("bclri a5, a6, 63", OpImm { op: A::Bclr, rd: A5, rs1: A6, imm: 63 }),
+        ("bexti a7, s0, 20", OpImm { op: A::Bext, rd: A7, rs1: S0, imm: 20 }),
+        ("binvi s1, s2, 33", OpImm { op: A::Binv, rd: S1, rs1: S2, imm: 33 }),
+        ("bseti s3, s4, 42", OpImm { op: A::Bset, rd: S3, rs1: S4, imm: 42 }),
+        // Zicond
+        ("czero.eqz s5, s6, s7", Op { op: A::CzeroEqz, rd: S5, rs1: S6, rs2: S7 }),
+        ("czero.nez s8, s9, s10", Op { op: A::CzeroNez, rd: S8, rs1: S9, rs2: S10 }),
+        // Zcb
+        ("c.lbu a0, 2(s1)", Load { width: L::Bu, rd: A0, rs1: S1, offset: 2 }),
+        ("c.lhu a1, 2(s1)", Load { width: L::Hu, rd: A1, rs1: S1, offset: 2 }),
+        ("c.sb a2, 3(s1)", Store { width: S::B, rs1: S1, rs2: A2, offset: 3 }),
+        ("c.sh a3, 2(s1)", Store { width: S::H, rs1: S1, rs2: A3, offset: 2 }),
+        ("c.zext.b a0", OpImm { op: A::And, rd: A0, rs1: A0, imm: 0xff }),
+        ("c.sext.b a1", OpImm { op: A::SextB, rd: A1, rs1: A1, imm: 0 }),
+        ("c.zext.h a2", OpImm { op: A::ZextH, rd: A2, rs1: A2, imm: 0 }),
+        ("c.sext.h a3", OpImm { op: A::SextH, rd: A3, rs1: A3, imm: 0 }),
+        ("c.zext.w a4", Op { op: A::AddUw, rd: A4, rs1: A4, rs2: 0 }),
+        ("c.not a5", OpImm { op: A::Xor, rd: A5, rs1: A5, imm: -1 }),
+        ("c.mul a0, a1", Op { op: A::Mul, rd: A0, rs1: A0, rs2: A1 }),
+    ];
+    check(
+        include_str!("../../../tests/fixtures/rv64zb.s"),
+        include_bytes!("../../../tests/fixtures/rv64zb.bin"),
         &expected,
     );
 }

@@ -607,6 +607,13 @@ fn hwprobe(p: &Process, a: [u64; 6]) -> SysResult {
     const BASE_BEHAVIOR_IMA: u64 = 1;
     const IMA_FD: u64 = 1 << 0;
     const IMA_C: u64 = 1 << 1;
+    // The bit-manipulation extensions the decoder supports, and Zicond. V is absent on
+    // purpose: software (glibc's ifuncs in particular) must keep choosing its scalar
+    // paths, because there is no vector support yet.
+    const ZBA: u64 = 1 << 3;
+    const ZBB: u64 = 1 << 4;
+    const ZBS: u64 = 1 << 5;
+    const ZICOND: u64 = 1 << 35;
     if a[4] != 0 {
         return Err(errno::EINVAL);
     }
@@ -617,7 +624,7 @@ fn hwprobe(p: &Process, a: [u64; 6]) -> SysResult {
         let value = match i64::from_le_bytes(b) {
             0..=2 => Some(0), // mvendorid, marchid, mimpid
             3 => Some(BASE_BEHAVIOR_IMA),
-            4 => Some(IMA_FD | IMA_C),
+            4 => Some(IMA_FD | IMA_C | ZBA | ZBB | ZBS | ZICOND),
             _ => None,
         };
         match value {

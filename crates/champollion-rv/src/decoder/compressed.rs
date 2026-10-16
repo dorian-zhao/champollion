@@ -1,8 +1,9 @@
 //! C extension: expands 16-bit instructions into the equivalent 32-bit [`Inst`].
 //!
-//! Every RV64C instruction is an alias for a base instruction, so the interpreter and JIT
-//! never need to know an instruction was compressed (beyond its 2-byte length, which only
-//! matters for the link value and the next pc).
+//! Every compressed instruction (RVC, and Zcb's byte/half loads, bit-manipulation, and
+//! `c.mul`) is an alias for a base instruction, so the interpreter and JIT never need to
+//! know an instruction was compressed (beyond its 2-byte length, which only matters for
+//! the link value and the next pc).
 //!
 //! The double-precision forms (`c.fld`, `c.fsd`, `c.fldsp`, `c.fsdsp`) expand to D
 //! loads and stores; RV64 has no single-precision compressed forms.
@@ -88,6 +89,16 @@ pub fn decode_compressed(h: u16) -> Result<Inst, DecodeError> {
         (0b00, 0b010) => Inst::Load { width: LoadWidth::W, rd: rd_, rs1: rs1_, offset: off_w },
         (0b00, 0b001) => Inst::FLoad { width: FWidth::D, rd: rd_, rs1: rs1_, offset: off_d },
         (0b00, 0b011) => Inst::Load { width: LoadWidth::D, rd: rd_, rs1: rs1_, offset: off_d },
+        (0b00, 0b100) => {
+            // Zcb: c.lbu/c.lhu/c.sb/c.sh; uimm[1] in bit 5, uimm[0] in bit 6.
+            let off = ((bits(h, 5, 5) << 1) | bits(h, 6, 6)) as i32;
+            match bits(h, 11, 10) {
+                0b00 => Inst::Load { width: LoadWidth::Bu, rd: rd_, rs1: rs1_, offset: off },
+                0b01 => Inst::Load { width: LoadWidth::Hu, rd: rd_, rs1: rs1_, offset: off },
+                0b10 => Inst::Store { width: StoreWidth::B, rs1: rs1_, rs2: rd_, offset: off },
+                _ => Inst::Store { width: StoreWidth::H, rs1: rs1_, rs2: rd_, offset: off },
+            }
+        }
         (0b00, 0b101) => Inst::FStore { width: FWidth::D, rs1: rs1_, rs2: rd_, offset: off_d },
         (0b00, 0b110) => Inst::Store { width: StoreWidth::W, rs1: rs1_, rs2: rd_, offset: off_w },
         (0b00, 0b111) => Inst::Store { width: StoreWidth::D, rs1: rs1_, rs2: rd_, offset: off_d },
@@ -129,7 +140,20 @@ pub fn decode_compressed(h: u16) -> Result<Inst, DecodeError> {
                 (0b11, 0, 0b11) => Inst::Op { op: AluOp::And, rd, rs1, rs2: rd_ },
                 (0b11, 1, 0b00) => Inst::Op32 { op: AluOp32::Sub, rd, rs1, rs2: rd_ },
                 (0b11, 1, 0b01) => Inst::Op32 { op: AluOp32::Add, rd, rs1, rs2: rd_ },
-                _ => return illegal, // Zcb
+                // Zcb: c.mul takes the last CA slot (its operands are rd' and rs2');
+                // c.zext.b/c.sext.b/c.zext.h/c.sext.h/c.zext.w/c.not fill the slot after
+                // it, selected by bits 4:2, operating in place.
+                (0b11, 1, 0b10) => Inst::Op { op: AluOp::Mul, rd, rs1, rs2: rd_ },
+                (0b11, 1, 0b11) => match bits(h, 4, 2) {
+                    0b000 => Inst::OpImm { op: AluOp::And, rd, rs1, imm: 0xff },
+                    0b001 => Inst::OpImm { op: AluOp::SextB, rd, rs1, imm: 0 },
+                    0b010 => Inst::OpImm { op: AluOp::ZextH, rd, rs1, imm: 0 },
+                    0b011 => Inst::OpImm { op: AluOp::SextH, rd, rs1, imm: 0 },
+                    0b100 => Inst::Op { op: AluOp::AddUw, rd, rs1, rs2: 0 },
+                    0b101 => Inst::OpImm { op: AluOp::Xor, rd, rs1, imm: -1 },
+                    _ => return illegal,
+                },
+                _ => return illegal,
             }
         }
         (0b01, 0b101) => Inst::Jal { rd: 0, offset: offset_j(h) },

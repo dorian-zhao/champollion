@@ -389,10 +389,26 @@ impl Tx {
         match inst {
             Inst::Lui { rd, imm } => self.constant(rd, sext(imm)),
             Inst::Auipc { rd, imm } => self.constant(rd, pc.wrapping_add(sext(imm))),
-            Inst::OpImm { op, rd, rs1, imm } => self.op_imm(op, rd, rs1, imm),
-            Inst::OpImm32 { op, rd, rs1, imm } => self.op_imm32(op, rd, rs1, imm),
-            Inst::Op { op, rd, rs1, rs2 } => self.op(op, rd, rs1, rs2),
-            Inst::Op32 { op, rd, rs1, rs2 } => self.op32(op, rd, rs1, rs2),
+            Inst::OpImm { op, rd, rs1, imm } => {
+                if !self.op_imm(op, rd, rs1, imm) {
+                    return false;
+                }
+            }
+            Inst::OpImm32 { op, rd, rs1, imm } => {
+                if !self.op_imm32(op, rd, rs1, imm) {
+                    return false;
+                }
+            }
+            Inst::Op { op, rd, rs1, rs2 } => {
+                if !self.op(op, rd, rs1, rs2) {
+                    return false;
+                }
+            }
+            Inst::Op32 { op, rd, rs1, rs2 } => {
+                if !self.op32(op, rd, rs1, rs2) {
+                    return false;
+                }
+            }
             Inst::Load { width, rd, rs1, offset } => {
                 let mem = match width {
                     LoadWidth::B => Mem::S8,
@@ -803,9 +819,9 @@ impl Tx {
         }
     }
 
-    fn op_imm(&mut self, op: AluOp, rd: u8, rs1: u8, imm: i32) {
+    fn op_imm(&mut self, op: AluOp, rd: u8, rs1: u8, imm: i32) -> bool {
         if rd == 0 {
-            return; // no side effects
+            return true; // no side effects
         }
         let v = sext(imm);
         if rs1 == 0 {
@@ -814,9 +830,24 @@ impl Tx {
                 AluOp::Add | AluOp::Xor | AluOp::Or => v,
                 AluOp::Slt => (0 < imm as i64) as u64,
                 AluOp::Sltu => (0 < v) as u64,
+                // Zba/Zbb/Zbs/Zicond immediate forms are interpreted only for now.
+                AluOp::SllUw
+                | AluOp::Clz
+                | AluOp::Ctz
+                | AluOp::Cpop
+                | AluOp::SextB
+                | AluOp::SextH
+                | AluOp::Rev8
+                | AluOp::OrcB
+                | AluOp::Ror
+                | AluOp::Bclr
+                | AluOp::Bext
+                | AluOp::Binv
+                | AluOp::Bset => return false,
                 _ => 0, // and, shifts of zero
             };
-            return self.constant(rd, r);
+            self.constant(rd, r);
+            return true;
         }
         let d = self.dst(rd);
         let a = self.src(rs1, SRC0);
@@ -856,18 +887,34 @@ impl Tx {
             AluOp::Sll => self.a.lsl_imm(d, a, imm as u32),
             AluOp::Srl => self.a.lsr_imm(d, a, imm as u32),
             AluOp::Sra => self.a.asr_imm(d, a, imm as u32),
+            // Zba/Zbb/Zbs/Zicond immediate forms are interpreted only for now.
+            AluOp::SllUw
+            | AluOp::Clz
+            | AluOp::Ctz
+            | AluOp::Cpop
+            | AluOp::SextB
+            | AluOp::SextH
+            | AluOp::Rev8
+            | AluOp::OrcB
+            | AluOp::Ror
+            | AluOp::Bclr
+            | AluOp::Bext
+            | AluOp::Binv
+            | AluOp::Bset => return false,
             _ => unreachable!("no immediate form of {op:?}"),
         }
         self.commit(rd, d);
+        true
     }
 
-    fn op_imm32(&mut self, op: AluOp32, rd: u8, rs1: u8, imm: i32) {
+    fn op_imm32(&mut self, op: AluOp32, rd: u8, rs1: u8, imm: i32) -> bool {
         if rd == 0 {
-            return;
+            return true;
         }
         if rs1 == 0 {
             let r = if op == AluOp32::Add { sext(imm) } else { 0 };
-            return self.constant(rd, r);
+            self.constant(rd, r);
+            return true;
         }
         let d = self.dst(rd);
         let a = self.src(rs1, SRC0);
@@ -877,15 +924,17 @@ impl Tx {
             AluOp32::Sll => self.a.lsl_imm_w(d, a, imm as u32),
             AluOp32::Srl => self.a.lsr_imm_w(d, a, imm as u32),
             AluOp32::Sra => self.a.asr_imm_w(d, a, imm as u32),
+            AluOp32::Ror => return false, // Zbb roriw: interpreted only for now
             _ => unreachable!("no immediate form of {op:?}"),
         }
         self.a.sxtw(d, d);
         self.commit(rd, d);
+        true
     }
 
-    fn op(&mut self, op: AluOp, rd: u8, rs1: u8, rs2: u8) {
+    fn op(&mut self, op: AluOp, rd: u8, rs1: u8, rs2: u8) -> bool {
         if rd == 0 {
-            return; // M-extension ops never trap, so nothing is observable
+            return true; // M-extension ops never trap, so nothing is observable
         }
         let d = self.dst(rd);
         let a = self.src(rs1, SRC0);
@@ -935,13 +984,47 @@ impl Tx {
                 }
                 self.a.msub(d, ADDR, b, a);
             }
+            // Zba/Zbb/Zbs/Zicond (the immediate-only variants never reach here) are
+            // interpreted only for now; the block falls back as a whole.
+            AluOp::Sh1Add
+            | AluOp::Sh2Add
+            | AluOp::Sh3Add
+            | AluOp::AddUw
+            | AluOp::Sh1AddUw
+            | AluOp::Sh2AddUw
+            | AluOp::Sh3AddUw
+            | AluOp::SllUw
+            | AluOp::Andn
+            | AluOp::Orn
+            | AluOp::Xnor
+            | AluOp::Max
+            | AluOp::Maxu
+            | AluOp::Min
+            | AluOp::Minu
+            | AluOp::Rol
+            | AluOp::Ror
+            | AluOp::Bclr
+            | AluOp::Bext
+            | AluOp::Binv
+            | AluOp::Bset
+            | AluOp::CzeroEqz
+            | AluOp::CzeroNez
+            | AluOp::Clz
+            | AluOp::Ctz
+            | AluOp::Cpop
+            | AluOp::SextB
+            | AluOp::SextH
+            | AluOp::ZextH
+            | AluOp::Rev8
+            | AluOp::OrcB => return false,
         }
         self.commit(rd, d);
+        true
     }
 
-    fn op32(&mut self, op: AluOp32, rd: u8, rs1: u8, rs2: u8) {
+    fn op32(&mut self, op: AluOp32, rd: u8, rs1: u8, rs2: u8) -> bool {
         if rd == 0 {
-            return;
+            return true;
         }
         let d = self.dst(rd);
         let a = self.src(rs1, SRC0);
@@ -973,9 +1056,12 @@ impl Tx {
                 }
                 self.a.msub_w(d, ADDR, b, a);
             }
+            // Zbb word rotations are interpreted only for now.
+            AluOp32::Rol | AluOp32::Ror => return false,
         }
         self.a.sxtw(d, d);
         self.commit(rd, d);
+        true
     }
 
     /// Write the link register of `jal`/`jalr`.

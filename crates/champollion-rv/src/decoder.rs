@@ -163,6 +163,41 @@ pub enum AluOp {
     Divu,
     Rem,
     Remu,
+    // Zba (address generation), Zbb (basic bit manipulation), Zbs (single-bit), and
+    // Zicond (integer conditional operations, V.1.0.2). The unary operations (`Clz`,
+    // `Ctz`, `Cpop`, `SextB`, `SextH`, `ZextH`, `Rev8`, `OrcB`) ignore their second
+    // operand, which their encodings fix to a constant.
+    Sh1Add,
+    Sh2Add,
+    Sh3Add,
+    AddUw,
+    Sh1AddUw,
+    Sh2AddUw,
+    Sh3AddUw,
+    SllUw,
+    Andn,
+    Orn,
+    Xnor,
+    Max,
+    Maxu,
+    Min,
+    Minu,
+    Rol,
+    Ror,
+    Bclr,
+    Bext,
+    Binv,
+    Bset,
+    CzeroEqz,
+    CzeroNez,
+    Clz,
+    Ctz,
+    Cpop,
+    SextB,
+    SextH,
+    ZextH,
+    Rev8,
+    OrcB,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +213,9 @@ pub enum AluOp32 {
     Divu,
     Rem,
     Remu,
+    // Zbb word rotations.
+    Rol,
+    Ror,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +433,21 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b001, 0b00_0000) => (AluOp::Sll, shamt),
                 (0b101, 0b00_0000) => (AluOp::Srl, shamt),
                 (0b101, 0b01_0000) => (AluOp::Sra, shamt),
+                // Zbb: clz/ctz/cpop/sext.b/sext.h share funct6 011000, the rs2 field
+                // selects one; rori is the unguarded funct6 011000 with funct3 101.
+                (0b001, 0b011_000) if rs2 == 0b00000 => (AluOp::Clz, 0),
+                (0b001, 0b011_000) if rs2 == 0b00001 => (AluOp::Ctz, 0),
+                (0b001, 0b011_000) if rs2 == 0b00010 => (AluOp::Cpop, 0),
+                (0b001, 0b011_000) if rs2 == 0b00100 => (AluOp::SextB, 0),
+                (0b001, 0b011_000) if rs2 == 0b00101 => (AluOp::SextH, 0),
+                (0b101, 0b011_000) => (AluOp::Ror, shamt),
+                (0b101, 0b001_010) => (AluOp::OrcB, 0),
+                (0b101, 0b011_010) => (AluOp::Rev8, 0),
+                // Zbs immediate forms; the 6-bit shamt is the bit index.
+                (0b001, 0b010_010) => (AluOp::Bclr, shamt),
+                (0b101, 0b010_010) => (AluOp::Bext, shamt),
+                (0b001, 0b011_010) => (AluOp::Binv, shamt),
+                (0b001, 0b001_010) => (AluOp::Bset, shamt),
                 _ => return illegal,
             };
             Inst::OpImm { op, rd, rs1, imm }
@@ -419,37 +472,75 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
                 (0b101, 0b000_0001) => AluOp::Divu,
                 (0b110, 0b000_0001) => AluOp::Rem,
                 (0b111, 0b000_0001) => AluOp::Remu,
+                // Zba shifted adds (64-bit result).
+                (0b010, 0b001_0000) => AluOp::Sh1Add,
+                (0b100, 0b001_0000) => AluOp::Sh2Add,
+                (0b110, 0b001_0000) => AluOp::Sh3Add,
+                // Zbb register-register.
+                (0b111, 0b010_0000) => AluOp::Andn,
+                (0b110, 0b010_0000) => AluOp::Orn,
+                (0b100, 0b010_0000) => AluOp::Xnor,
+                (0b100, 0b000_0101) => AluOp::Min,
+                (0b101, 0b000_0101) => AluOp::Minu,
+                (0b110, 0b000_0101) => AluOp::Max,
+                (0b111, 0b000_0101) => AluOp::Maxu,
+                (0b001, 0b011_0000) => AluOp::Rol,
+                (0b101, 0b011_0000) => AluOp::Ror,
+                // Zbs register-register.
+                (0b001, 0b001_0100) => AluOp::Bset,
+                (0b001, 0b010_0100) => AluOp::Bclr,
+                (0b101, 0b010_0100) => AluOp::Bext,
+                (0b001, 0b011_0100) => AluOp::Binv,
+                // Zicond.
+                (0b101, 0b000_0111) => AluOp::CzeroEqz,
+                (0b111, 0b000_0111) => AluOp::CzeroNez,
                 _ => return illegal,
             };
             Inst::Op { op, rd, rs1, rs2 }
         }
         OP_IMM_32 => {
-            // 32-bit shifts take a 5-bit shamt; funct7 is the full selector.
-            let shamt = rs2 as i32;
-            let (op, imm) = match (f3, f7) {
-                (0b000, _) => (AluOp32::Add, imm_i(w)),
-                (0b001, 0b000_0000) => (AluOp32::Sll, shamt),
-                (0b101, 0b000_0000) => (AluOp32::Srl, shamt),
-                (0b101, 0b010_0000) => (AluOp32::Sra, shamt),
+            // 32-bit shifts take a 5-bit shamt (the sixth bit is part of funct7).
+            match (f3, f7) {
+                (0b000, _) => Inst::OpImm32 { op: AluOp32::Add, rd, rs1, imm: imm_i(w) },
+                (0b001, 0b000_0000) => Inst::OpImm32 { op: AluOp32::Sll, rd, rs1, imm: rs2 as i32 },
+                (0b101, 0b000_0000) => Inst::OpImm32 { op: AluOp32::Srl, rd, rs1, imm: rs2 as i32 },
+                (0b101, 0b010_0000) => Inst::OpImm32 { op: AluOp32::Sra, rd, rs1, imm: rs2 as i32 },
+                // Zba slli.uw: a 6-bit shift of the zero-extended low word; the result
+                // is a full 64-bit value, so the shamt's top bit is part of funct7.
+                (0b001, 0b000_0100) | (0b001, 0b000_0101) => {
+                    let shamt6 = ((w >> 20) & 0x3f) as i32;
+                    Inst::OpImm { op: AluOp::SllUw, rd, rs1, imm: shamt6 }
+                }
+                // Zbb roriw.
+                (0b101, 0b011_0000) => Inst::OpImm32 { op: AluOp32::Ror, rd, rs1, imm: rs2 as i32 },
                 _ => return illegal,
-            };
-            Inst::OpImm32 { op, rd, rs1, imm }
+            }
         }
         OP_32 => {
-            let op = match (f3, f7) {
-                (0b000, 0b000_0000) => AluOp32::Add,
-                (0b000, 0b010_0000) => AluOp32::Sub,
-                (0b001, 0b000_0000) => AluOp32::Sll,
-                (0b101, 0b000_0000) => AluOp32::Srl,
-                (0b101, 0b010_0000) => AluOp32::Sra,
-                (0b000, 0b000_0001) => AluOp32::Mul,
-                (0b100, 0b000_0001) => AluOp32::Div,
-                (0b101, 0b000_0001) => AluOp32::Divu,
-                (0b110, 0b000_0001) => AluOp32::Rem,
-                (0b111, 0b000_0001) => AluOp32::Remu,
+            match (f3, f7) {
+                (0b000, 0b000_0000) => Inst::Op32 { op: AluOp32::Add, rd, rs1, rs2 },
+                (0b000, 0b010_0000) => Inst::Op32 { op: AluOp32::Sub, rd, rs1, rs2 },
+                (0b001, 0b000_0000) => Inst::Op32 { op: AluOp32::Sll, rd, rs1, rs2 },
+                (0b101, 0b000_0000) => Inst::Op32 { op: AluOp32::Srl, rd, rs1, rs2 },
+                (0b101, 0b010_0000) => Inst::Op32 { op: AluOp32::Sra, rd, rs1, rs2 },
+                (0b000, 0b000_0001) => Inst::Op32 { op: AluOp32::Mul, rd, rs1, rs2 },
+                (0b100, 0b000_0001) => Inst::Op32 { op: AluOp32::Div, rd, rs1, rs2 },
+                (0b101, 0b000_0001) => Inst::Op32 { op: AluOp32::Divu, rd, rs1, rs2 },
+                (0b110, 0b000_0001) => Inst::Op32 { op: AluOp32::Rem, rd, rs1, rs2 },
+                (0b111, 0b000_0001) => Inst::Op32 { op: AluOp32::Remu, rd, rs1, rs2 },
+                // Zba: word-sourced shifted adds and add.uw; the source is zero-extended
+                // but the sum is a full 64-bit value.
+                (0b010, 0b001_0000) => Inst::Op { op: AluOp::Sh1AddUw, rd, rs1, rs2 },
+                (0b100, 0b001_0000) => Inst::Op { op: AluOp::Sh2AddUw, rd, rs1, rs2 },
+                (0b110, 0b001_0000) => Inst::Op { op: AluOp::Sh3AddUw, rd, rs1, rs2 },
+                (0b000, 0b000_0100) => Inst::Op { op: AluOp::AddUw, rd, rs1, rs2 },
+                // Zbb zext.h has a 64-bit result (it is `packw` on the host side).
+                (0b100, 0b000_0100) if rs2 == 0 => Inst::Op { op: AluOp::ZextH, rd, rs1, rs2: 0 },
+                // Zbb word rotations.
+                (0b001, 0b011_0000) => Inst::Op32 { op: AluOp32::Rol, rd, rs1, rs2 },
+                (0b101, 0b011_0000) => Inst::Op32 { op: AluOp32::Ror, rd, rs1, rs2 },
                 _ => return illegal,
-            };
-            Inst::Op32 { op, rd, rs1, rs2 }
+            }
         }
         // rd, rs1, and unknown fm values are reserved for future fence variants and must be
         // ignored, which makes every such encoding a (possibly stronger-than-needed) fence.
@@ -662,6 +753,12 @@ pub(crate) mod enc {
     pub fn op_imm(f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
         i(OP_IMM, f3, rd, rs1, imm)
     }
+    /// OP-IMM whose immediate field doubles as a selector: the Zbb/Zbs unary and
+    /// immediate forms pack a funct6 above a 5-bit rs2/shift field, so the caller
+    /// passes the combined 12-bit value.
+    pub fn op_imm_selector(f3: u32, selector: u32, rd: u32, rs1: u32) -> u32 {
+        i(OP_IMM, f3, rd, rs1, selector as i32)
+    }
     pub fn op(f3: u32, f7: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
         r(OP, f3, f7, rd, rs1, rs2)
     }
@@ -773,11 +870,11 @@ mod tests {
         let illegal_c = [
             0x0000, // all zeros: defined illegal
             0x0010, // c.addi4spn with nzuimm = 0
-            0x8000, // reserved (Zcb loads/stores)
             0x2001, // c.addiw with rd = 0
             0x6101, // c.addi16sp with nzimm = 0
             0x6081, // c.lui with nzimm = 0
-            0x9c41, // c.mulw-shaped: Zcb
+            0x9c79, // Zcb unary slot, bits 4:2 = 110 (unassigned)
+            0x9c7d, // Zcb unary slot, bits 4:2 = 111 (unassigned)
             0x4002, // c.lwsp with rd = 0
             0x8002, // c.jr with rs1 = 0
         ];

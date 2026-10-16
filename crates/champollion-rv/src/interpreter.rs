@@ -430,6 +430,62 @@ fn alu(op: AluOp, a: u64, b: u64) -> u64 {
         AluOp::Rem if b == 0 => a,
         AluOp::Rem => (a as i64).wrapping_rem(b as i64) as u64,
         AluOp::Remu => a.checked_rem(b).unwrap_or(a),
+        // Zba. The word-sourced adds zero-extend the low word of `a` but produce a full
+        // 64-bit sum, so they carry a 64-bit result here, not an `AluOp32` one.
+        AluOp::Sh1Add => (a << 1).wrapping_add(b),
+        AluOp::Sh2Add => (a << 2).wrapping_add(b),
+        AluOp::Sh3Add => (a << 3).wrapping_add(b),
+        AluOp::AddUw => (a as u32 as u64).wrapping_add(b),
+        AluOp::Sh1AddUw => ((a as u32 as u64) << 1).wrapping_add(b),
+        AluOp::Sh2AddUw => ((a as u32 as u64) << 2).wrapping_add(b),
+        AluOp::Sh3AddUw => ((a as u32 as u64) << 3).wrapping_add(b),
+        AluOp::SllUw => (a as u32 as u64) << sh,
+        // Zbb.
+        AluOp::Andn => a & !b,
+        AluOp::Orn => a | !b,
+        AluOp::Xnor => !(a ^ b),
+        AluOp::Max => (a as i64).max(b as i64) as u64,
+        AluOp::Maxu => a.max(b),
+        AluOp::Min => (a as i64).min(b as i64) as u64,
+        AluOp::Minu => a.min(b),
+        AluOp::Rol => a.rotate_left(sh),
+        AluOp::Ror => a.rotate_right(sh),
+        AluOp::Clz => u64::from(a.leading_zeros()),
+        AluOp::Ctz => u64::from(a.trailing_zeros()),
+        AluOp::Cpop => u64::from(a.count_ones()),
+        AluOp::SextB => a as i8 as i64 as u64,
+        AluOp::SextH => a as i16 as i64 as u64,
+        AluOp::ZextH => a as u16 as u64,
+        AluOp::Rev8 => a.swap_bytes(),
+        AluOp::OrcB => {
+            let mut r = 0u64;
+            for i in 0..8 {
+                if a >> (8 * i) & 0xff != 0 {
+                    r |= 0xff << (8 * i);
+                }
+            }
+            r
+        }
+        // Zbs.
+        AluOp::Bclr => a & !(1u64 << sh),
+        AluOp::Bext => (a >> sh) & 1,
+        AluOp::Binv => a ^ (1u64 << sh),
+        AluOp::Bset => a | (1u64 << sh),
+        // Zicond.
+        AluOp::CzeroEqz => {
+            if b == 0 {
+                0
+            } else {
+                a
+            }
+        }
+        AluOp::CzeroNez => {
+            if b != 0 {
+                0
+            } else {
+                a
+            }
+        }
     }
 }
 
@@ -452,6 +508,9 @@ fn alu32(op: AluOp32, a: u64, b: u64) -> u64 {
         AluOp32::Rem if b == 0 => a,
         AluOp32::Rem => (a as i32).wrapping_rem(b as i32) as u32,
         AluOp32::Remu => a.checked_rem(b).unwrap_or(a),
+        // Zbb word rotations; the sign-extension below applies to them like the *w ops.
+        AluOp32::Rol => a.rotate_left(sh),
+        AluOp32::Ror => a.rotate_right(sh),
     };
     r as i32 as u64
 }
@@ -1062,5 +1121,130 @@ mod tests {
         let (_, mem) = setup(&[]);
         let mut cpu = CpuState::new(0x10);
         assert_eq!(step(&mut cpu, &mem), Err(Trap::FetchFault(MemFault { addr: 0x10 })));
+    }
+
+    #[test]
+    fn zba_shifted_adds() {
+        // shNadd: (rs1 << N) + rs2, wrapping.
+        assert_eq!(one(op(0b010, 0b001_0000, 10, 11, 12), 5, 7), 17);
+        assert_eq!(one(op(0b100, 0b001_0000, 10, 11, 12), 5, 7), 27);
+        assert_eq!(one(op(0b110, 0b001_0000, 10, 11, 12), 5, 7), 47);
+        assert_eq!(one(op(0b010, 0b001_0000, 10, 11, 12), 1 << 63, 1), 1);
+        // The .uw forms use only the low word of rs1 but keep rs2 full width, and the
+        // sum is 64-bit.
+        assert_eq!(one(op_32(0b010, 0b001_0000, 10, 11, 12), 0xffff_ffff_0000_0003, 2), 8);
+        assert_eq!(one(op_32(0b100, 0b001_0000, 10, 11, 12), 3, 0), 12);
+        assert_eq!(one(op_32(0b110, 0b001_0000, 10, 11, 12), 3, 0), 24);
+        assert_eq!(
+            one(op_32(0b000, 0b000_0100, 10, 11, 12), 0xffff_ffff_ffff_ffff, 0x10),
+            0x1_0000_000f
+        );
+        // slli.uw shifts the zero-extended low word by 0..63 (the sixth shamt bit is
+        // part of funct7, so the immediate is funct6 000010 above the shamt).
+        let slliuw = |shamt: i32| 0b000_010 << 6 | shamt;
+        assert_eq!(one(op_imm_32(0b001, 10, 11, slliuw(0)), 0xffff_ffff_ffff_ffff, 0), 0xffff_ffff);
+        assert_eq!(
+            one(op_imm_32(0b001, 10, 11, slliuw(40)), 0xffff_ffff, 0),
+            0xffff_ff00_0000_0000
+        );
+        assert_eq!(one(op_imm_32(0b001, 10, 11, slliuw(63)), 3, 0), 0x8000_0000_0000_0000);
+    }
+
+    #[test]
+    fn zbb_registers() {
+        assert_eq!(one(op(0b111, 0b010_0000, 10, 11, 12), 12, 10), 4);
+        assert_eq!(one(op(0b110, 0b010_0000, 10, 11, 12), 12, 10), (!10) | 12);
+        assert_eq!(one(op(0b100, 0b010_0000, 10, 11, 12), 12, 10), !6);
+        // min/max are signed; minu/maxu are unsigned.
+        assert_eq!(one(op(0b110, 0b000_0101, 10, 11, 12), NEG1, 1), 1);
+        assert_eq!(one(op(0b111, 0b000_0101, 10, 11, 12), NEG1, 1), NEG1);
+        assert_eq!(one(op(0b100, 0b000_0101, 10, 11, 12), NEG1, 1), NEG1);
+        assert_eq!(one(op(0b101, 0b000_0101, 10, 11, 12), NEG1, 1), 1);
+        // Rotates mask the amount to 6 bits.
+        assert_eq!(one(op(0b001, 0b011_0000, 10, 11, 12), 0x8000_0000_0000_0001, 1), 3);
+        assert_eq!(one(op(0b001, 0b011_0000, 10, 11, 12), 0x8000_0000_0000_0001, 65), 3);
+        assert_eq!(one(op(0b101, 0b011_0000, 10, 11, 12), 1, 1), 0x8000_0000_0000_0000);
+        // rori (funct6 011000 above the 6-bit shamt).
+        assert_eq!(one(op_imm_selector(0b101, 0b011_000 << 6 | 60, 10, 11), 1, 0), 16);
+    }
+
+    #[test]
+    fn zbb_unary() {
+        // clz/ctz/cpop: funct6 011000 with rs2 0/1/2.
+        assert_eq!(one(op_imm_selector(0b001, 0b011_000 << 6, 10, 11), 0, 0), 64);
+        assert_eq!(one(op_imm_selector(0b001, 0b011_000 << 6, 10, 11), 1, 0), 63);
+        assert_eq!(one(op_imm_selector(0b001, 0b011_000 << 6 | 1, 10, 11), 0, 0), 64);
+        assert_eq!(one(op_imm_selector(0b001, 0b011_000 << 6 | 1, 10, 11), 1 << 63, 0), 63);
+        assert_eq!(one(op_imm_selector(0b001, 0b011_000 << 6 | 2, 10, 11), 0, 0), 0);
+        assert_eq!(one(op_imm_selector(0b001, 0b011_000 << 6 | 2, 10, 11), NEG1, 0), 64);
+        // sext.b / sext.h (rs2 4/5).
+        assert_eq!(one(op_imm_selector(0b001, 0b011_000 << 6 | 4, 10, 11), 0xff, 0), NEG1);
+        assert_eq!(
+            one(op_imm_selector(0b001, 0b011_000 << 6 | 4, 10, 11), 0x80, 0),
+            -128i64 as u64
+        );
+        assert_eq!(
+            one(op_imm_selector(0b001, 0b011_000 << 6 | 5, 10, 11), 0xff80, 0),
+            -128i64 as u64
+        );
+        // zext.h zero-extends the low halfword (64-bit result).
+        assert_eq!(one(op_32(0b100, 0b000_0100, 10, 11, 0), NEG1, 0), 0xffff);
+        // rev8 byte-swaps (one byte swap on a 64-bit register).
+        assert_eq!(
+            one(op_imm_selector(0b101, 0b011_010 << 6 | 0b11000, 10, 11), 0x0102_0304_0506_0708, 0),
+            0x0807_0605_0403_0201
+        );
+        // orc.b sets a byte to 0xff when it is nonzero (rs2 00111 in funct6 001010).
+        assert_eq!(
+            one(op_imm_selector(0b101, 0b001_010 << 6 | 0b00111, 10, 11), 0x0100_0002_0000_0000, 0),
+            0xff00_00ff_0000_0000
+        );
+    }
+
+    #[test]
+    fn zbs_single_bits() {
+        // bset/bclr/binv/bext; the bit index is rs2 & 63.
+        assert_eq!(one(op(0b001, 0b001_0100, 10, 11, 12), 0, 63), 1 << 63);
+        assert_eq!(one(op(0b001, 0b010_0100, 10, 11, 12), 1 << 63, 63), 0);
+        assert_eq!(one(op(0b001, 0b011_0100, 10, 11, 12), 0, 63), 1 << 63);
+        assert_eq!(one(op(0b001, 0b011_0100, 10, 11, 12), 1 << 63, 63), 0);
+        assert_eq!(one(op(0b101, 0b010_0100, 10, 11, 12), 2, 65), 1);
+        assert_eq!(one(op(0b101, 0b010_0100, 10, 11, 12), 2, 1), 1);
+        // Immediate forms take a 6-bit bit index (funct6 above the shamt).
+        assert_eq!(one(op_imm_selector(0b001, 0b001_010 << 6 | 63, 10, 11), 0, 0), 1 << 63);
+        assert_eq!(one(op_imm_selector(0b001, 0b010_010 << 6 | 63, 10, 11), NEG1, 0), !(1 << 63));
+        assert_eq!(one(op_imm_selector(0b101, 0b010_010 << 6 | 20, 10, 11), 1 << 20, 0), 1);
+        assert_eq!(one(op_imm_selector(0b001, 0b011_010 << 6 | 33, 10, 11), 0, 0), 1 << 33);
+        assert_eq!(one(op_imm_selector(0b001, 0b001_010 << 6 | 42, 10, 11), 0, 0), 1 << 42);
+    }
+
+    #[test]
+    fn zicond_selects() {
+        assert_eq!(one(op(0b101, 0b000_0111, 10, 11, 12), 5, 0), 0);
+        assert_eq!(one(op(0b101, 0b000_0111, 10, 11, 12), 5, 9), 5);
+        assert_eq!(one(op(0b111, 0b000_0111, 10, 11, 12), 5, 9), 0);
+        assert_eq!(one(op(0b111, 0b000_0111, 10, 11, 12), 5, 0), 5);
+    }
+
+    #[test]
+    fn zbb_word_rotates() {
+        // rolw/rorw rotate the low word and sign-extend the result.
+        assert_eq!(one(op_32(0b001, 0b011_0000, 10, 11, 12), 1, 31), 0xffff_ffff_8000_0000);
+        assert_eq!(one(op_32(0b101, 0b011_0000, 10, 11, 12), 1, 1), 0xffff_ffff_8000_0000);
+        assert_eq!(one(op_32(0b101, 0b011_0000, 10, 11, 12), 1, 33), 0xffff_ffff_8000_0000);
+        assert_eq!(one(op_imm_32(0b101, 10, 11, 0b011_000 << 6 | 31), 1, 0), 2);
+    }
+
+    #[test]
+    fn zcb_aliases() {
+        // Raw words from tests/fixtures/rv64zb.s: c.zext.w a4, c.not a5, c.zext.b a0,
+        // c.sext.h a3, c.mul a0, a1. Each 2-byte word is paired with a c.nop so the
+        // program fills its whole 4-byte word.
+        let pair = |h: u32| h | 0x0001 << 16;
+        assert_eq!(exec(&[pair(0x9f71)], &[(14, NEG1)]).0.x[14], 0xffff_ffff);
+        assert_eq!(exec(&[pair(0x9ff5)], &[(15, 0)]).0.x[15], NEG1);
+        assert_eq!(exec(&[pair(0x9d61)], &[(10, 0x1234)]).0.x[10], 0x34);
+        assert_eq!(exec(&[pair(0x9eed)], &[(13, 0xff80)]).0.x[13], -128i64 as u64);
+        assert_eq!(exec(&[pair(0x9d4d)], &[(10, 6), (11, 7)]).0.x[10], 42);
     }
 }
