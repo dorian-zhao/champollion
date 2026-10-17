@@ -459,7 +459,12 @@ impl Tx {
 
     /// Translate one non-control-flow instruction. Returns false if unsupported.
     fn simple(&mut self, inst: Inst, pc: u64) -> bool {
-        if !matches!(inst, Inst::VArith { mask: false, .. }) {
+        if !matches!(
+            inst,
+            Inst::VArith { mask: false, .. }
+                | Inst::VLoad { mask: false, .. }
+                | Inst::VStore { mask: false, .. }
+        ) {
             self.vec_last = None;
         }
         match inst {
@@ -1479,6 +1484,7 @@ impl Tx {
                     self.v_str(FA, (vd + r as u8) & 31);
                 }
                 self.addr_base = None;
+                self.vec_last = if regs == 1 { Some(vd) } else { None };
                 true
             }
             // Whole-register moves carry `nf` 16-byte registers whatever vl and vtype
@@ -1503,6 +1509,7 @@ impl Tx {
                     self.v_str(FA, (vd + k as u8) & 31);
                 }
                 self.addr_base = None;
+                self.vec_last = if n == 1 { Some(vd) } else { None };
                 true
             }
             Inst::VStore { kind: VStoreKind::WholeRegister, vs3, rs1, mask: false, nf, .. } => {
@@ -1510,7 +1517,9 @@ impl Tx {
                 let operand = self.mem_operand(rs1, 0, 16);
                 self.a.mov(SRC0, ADDR);
                 for k in 0..n {
-                    self.v_ldr(FA, (vs3 + k as u8) & 31);
+                    if n != 1 || self.vec_last != Some((vs3 + k as u8) & 31) {
+                        self.v_ldr(FA, (vs3 + k as u8) & 31);
+                    }
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
@@ -1524,6 +1533,7 @@ impl Tx {
                     }
                 }
                 self.addr_base = None;
+                self.vec_last = if n == 1 { Some(vs3) } else { None };
                 true
             }
             Inst::VStore {
@@ -1533,7 +1543,9 @@ impl Tx {
                 let operand = self.mem_operand(rs1, 0, 16);
                 self.a.mov(SRC0, ADDR);
                 for r in 0..regs {
-                    self.v_ldr(FA, (vs3 + r as u8) & 31);
+                    if regs != 1 || self.vec_last != Some((vs3 + r as u8) & 31) {
+                        self.v_ldr(FA, (vs3 + r as u8) & 31);
+                    }
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
@@ -1547,6 +1559,7 @@ impl Tx {
                     }
                 }
                 self.addr_base = None;
+                self.vec_last = if regs == 1 { Some(vs3) } else { None };
                 true
             }
             _ => false,
