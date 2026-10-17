@@ -2250,6 +2250,10 @@ fn f_single_reads(inst: Inst) -> [Option<u8>; 3] {
         // fcvt.d.s reads its single source with the boxing rule; both int conversions too.
         Inst::FCvtFloat { to: FWidth::D, rs1, .. } => [Some(rs1), None, None],
         Inst::FCvtToInt { from: FWidth::S, rs1, rm, .. } if rm != RM_DYN => [Some(rs1), None, None],
+        Inst::VFArith { src: VSel::F(rs1), .. } => [Some(rs1), None, None],
+        Inst::VFMa { src: VSel::F(rs1), .. } => [Some(rs1), None, None],
+        Inst::VFSlide1 { rs1, .. } => [Some(rs1), None, None],
+        Inst::Vmv { src: VSel::F(rs1), .. } => [Some(rs1), None, None],
         _ => [None; 3],
     }
 }
