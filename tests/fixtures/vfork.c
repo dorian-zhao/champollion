@@ -1,6 +1,7 @@
 // vfork (CLONE_VM | CLONE_VFORK): the parent does not resume until the child has execed
 // or exited. A failed exec is reported synchronously, the way glibc's posix_spawn needs
-// its spawner to see it (issue #8): the raw clone here gets the -errno directly.
+// its spawner to see it (issue #8): the raw clone here gets the -errno directly. A later
+// successful exec after a failed candidate must win, as glibc's posix_spawnp searches PATH.
 //   vfork        -> prints a line per check
 //   vfork child  -> exits 7 (the target of the successful exec)
 #include <errno.h>
@@ -48,6 +49,23 @@ int main(int argc, char **argv) {
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 7) bad = 1;
     } else {
         printf("vfork exec: pid missing (ret=%ld errno=%d)\n", ret, errno);
+        bad = 1;
+    }
+
+    status = 0;
+    ret = vfork_child();
+    if (ret == 0) {
+        char *missing[] = {"missing", NULL};
+        syscall(SYS_execve, "/nonexistent/vfork-first", missing, environ);
+        char *args[] = {argv[0], "child", NULL};
+        syscall(SYS_execve, argv[0], args, environ);
+        _exit(127);
+    }
+    if (ret > 0 && waitpid((pid_t)ret, &status, 0) == ret) {
+        printf("vfork exec retry: exited %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 7) bad = 1;
+    } else {
+        printf("vfork exec retry: pid missing (ret=%ld errno=%d)\n", ret, errno);
         bad = 1;
     }
 

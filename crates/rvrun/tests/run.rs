@@ -80,6 +80,7 @@ fn vfork() {
         String::from_utf8_lossy(&out.stdout),
         "vfork exec missing: ENOENT\n\
          vfork exec: exited 7\n\
+         vfork exec retry: exited 7\n\
          vfork exit: exited 5\n"
     );
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));

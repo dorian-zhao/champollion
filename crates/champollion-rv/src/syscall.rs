@@ -786,18 +786,20 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
         // the errno into a pipe instead). A successful exec closes the CLOEXEC write
         // end too, which the parent reads as EOF and takes as the child running.
         let pipe = if flags & CLONE_VFORK != 0 { Some(p.host.pipe2(O_CLOEXEC)?) } else { None };
-        if let Some([_, write]) = pipe
-            && let Some(stale) = t.vfork_pipe.replace(write)
-        {
-            // An earlier vfork child of this thread that never reported; it is not
-            // this call's concern.
-            unsafe { libc::close(stale) };
+        if let Some([_, write]) = pipe {
+            if let Some(stale) = t.vfork_pipe.replace(write) {
+                // An earlier vfork child of this thread that never reported; it is not
+                // this call's concern.
+                unsafe { libc::close(stale) };
+            }
+            t.vfork_errno = None;
         }
         let pid = match p.fork(t) {
             Ok(pid) => pid,
             Err(e) => {
                 if let Some([read, write]) = pipe {
                     t.vfork_pipe = None;
+                    t.vfork_errno = None;
                     // SAFETY: both fds are open in this process here, and taken from use.
                     unsafe {
                         libc::close(read);
@@ -831,6 +833,7 @@ fn clone(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
                 // The parent holds no copy of the write end while it waits, or the EOF
                 // that ends the wait would never come.
                 t.vfork_pipe = None;
+                t.vfork_errno = None;
                 // SAFETY: the write end was just inherited; this is the parent's copy.
                 unsafe { libc::close(write) };
                 let outcome = wait_for_vfork(read);
@@ -948,7 +951,7 @@ fn read_cstr_array(p: &Process, mut addr: u64) -> Result<Vec<Vec<u8>>, i32> {
 fn execve(p: &Process, t: &mut Thread, a: [u64; 6]) -> SysResult {
     match exec(p, t, a) {
         Err(errno) => {
-            report_failed_exec(t, errno);
+            record_failed_exec(t, errno);
             Err(errno)
         }
         ok => ok,
@@ -987,23 +990,35 @@ fn exec(p: &Process, t: &Thread, a: [u64; 6]) -> SysResult {
     Err(p.exec(&crate::process::Exec { path: host, argv, envp, ignored, mask: t.signals.mask() }))
 }
 
-/// A vfork child reporting a failed `execve` to the parent waiting in [`clone`]. The
-/// write end is `CLOEXEC`, so a successful exec closes the pipe instead and the parent
-/// reads EOF.
-fn report_failed_exec(t: &mut Thread, errno: i32) {
+/// Record a failed `execve` in a vfork child. `posix_spawnp` may try another `PATH`
+/// candidate after a failure, so the parent waiting in [`clone`] must not resume yet.
+fn record_failed_exec(t: &mut Thread, errno: i32) {
+    if t.vfork_pipe.is_some() {
+        t.vfork_errno = Some(errno);
+    }
+}
+
+/// Report a vfork child's last failed `execve`, if any, as it exits. A successful exec
+/// closes the `CLOEXEC` pipe first, which the parent reads as success. If every candidate
+/// failed, the child reaches `exit` and this message ends the parent's wait with the
+/// final errno.
+fn report_vfork_exit(t: &mut Thread) {
     let Some(fd) = t.vfork_pipe.take() else { return };
-    let bytes = errno.to_le_bytes();
-    let mut written = 0;
-    while written < bytes.len() {
-        // SAFETY: the fd is this child's inherited pipe write end; bytes is four long.
-        let n = unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
-        if n < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+    if let Some(errno) = t.vfork_errno.take() {
+        let bytes = errno.to_le_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            // SAFETY: the fd is this child's inherited pipe write end; bytes is four long.
+            let n =
+                unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
             }
-            break;
+            written += n as usize;
         }
-        written += n as usize;
     }
     // SAFETY: closed exactly once: the field was taken.
     unsafe { libc::close(fd) };
@@ -1078,6 +1093,7 @@ pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
 
     let result = match nr {
         nr::EXIT | nr::EXIT_GROUP => {
+            report_vfork_exit(t);
             if p.log.strace.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("[rvrun {}] {}({}) = ?", t.tid, name(nr).unwrap(), a[0] as i32);
             }
