@@ -9,10 +9,15 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn rvrun(args: &[&std::ffi::OsStr], stdin: &[u8]) -> Output {
+    rvrun_with_jit(args, stdin, true)
+}
+
+fn rvrun_with_jit(args: &[&std::ffi::OsStr], stdin: &[u8], jit: bool) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rvrun"))
         .args(args)
         .env("CHAMPOLLION_TEST", "yes")
         .env("RVRUN_CACHE", "0")
+        .env("RVRUN_JIT", if jit { "1" } else { "0" })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -185,4 +190,17 @@ fn floating_point_matches_native() {
         assert_eq!(g, e, "line {}", i + 1);
     }
     assert_eq!(got.lines().count(), expected.lines().count());
+}
+
+#[test]
+fn rotate_sequences_match_the_interpreter() {
+    let path = fixture("rotate");
+    let args = [path.as_os_str()];
+    let jit = rvrun(&args, b"");
+    let interp = rvrun_with_jit(&args, b"", false);
+    let stderr = String::from_utf8_lossy(&jit.stderr);
+    assert_eq!(jit.status.code(), Some(0), "{stderr}");
+    assert_eq!(interp.status.code(), Some(0), "{}", String::from_utf8_lossy(&interp.stderr));
+    assert_eq!(jit.stdout, b"ok rotate sequences\n");
+    assert_eq!(jit.stdout, interp.stdout);
 }

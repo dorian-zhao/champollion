@@ -2338,6 +2338,268 @@ fn internal_edge(
     carry_clean[t].then_some(t)
 }
 
+/// A fused rotate: the source, destination, right-rotate amount, and the shift whose
+/// result the OR did not replace.
+struct Rotate {
+    rs: u8,
+    rd: u8,
+    amount: u32,
+    keep_op: AluOp,
+    keep_rd: u8,
+    keep_imm: u32,
+}
+
+/// Match a rotate written as two shifts and an OR at `i`, which is what RV64GC compilers
+/// emit because the base ISA has no rotate instruction: `slli t, a, m; srli a, a, 64-m;
+/// or a, t, a` (or the same with the shifts in the other order).
+///
+/// The first shift must not write the shared source: otherwise the second shift reads
+/// the already-shifted value, and the three instructions are not a rotate. Writing the
+/// source in the second shift is fine (and common), because both shifts have read it by
+/// then.
+///
+/// The shift the OR did not replace still has to run: its destination may stay live
+/// after the OR, so dropping it would leave the guest register file wrong.
+fn rotate_pattern(block: &[(Inst, u8)], i: usize) -> Option<Rotate> {
+    let Inst::OpImm { op: op0, rd: d0, rs1: s0, imm: k0 } = block.get(i)?.0 else {
+        return None;
+    };
+    let Inst::OpImm { op: op1, rd: d1, rs1: s1, imm: k1 } = block.get(i + 1)?.0 else {
+        return None;
+    };
+    let Inst::Op { op: AluOp::Or, rd, rs1: o0, rs2: o1 } = block.get(i + 2)?.0 else {
+        return None;
+    };
+    if s0 != s1 || d0 == 0 || d1 == 0 || rd == 0 || d0 == d1 || d0 == s0 {
+        return None;
+    }
+    let (right, left) = match (op0, op1) {
+        (AluOp::Srl, AluOp::Sll) => (k0, k1),
+        (AluOp::Sll, AluOp::Srl) => (k1, k0),
+        _ => return None,
+    };
+    let (right, left) = (right as u32, left as u32);
+    if right == 0 || left == 0 || right + left != 64 {
+        return None;
+    }
+    if !((o0 == d0 && o1 == d1) || (o0 == d1 && o1 == d0)) {
+        return None;
+    }
+    // With a third destination both shift results are intermediates, so fusion would
+    // emit as many instructions as the original three and buy nothing.
+    let rotate = if rd == d0 {
+        Rotate { rs: s0, rd, amount: right, keep_op: op1, keep_rd: d1, keep_imm: k1 as u32 }
+    } else if rd == d1 {
+        Rotate { rs: s0, rd, amount: right, keep_op: op0, keep_rd: d0, keep_imm: k0 as u32 }
+    } else {
+        return None;
+    };
+    Some(rotate)
+}
+
+/// How far ahead of an OR a 32-bit shift pair may be scheduled. Compilers interleave
+/// independent rotates to hide latency, so the OR often follows the next rotate's first
+/// shift.
+const ROTATE32_WINDOW: usize = 8;
+
+#[derive(Clone, Copy)]
+enum Rotate32Shift {
+    Left(u32),
+    Right(u32),
+}
+
+/// A 32-bit rotate found in a window ending at an OR. `first` and `second` are the two
+/// shifts, in program order; both are skipped and recomputed at the OR.
+#[derive(Clone, Copy)]
+struct Rotate32 {
+    rs: u8,
+    rd: u8,
+    amount: u32,
+    keep: (Rotate32Shift, u8),
+    d0: u8,
+    d1: u8,
+    first: usize,
+    second: usize,
+    at: usize,
+}
+
+/// The integer registers an ALU instruction reads, and the one it writes. `None` for
+/// anything that is not a pure integer ALU operation, which keeps the window analysis
+/// free of faults and control flow.
+fn alu_effect(inst: Inst) -> Option<(u32, u8)> {
+    match inst {
+        Inst::Lui { rd, .. } | Inst::Auipc { rd, .. } => Some((0, rd)),
+        Inst::OpImm { rd, rs1, .. } | Inst::OpImm32 { rd, rs1, .. } => Some((1 << rs1, rd)),
+        Inst::Op { rd, rs1, rs2, .. } | Inst::Op32 { rd, rs1, rs2, .. } => {
+            Some((1 << rs1 | 1 << rs2, rd))
+        }
+        _ => None,
+    }
+}
+
+fn shift32(op: AluOp32, imm: u32) -> Option<Rotate32Shift> {
+    match op {
+        AluOp32::Sll => Some(Rotate32Shift::Left(imm)),
+        AluOp32::Srl => Some(Rotate32Shift::Right(imm)),
+        _ => None,
+    }
+}
+
+/// Whether the instructions between a 32-bit rotate's two shifts and its OR still leave
+/// the shift results intact. Instructions that are themselves part of another fused
+/// rotate are judged by their fused effect: the rotate reads its source and writes its
+/// destination and the kept shift's destination. A skipped shift has no effect at its
+/// old position; its result is materialized at its own OR.
+fn rotate32_window_ok(
+    block: &[(Inst, u8)],
+    plans: &[Option<Rotate32>],
+    skip: &[bool],
+    r: &Rotate32,
+) -> bool {
+    for p in r.first + 1..r.at {
+        if p == r.second || skip[p] {
+            continue;
+        }
+        let (reads, writes) = match plans[p] {
+            Some(q) => (1u32 << q.rs, [q.rd, q.keep.1]),
+            None => match alu_effect(block[p].0) {
+                Some((reads, w)) => (reads, [w, w]),
+                None => return false,
+            },
+        };
+        if p < r.second {
+            // The second shift overwrites d1, so any earlier write to it is dead.
+            for w in writes {
+                if w == r.rs || w == r.d0 {
+                    return false;
+                }
+            }
+            if reads & (1 << r.d0) != 0 {
+                return false;
+            }
+        } else {
+            for w in writes {
+                if w == r.rs || w == r.d0 || w == r.d1 {
+                    return false;
+                }
+            }
+            if reads & (1 << r.d0 | 1 << r.d1) != 0 || (r.d1 == r.rs && reads & (1 << r.rs) != 0) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Find windowed 32-bit rotates. Returns which instructions to skip and the plan for each
+/// OR that replaces them. Windows may overlap in the scheduling pattern compilers emit:
+/// the next rotate's first shift sits between this rotate's second shift and its OR.
+fn plan_rotates32(
+    block: &[(Inst, u8)],
+    pcs: &[u64],
+    branch_targets: &[u64],
+) -> (Vec<bool>, Vec<Option<Rotate32>>) {
+    let mut skip = vec![false; block.len()];
+    let mut plans = vec![None; block.len()];
+    for i in 0..block.len() {
+        let Inst::Op { op: AluOp::Or, rd, rs1: o0, rs2: o1 } = block[i].0 else {
+            continue;
+        };
+        let start = i.saturating_sub(ROTATE32_WINDOW);
+        let mut shifts = Vec::new();
+        for (p, &(inst, _)) in block.iter().enumerate().take(i).skip(start) {
+            if let Inst::OpImm32 { op, rd, rs1, imm } = inst
+                && let Some(shift) = shift32(op, imm as u32)
+            {
+                shifts.push((p, shift, rd, rs1));
+            }
+        }
+        let mut found = None;
+        'pairs: for a in 0..shifts.len() {
+            for b in a + 1..shifts.len() {
+                let (j, s0, d0, src0) = shifts[a];
+                let (k, s1, d1, src1) = shifts[b];
+                let (right, left) = match (s0, s1) {
+                    (Rotate32Shift::Left(m), Rotate32Shift::Right(k)) => (k, m),
+                    (Rotate32Shift::Right(k), Rotate32Shift::Left(m)) => (k, m),
+                    _ => continue,
+                };
+                if src0 != src1
+                    || d0 == 0
+                    || d1 == 0
+                    || d0 == d1
+                    || d0 == src0
+                    || right == 0
+                    || left == 0
+                    || right + left != 32
+                {
+                    continue;
+                }
+                if !((o0 == d0 && o1 == d1) || (o0 == d1 && o1 == d0)) {
+                    continue;
+                }
+                let keep = if rd == d0 {
+                    (s1, d1)
+                } else if rd == d1 {
+                    (s0, d0)
+                } else {
+                    continue;
+                };
+                // A branch entering the window would skip the shifts but still reach the
+                // fused OR, which would then compute a rotate from the wrong state.
+                if (j..=i).any(|p| branch_targets.contains(&pcs[p])) {
+                    continue;
+                }
+                let r = Rotate32 {
+                    rs: src0,
+                    rd,
+                    amount: right,
+                    keep,
+                    d0,
+                    d1,
+                    first: j,
+                    second: k,
+                    at: i,
+                };
+                // Two plans cannot share a shift: the second would need the first's
+                // materialized value at a different point.
+                if skip[j] || skip[k] || !rotate32_window_ok(block, &plans, &skip, &r) {
+                    continue;
+                }
+                found = Some(r);
+                break 'pairs;
+            }
+        }
+        if let Some(r) = found {
+            plans[i] = Some(r);
+            skip[r.first] = true;
+            skip[r.second] = true;
+        }
+    }
+    // A later plan can change the effect of an earlier plan's window. Recheck with the
+    // final set and drop anything that no longer holds.
+    loop {
+        let mut changed = false;
+        for i in 0..plans.len() {
+            if let Some(r) = plans[i]
+                && !rotate32_window_ok(block, &plans, &skip, &r)
+            {
+                plans[i] = None;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        skip.fill(false);
+        for r in plans.iter().flatten() {
+            skip[r.first] = true;
+            skip[r.second] = true;
+        }
+    }
+    (skip, plans)
+}
+
 /// Translate `block` (as decoded at `pc`) into code that will live at word index
 /// `block_word` of the code buffer, whose exit stub is at word index `stub_word`. Returns
 /// `None` if not even the first instruction can be translated. Indirect jumps probe the
@@ -2457,6 +2719,19 @@ pub fn translate(
             a += u64::from(len);
         }
     }
+    // Instructions a branch or jump inside this block can enter. A fused rotate spans
+    // three instructions, so a branch must not be able to land in its middle.
+    let branch_targets: Vec<u64> = block
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(inst, _))| match inst {
+            Inst::Branch { offset, .. } | Inst::Jal { offset, .. } => {
+                Some(pcs[i].wrapping_add(sext(offset)))
+            }
+            _ => None,
+        })
+        .collect();
+    let (skip32, plans32) = plan_rotates32(block, &pcs, &branch_targets);
     let mut code_pos = vec![0usize; block.len()];
     let mut carry_clean = vec![false; block.len()];
     let mut fboxed_at = vec![0u32; block.len()];
@@ -2489,6 +2764,95 @@ pub fn translate(
             fboxed_at[i] = tx.fboxed;
         }
         tx.base_reused = reused[i];
+        if skip32[i] {
+            // The shift runs as part of the rotate at the waiting OR. Its result is
+            // materialized there, so only bookkeeping happens here.
+            retired += 1;
+            tx.retired = retired;
+            if let Some(rd) = int_dest(inst) {
+                if tx.addr_base == Some(rd) {
+                    tx.addr_base = None;
+                }
+                if known.is_some_and(|(r, _)| r == rd) {
+                    known = None;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(r) = plans32[i] {
+            let a = tx.src(r.rs, SRC0);
+            let d = tx.dst(r.rd);
+            let keep_after = r.keep.1 == r.rs;
+            let emit_shift = |tx: &mut Tx, h: Reg| {
+                match r.keep.0 {
+                    Rotate32Shift::Left(imm) => tx.a.lsl_imm_w(h, a, imm),
+                    Rotate32Shift::Right(imm) => tx.a.lsr_imm_w(h, a, imm),
+                }
+                tx.a.sxtw(h, h);
+            };
+            if !keep_after {
+                let h = tx.dst(r.keep.1);
+                emit_shift(&mut tx, h);
+                tx.commit(r.keep.1, h);
+            }
+            tx.a.ror_imm_w(d, a, r.amount);
+            tx.a.sxtw(d, d);
+            tx.commit(r.rd, d);
+            if keep_after {
+                let h = tx.dst(r.keep.1);
+                emit_shift(&mut tx, h);
+                tx.commit(r.keep.1, h);
+            }
+            retired += 1;
+            tx.retired = retired;
+            if tx.addr_base == Some(r.rd) || tx.addr_base == Some(r.keep.1) {
+                tx.addr_base = None;
+            }
+            known = None;
+            i += 1;
+            continue;
+        }
+        if i + 2 < block.len()
+            && !branch_targets.contains(&pcs[i + 1])
+            && !branch_targets.contains(&pcs[i + 2])
+            && let Some(r) = rotate_pattern(block, i)
+        {
+            let a = tx.src(r.rs, SRC0);
+            let d = tx.dst(r.rd);
+            // The kept shift still reads the original source. If its destination is
+            // that source, it has to run after the rotate, which does not write rs
+            // (rd and the kept destination differ).
+            let keep_after = r.keep_rd == r.rs;
+            if !keep_after {
+                let h = tx.dst(r.keep_rd);
+                match r.keep_op {
+                    AluOp::Sll => tx.a.lsl_imm(h, a, r.keep_imm),
+                    AluOp::Srl => tx.a.lsr_imm(h, a, r.keep_imm),
+                    _ => unreachable!(),
+                }
+                tx.commit(r.keep_rd, h);
+            }
+            tx.a.ror_imm(d, a, r.amount);
+            tx.commit(r.rd, d);
+            if keep_after {
+                let h = tx.dst(r.keep_rd);
+                match r.keep_op {
+                    AluOp::Sll => tx.a.lsl_imm(h, a, r.keep_imm),
+                    AluOp::Srl => tx.a.lsr_imm(h, a, r.keep_imm),
+                    _ => unreachable!(),
+                }
+                tx.commit(r.keep_rd, h);
+            }
+            retired += 3;
+            tx.retired = retired;
+            if tx.addr_base == Some(r.rd) || tx.addr_base == Some(r.keep_rd) {
+                tx.addr_base = None;
+            }
+            known = None;
+            i += 3;
+            continue;
+        }
         match inst {
             Inst::Jal { rd, offset } => {
                 tx.link(rd, next);
