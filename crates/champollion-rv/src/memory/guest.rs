@@ -51,8 +51,13 @@ pub const GUARD_SIZE: u64 = 64 << 10;
 const CONTROL_SIZE: u64 = 16 << 10;
 /// Distance from the guest base down to the control area.
 pub const CONTROL_OFFSET: u64 = GUARD_SIZE + CONTROL_SIZE;
+/// Fast syscall buffer ranges kept in the control area: `mmap`, `brk`, and the stack.
+pub const FAST_RANGE_COUNT: usize = 4;
+pub const FAST_RANGE_STRIDE: usize = 32;
+pub const FAST_RANGES_OFFSET: usize = CONTROL_SIZE as usize - FAST_RANGE_COUNT * FAST_RANGE_STRIDE;
 /// Number of interrupt flags (thread slots) in the control area.
-pub const INTERRUPT_SLOTS: usize = (CONTROL_SIZE / 4) as usize;
+pub const INTERRUPT_SLOTS: usize =
+    (CONTROL_SIZE as usize - FAST_RANGE_COUNT * FAST_RANGE_STRIDE) / 4;
 
 /// Guest page permissions, with Linux `PROT_*` bit values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -232,6 +237,10 @@ pub struct GuestMemory {
     /// Unmapped host pages, already emptied, still to be made inaccessible once no TLB can
     /// point at them (see [`GuestMemory::settle`]).
     pending: Mutex<Vec<Range<u64>>>,
+    /// Serializes updates to the fast syscall range cache in the control area.
+    fast_lock: Mutex<()>,
+    /// Next fast-range slot to replace.
+    fast_next: AtomicU32,
     /// Set by [`GuestMemory::leak_at_exit`]: the process is exiting, so the reservation
     /// stays mapped and the kernel reclaims it.
     leaked: std::sync::atomic::AtomicBool,
@@ -362,6 +371,8 @@ impl GuestMemory {
         Self {
             readers: Mutex::default(),
             pending: Mutex::default(),
+            fast_lock: Mutex::default(),
+            fast_next: AtomicU32::new(0),
             base,
             lowest,
             control,
@@ -444,6 +455,65 @@ impl GuestMemory {
         // SAFETY: the control area is mapped read/write for the reservation's lifetime and
         // only ever accessed atomically; slots are 4-byte aligned.
         unsafe { AtomicU32::from_ptr(self.control.add(slot)) }
+    }
+
+    fn fast_entry(&self, slot: usize) -> *mut u8 {
+        // SAFETY: the fast-range area is inside the control mapping.
+        unsafe { self.control.cast::<u8>().add(FAST_RANGES_OFFSET + slot * FAST_RANGE_STRIDE) }
+    }
+
+    /// Record a mapped range for the generated read/write fast path. The entry is a
+    /// seqlock: the odd version marks an update in progress, the even one a usable range.
+    pub fn fast_range_add(&self, start: u64, end: u64, prot: Prot) {
+        if start >= end || (prot.0 & (Prot::READ.0 | Prot::WRITE.0)) == 0 {
+            return;
+        }
+        let _guard = self.fast_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self.fast_next.fetch_add(1, Relaxed) as usize % FAST_RANGE_COUNT;
+        let base = self.fast_entry(slot);
+        // SAFETY: the control area is writable and the fields are naturally aligned.
+        unsafe {
+            let version = AtomicU32::from_ptr(base.cast());
+            let prot_field = AtomicU32::from_ptr(base.add(4).cast());
+            let start_field = AtomicU64::from_ptr(base.add(8).cast());
+            let end_field = AtomicU64::from_ptr(base.add(16).cast());
+            let v = version.load(Relaxed);
+            version.store(v.wrapping_add(1), Relaxed);
+            prot_field.store(prot.0, Relaxed);
+            start_field.store(start, Relaxed);
+            end_field.store(end, Relaxed);
+            version.store(v.wrapping_add(2), Release);
+        }
+    }
+
+    /// Drop cached ranges overlapping an unmapped or reprotected range.
+    pub fn fast_range_clear_overlap(&self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let _guard = self.fast_lock.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in 0..FAST_RANGE_COUNT {
+            let base = self.fast_entry(slot);
+            // SAFETY: as in `fast_range_add`.
+            unsafe {
+                let version = AtomicU32::from_ptr(base.cast());
+                let v = version.load(Relaxed);
+                if v & 1 != 0 {
+                    continue;
+                }
+                let start_field = AtomicU64::from_ptr(base.add(8).cast());
+                let end_field = AtomicU64::from_ptr(base.add(16).cast());
+                let entry_start = start_field.load(Relaxed);
+                let entry_end = end_field.load(Relaxed);
+                if entry_start < end && start < entry_end {
+                    version.store(v.wrapping_add(1), Relaxed);
+                    AtomicU32::from_ptr(base.add(4).cast()).store(0, Relaxed);
+                    start_field.store(0, Relaxed);
+                    end_field.store(0, Relaxed);
+                    version.store(v.wrapping_add(2), Release);
+                }
+            }
+        }
     }
 
     /// Counter bumped by mapping changes that involve executable pages (before or after the
@@ -607,7 +677,7 @@ impl GuestMemory {
         // Shared mappings start read-only on the host unless writable (see `map_shared`), so
         // making one writable needs the host's consent: a file opened read-only refuses.
         // (Write access is never taken back on the host; software checks enforce that.)
-        let splits = maps.split_out(r);
+        let splits = maps.split_out(r.clone());
         if prot.contains(Prot::WRITE) {
             for &(start, m) in &splits {
                 if m.shared {
@@ -631,6 +701,8 @@ impl GuestMemory {
             code |= m.prot.contains(Prot::EXEC);
             m.prot = prot;
         }
+        self.fast_range_clear_overlap(r.start, r.end);
+        self.fast_range_add(r.start, r.end, prot);
         self.changed(code);
         Ok(())
     }
@@ -652,16 +724,19 @@ impl GuestMemory {
     fn insert_locked(&self, maps: &mut Maps, r: Range<u64>, prot: Prot) {
         self.commit_host(r.clone());
         maps.0.insert(r.start, Mapping { end: r.end, prot, shared: false });
+        self.fast_range_add(r.start, r.end, prot);
         self.changed(prot.contains(Prot::EXEC));
     }
 
     fn unmap_locked(&self, maps: &mut Maps, r: Range<u64>) {
         let mut code = false;
+        let (start, end) = (r.start, r.end);
         for (start, m) in maps.split_out(r) {
             code |= m.prot.contains(Prot::EXEC);
             maps.0.remove(&start);
             self.release(maps, start..m.end, m.shared);
         }
+        self.fast_range_clear_overlap(start, end);
         self.changed(code);
     }
 
@@ -779,6 +854,7 @@ impl GuestMemory {
             }));
         }
         maps.0.insert(addr, Mapping { end: addr + len, prot, shared: true });
+        self.fast_range_add(addr, addr + len, prot);
         self.changed(prot.contains(Prot::EXEC));
         drop(maps);
         self.settle();
@@ -1188,6 +1264,40 @@ mod tests {
         assert!(m.read_cstr(0x60ffb, 2).is_err()); // too long
         m.write(0x60ffc, b"xyzw").unwrap(); // runs off the mapping
         assert!(m.read_cstr(0x60ffc, 100).is_err());
+    }
+
+    #[test]
+    fn fast_ranges_follow_maps_and_protections() {
+        fn entries(m: &GuestMemory) -> Vec<(u64, u64, Prot)> {
+            (0..FAST_RANGE_COUNT)
+                .filter_map(|i| {
+                    // SAFETY: the control area is ours and the fields are aligned.
+                    unsafe {
+                        let base = m.fast_entry(i);
+                        if *(base as *const u32) & 1 != 0 {
+                            return None;
+                        }
+                        let prot = *(base.add(4) as *const u32);
+                        let start = *(base.add(8) as *const u64);
+                        let end = *(base.add(16) as *const u64);
+                        (start < end).then_some((start, end, Prot(prot)))
+                    }
+                })
+                .collect()
+        }
+        let m = GuestMemory::new().unwrap();
+        assert!(entries(&m).is_empty());
+        m.map(0x100000, P, Prot::RW).unwrap();
+        assert_eq!(entries(&m), vec![(0x100000, 0x100000 + P, Prot::RW)]);
+        m.protect(0x100000, P, Prot::READ).unwrap();
+        assert_eq!(entries(&m), vec![(0x100000, 0x100000 + P, Prot::READ)]);
+        m.unmap(0x100000, P).unwrap();
+        assert!(entries(&m).is_empty());
+
+        for i in 0..=FAST_RANGE_COUNT {
+            m.map(0x200000 + i as u64 * P, P, Prot::RW).unwrap();
+        }
+        assert_eq!(entries(&m).len(), FAST_RANGE_COUNT);
     }
 
     #[test]

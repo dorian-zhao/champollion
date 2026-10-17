@@ -36,7 +36,9 @@ use crate::decoder::{
     IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VFArithOp, VFMaOp, VMaskOp,
     VMemKind, VSel, VSetKind, VStoreKind,
 };
-use crate::memory::{CONTROL_OFFSET, GUARD_SIZE, GUEST_SIZE};
+use crate::memory::{
+    CONTROL_OFFSET, FAST_RANGE_COUNT, FAST_RANGE_STRIDE, FAST_RANGES_OFFSET, GUARD_SIZE, GUEST_SIZE,
+};
 const _: () = assert!(CONTROL_OFFSET.is_multiple_of(4096) && CONTROL_OFFSET >> 12 < 4096);
 
 pub const CTX: Reg = 28;
@@ -3020,21 +3022,88 @@ pub fn translate(
             }
             Inst::Ecall if tx.identity => {
                 // Linux's asm-generic numbers, arguments, and return register line up
-                // for these calls, and none of them touches guest memory. Run them in
-                // generated code and chain straight to the next block; anything else
-                // still leaves to the dispatcher.
-                let mut fast_branches = Vec::new();
+                // for these calls. close and getpid do not touch guest memory; read and
+                // write can run inline when their buffer falls in one of the recently
+                // mapped ranges recorded in the control area.
+                let mut close_branches = Vec::new();
                 for nr in [57u32, 172] {
-                    // close, getpid
                     tx.a.cmp_imm(7, nr);
                     let b = tx.a.pos();
                     tx.a.b_cond(Cond::Eq, b);
-                    fast_branches.push(b);
+                    close_branches.push(b);
                 }
-                exits.push((tx.a.pos(), None));
+                let mut rw_branches = Vec::new();
+                for nr in [63u32, 64] {
+                    tx.a.cmp_imm(7, nr);
+                    let b = tx.a.pos();
+                    tx.a.b_cond(Cond::Eq, b);
+                    rw_branches.push(b);
+                }
+                let slow = tx.a.pos();
+                exits.push((slow, None));
                 tx.exit(Tail::Static { pc: at, code: exit::ECALL });
+                let rw = tx.a.pos();
+                for b in rw_branches {
+                    tx.a.patch(b, rw);
+                }
+                // read needs a writable buffer; write needs a readable one.
+                tx.a.and_imm_w(15, 7, 1).unwrap();
+                tx.a.add_imm_w(15, 15, 1);
+                let mut hit_branches = Vec::new();
+                for slot in 0..FAST_RANGE_COUNT {
+                    let base = FAST_RANGES_OFFSET + slot * FAST_RANGE_STRIDE;
+                    let mut failures = Vec::new();
+                    // The version is odd while a mapping update is in progress.
+                    tx.a.ldr_off_w(16, MEMBASE, base as u32);
+                    tx.a.and_imm_w(17, 16, 1).unwrap();
+                    let b = tx.a.pos();
+                    tx.a.cbnz(17, b);
+                    failures.push(b);
+                    // start <= buffer
+                    tx.a.ldr_off(14, MEMBASE, (base + 8) as u32);
+                    tx.a.cmp(1, 14);
+                    let b = tx.a.pos();
+                    tx.a.b_cond(Cond::Lo, b);
+                    failures.push(b);
+                    // end = buffer + len, without wrapping
+                    tx.a.add(14, 1, 2);
+                    tx.a.cmp(14, 1);
+                    let b = tx.a.pos();
+                    tx.a.b_cond(Cond::Lo, b);
+                    failures.push(b);
+                    // end <= range end
+                    tx.a.ldr_off(17, MEMBASE, (base + 16) as u32);
+                    tx.a.cmp(14, 17);
+                    let b = tx.a.pos();
+                    tx.a.b_cond(Cond::Hi, b);
+                    failures.push(b);
+                    // the mapping has the permission this syscall needs
+                    tx.a.ldr_off_w(14, MEMBASE, (base + 4) as u32);
+                    tx.a.and(14, 14, 15);
+                    let b = tx.a.pos();
+                    tx.a.cbz(14, b);
+                    failures.push(b);
+                    // the seqlock did not move while we read the fields
+                    tx.a.dmb_ish();
+                    tx.a.ldr_off_w(14, MEMBASE, base as u32);
+                    tx.a.cmp(16, 14);
+                    let b = tx.a.pos();
+                    tx.a.b_cond(Cond::Ne, b);
+                    failures.push(b);
+                    let hit = tx.a.pos();
+                    tx.a.b(hit); // patched to the shared fast body
+                    hit_branches.push(hit);
+                    let next_slot = tx.a.pos();
+                    for b in failures {
+                        tx.a.patch(b, next_slot);
+                    }
+                }
+                tx.a.b(slow);
                 let fast = tx.a.pos();
-                for b in fast_branches {
+                for b in close_branches {
+                    tx.a.patch(b, fast);
+                }
+                for b in hit_branches {
                     tx.a.patch(b, fast);
                 }
                 // The ecall retires once; the block's entry counted everything before it.
