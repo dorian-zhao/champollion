@@ -1506,6 +1506,85 @@ mod tests {
         assert_eq!(u64::from_le_bytes(b[8..].try_into().unwrap()), 0xfc00_0000_0000_0000);
     }
 
+    #[test]
+    fn vector_arith_chain_reuses_the_previous_destination() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle =
+            |wf3: u32, vd: u32, rs1: u32| (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |wf3: u32, vs3: u32, rs1: u32| {
+            (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vx = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (rs1 << 15) | (0b100 << 12) | (vd << 7) | 0x57
+        };
+        let vi = |f6: u32, vd: u32, vs2: u32, imm: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (imm << 15) | (0b011 << 12) | (vd << 7) | 0x57
+        };
+        let mvx = |vd: u32, vs2: u32, rs1: u32| {
+            (0b100101 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (rs1 << 15)
+                | (0b110 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let prog = [
+            vsetivli(0, 16, 0xc0), // e8, m1, ta, ma
+            vle(0b000, 1, 11),
+            vle(0b000, 2, 12),
+            vi(0b101000, 1, 1, 3),  // vsrl.vi v1, v1, 3
+            vx(0b101001, 1, 1, 14), // vsra.vx v1, v1, a4
+            vv(0b000010, 1, 1, 2),  // vsub.vv v1, v1, v2
+            mvx(1, 1, 15),          // vmul.vx v1, v1, a5
+            vse(0b000, 1, 13),
+            ECALL,
+        ];
+        let data = |mem: &GuestMemory| {
+            mem.write_privileged(
+                DATA,
+                &[
+                    0xff, 0x80, 0x7f, 0x01, 0xfe, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+                    0x90, 0xa0, 0xb0,
+                ],
+            )
+            .unwrap();
+            mem.write_privileged(
+                DATA + 16,
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            )
+            .unwrap();
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, 3), (15, 3)] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem_i = setup(&prog);
+        data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want, "trap");
+        assert_eq!(cpu, oracle, "state");
+        assert_eq!(jit.stats.interpreted.get("VArith"), None);
+    }
+
     /// A loop whose head is a `vsetivli`: the whole body translates as one block (the
     /// constant vset is emitted inline), and the engines must agree after every trip.
     #[test]

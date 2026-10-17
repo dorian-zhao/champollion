@@ -295,6 +295,9 @@ struct Tx {
     /// The block's internalized backward edge, if any: emitted at the very end, after
     /// the body it jumps back into (see [`Tx::emit_edge`]).
     edge: Option<Edge>,
+    /// The guest vector register currently held in `FA` after a translated `VArith`.
+    /// Consecutive operations on the same destination can skip its next `ldr q`.
+    vec_last: Option<u8>,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -456,6 +459,9 @@ impl Tx {
 
     /// Translate one non-control-flow instruction. Returns false if unsupported.
     fn simple(&mut self, inst: Inst, pc: u64) -> bool {
+        if !matches!(inst, Inst::VArith { mask: false, .. }) {
+            self.vec_last = None;
+        }
         match inst {
             Inst::Lui { rd, imm } => self.constant(rd, sext(imm)),
             Inst::Auipc { rd, imm } => self.constant(rd, pc.wrapping_add(sext(imm))),
@@ -1559,7 +1565,9 @@ impl Tx {
         // register's own elements - one byte-extract against a zero register.
         if let (VArithOp::SlideDown, VSel::I(imm)) = (op, src) {
             let elems = 16 / bytes;
-            self.v_ldr(FA, vs2);
+            if self.vec_last != Some(vs2) {
+                self.v_ldr(FA, vs2);
+            }
             if u32::from(imm) >= elems {
                 self.a.vec_movi_zero(FA);
             } else if imm > 0 {
@@ -1567,6 +1575,7 @@ impl Tx {
                 self.a.vec_ext(FA, FA, FB, u32::from(imm) * bytes);
             }
             self.v_str(FA, vd);
+            self.vec_last = Some(vd);
             return true;
         }
         let bits = bytes * 8;
@@ -1589,7 +1598,9 @@ impl Tx {
         if op == VArithOp::Mul && bits == 64 {
             return false; // NEON's MUL tops out at 4s
         }
-        self.v_ldr(FA, vs2);
+        if self.vec_last != Some(vs2) {
+            self.v_ldr(FA, vs2);
+        }
         match (op, src) {
             // Shifts want the immediate zero-extended and the scalar masked to
             // log2(SEW) bits, neither of which `vector_operand` does.
@@ -1639,6 +1650,7 @@ impl Tx {
             }
         }
         self.v_str(FA, vd);
+        self.vec_last = Some(vd);
         true
     }
 
@@ -2662,6 +2674,7 @@ pub fn translate(
         vec_regs,
         fboxed: 0,
         edge: None,
+        vec_last: None,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
