@@ -315,6 +315,9 @@ struct Tx {
     /// and accumulator back to back, so keeping both groups resident avoids reloading
     /// both sides from `CpuState`.
     vec_m2_b: Option<u8>,
+    /// Set while translating a unit m2 load whose CpuState store is provably dead
+    /// because the next vector instruction overwrites the same group.
+    defer_m2_store: bool,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -1509,7 +1512,9 @@ impl Tx {
                             self.a.ldp_q(first, second, ADDR);
                         }
                     }
-                    self.v_str2(first, second, vd);
+                    if !(self.defer_m2_store && (bytes == 4 || bytes == 8)) {
+                        self.v_str2(first, second, vd);
+                    }
                     return true;
                 }
                 for r in 0..regs {
@@ -2640,6 +2645,52 @@ fn is_integer_only(inst: Inst) -> bool {
     }
 }
 
+/// Whether an instruction is a pure integer ALU operation that cannot fault or use the
+/// vector scratch registers.
+fn is_pure_integer_alu(inst: Inst) -> bool {
+    match inst {
+        Inst::Op { op, .. } | Inst::OpImm { op, .. } => {
+            !matches!(op, AluOp::Cpop | AluOp::Brev8 | AluOp::OrcB)
+        }
+        Inst::Op32 { op, .. } => op != AluOp32::Cpop,
+        Inst::OpImm32 { .. } | Inst::Lui { .. } | Inst::Auipc { .. } => true,
+        _ => false,
+    }
+}
+
+/// Find unit m2 loads whose architectural store is dead because the next vector
+/// instruction is a macc that overwrites the same destination group. Only pure integer
+/// ALU instructions and constant formation may sit between them, so no fault or exit
+/// can observe the skipped store.
+fn plan_deferred_m2_stores(block: &[(Inst, u8)], pcs: &[u64], branch_targets: &[u64]) -> Vec<bool> {
+    let mut defer = vec![false; block.len()];
+    for i in 0..block.len() {
+        let Inst::VLoad { kind: VMemKind::Unit, vd, mask: false, nf: 0, .. } = block[i].0 else {
+            continue;
+        };
+        let mut j = i + 1;
+        while j < block.len() {
+            if branch_targets.contains(&pcs[j]) {
+                break;
+            }
+            if let Inst::VFMa { op: VFMaOp::Macc, vd: d, src: VSel::F(rs1), mask: false, .. } =
+                block[j].0
+            {
+                if d == vd && FHOST_REG[rs1 as usize].is_some() {
+                    defer[i] = true;
+                }
+                break;
+            }
+            if is_pure_integer_alu(block[j].0) {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    defer
+}
+
 /// Whether translating `inst` leaves `ADDR` alone, apart from [`Tx::mem_operand`], so the
 /// base-register cache survives it (unless it writes the base register, see [`int_dest`]).
 fn keeps_addr(inst: Inst) -> bool {
@@ -3056,6 +3107,7 @@ pub fn translate(
         vec_last: None,
         vec_m2: None,
         vec_m2_b: None,
+        defer_m2_store: false,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.
@@ -3128,6 +3180,7 @@ pub fn translate(
         })
         .collect();
     let (skip32, plans32) = plan_rotates32(block, &pcs, &branch_targets);
+    let defer_m2 = plan_deferred_m2_stores(block, &pcs, &branch_targets);
     let mut code_pos = vec![0usize; block.len()];
     let mut carry_clean = vec![false; block.len()];
     let mut fboxed_at = vec![0u32; block.len()];
@@ -3160,6 +3213,7 @@ pub fn translate(
             fboxed_at[i] = tx.fboxed;
         }
         tx.base_reused = reused[i];
+        tx.defer_m2_store = defer_m2[i];
         if skip32[i] {
             // The shift runs as part of the rotate at the waiting OR. Its result is
             // materialized there, so only bookkeeping happens here.
