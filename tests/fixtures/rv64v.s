@@ -1,6 +1,6 @@
 # The RVV subset (see crates/champollion-rv/src/decoder/vector.rs), one instruction
 # per line; see crates/champollion-rv/tests/decode.rs.
-.option arch, +v,+zvkb,+zvfhmin
+.option arch, +v,+zvbb,+zvkb,+zvfhmin
 vsetvli a0, a1, e8, m1, ta, ma
 vsetvli a0, a1, e32, mf2, ta, ma
 vsetvli a0, a1, e64, m1, ta, ma
@@ -111,6 +111,8 @@ vror.vv v1, v2, v3
 vror.vx v1, v2, a0
 vror.vi v1, v2, 7
 vror.vi v1, v2, 40
+vrol.vv v1, v2, v3
+vrol.vx v1, v2, a0
 vrev8.v v1, v2
 vbrev8.v v1, v2
 vandn.vx v1, v2, a0

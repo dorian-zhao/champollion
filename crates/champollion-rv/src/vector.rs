@@ -238,6 +238,11 @@ fn binop(op: VArithOp, a: u64, b: u64, sew_b: u64) -> u64 {
             let sh = b % bits;
             ((a >> sh) | (a << ((bits - sh) % bits))) & mask
         }
+        VArithOp::Rol => {
+            let bits = 8 * sew_b;
+            let sh = b % bits;
+            ((a << sh) | (a >> ((bits - sh) % bits))) & mask
+        }
         VArithOp::Mul => a.wrapping_mul(b) & mask,
         // The remaining variants are handled element-wise with their own control flow.
         _ => unreachable!("controlled ops are not binary"),
@@ -846,6 +851,12 @@ mod tests {
         assert_eq!(elems(&c, 1, 4, 1), [0xc0, 0xff, 0x04, 0x01]);
         exec_arith(&mut c, VArithOp::Ror, 1, 2, VSel::V(3), false);
         assert_eq!(elems(&c, 1, 4, 1), [0xc0, 0xff, 0x04, 0x01]);
+
+        let mut c = machine(0, 2); // e8
+        load(&mut c, 2, &[0x81, 0x12], 1);
+        load(&mut c, 3, &[1, 3], 1);
+        exec_arith(&mut c, VArithOp::Rol, 1, 2, VSel::V(3), false);
+        assert_eq!(elems(&c, 1, 2, 1), [0x03, 0x90]);
     }
 
     #[test]

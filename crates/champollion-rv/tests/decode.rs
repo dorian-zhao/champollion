@@ -832,6 +832,11 @@ fn rv64v() {
             "vror.vi v1, v2, 40",
             VArith { op: VArithOp::Ror, vd: 1, vs2: 2, src: I(40), mask: false },
         ),
+        ("vrol.vv v1, v2, v3", VArith { op: VArithOp::Rol, vd: 1, vs2: 2, src: V(3), mask: false }),
+        (
+            "vrol.vx v1, v2, a0",
+            VArith { op: VArithOp::Rol, vd: 1, vs2: 2, src: X(10), mask: false },
+        ),
         ("vrev8.v v1, v2", VUnary { op: VUnaryOp::Rev8, mask: false, vd: 1, vs2: 2 }),
         ("vbrev8.v v1, v2", VUnary { op: VUnaryOp::Brev8, mask: false, vd: 1, vs2: 2 }),
         (

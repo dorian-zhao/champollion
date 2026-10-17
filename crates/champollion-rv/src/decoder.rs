@@ -666,6 +666,8 @@ pub enum VArithOp {
     Sra,
     /// Zvbb `vror`: rotate right.
     Ror,
+    /// Zvbb `vrol`: rotate left.
+    Rol,
     Mul,
     SlideUp,
     SlideDown,
