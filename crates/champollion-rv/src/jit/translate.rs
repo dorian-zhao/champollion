@@ -1715,6 +1715,9 @@ impl Tx {
         if op == VArithOp::SlideUp {
             return self.vector_slide_up(vd, vs2, src);
         }
+        if op == VArithOp::Gather {
+            return self.vector_gather(vd, vs2, src);
+        }
         // vslidedown: elements move down by a constant, the top zero-filled. The guard
         // pins vl to VLMAX, where the spec's "source read bounded by VLMAX" is just the
         // register's own elements - one byte-extract against a zero register.
@@ -1907,6 +1910,34 @@ impl Tx {
         }
         self.v_str(FA, vd);
         self.vec_last = Some(vd);
+        self.vec_m2 = None;
+        self.vec_m2_b = None;
+        true
+    }
+
+    /// `vrgather.vi` / `vrgather.vv` at e8/m1: NEON `tbl` with a single 16-byte table
+    /// has exactly RVV's out-of-range-zero rule. Wider elements need a byte-index
+    /// expansion and stay on the interpreter for now.
+    fn vector_gather(&mut self, vd: u8, vs2: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if bytes != 1 {
+            return false;
+        }
+        if !matches!(src, VSel::I(_) | VSel::V(_)) {
+            return false;
+        }
+        self.v_ldr(FA, vs2);
+        match src {
+            VSel::I(imm) => {
+                self.a.mov_imm(SRC0, u64::from(imm));
+                self.a.vec_dup(FB, SRC0, 1);
+            }
+            VSel::V(vs1) => self.v_ldr(FB, vs1),
+            _ => unreachable!("checked above"),
+        }
+        self.a.vec_tbl(FC, FA, FB);
+        self.v_str(FC, vd);
+        self.vec_last = None;
         self.vec_m2 = None;
         self.vec_m2_b = None;
         true

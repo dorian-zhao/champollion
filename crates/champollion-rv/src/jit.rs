@@ -2106,6 +2106,90 @@ mod tests {
     }
 
     #[test]
+    fn vector_gather_e8_matches_the_interpreter() {
+        fn check(
+            prog: &[u32],
+            data: &dyn Fn(&GuestMemory),
+            init: &dyn Fn(&mut CpuState),
+        ) -> GuestMemory {
+            let mem_i = setup(prog);
+            data(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            init(&mut oracle);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(prog);
+            data(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            init(&mut cpu);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle);
+            assert_eq!(jit.stats.interpreted.get("VArith"), None);
+            mem_j
+        }
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle =
+            |wf3: u32, vd: u32, rs1: u32| (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |wf3: u32, vs3: u32, rs1: u32| {
+            (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let vv = |vd: u32, vs2: u32, vs1: u32| {
+            (0b001100 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vi = |vd: u32, vs2: u32, imm: u32| {
+            (0b001100 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (imm << 15)
+                | (0b011 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let table: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
+        let indices: [u8; 16] = [15, 0, 16, 3, 3, 0, 255, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let prog = [
+            vsetivli(0, 16, 0xc0),
+            vle(0b000, 1, 11),
+            vle(0b000, 2, 12),
+            vv(3, 1, 2),
+            vi(4, 1, 3),
+            vse(0b000, 3, 13),
+            addi(13, 13, 16),
+            vse(0b000, 4, 13),
+            ECALL,
+        ];
+        let data = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &table).unwrap();
+            mem.write_privileged(DATA + 16, &indices).unwrap();
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 32)] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem = check(&prog, &data, &init);
+        let mut row = [0u8; 16];
+        mem.read_privileged(DATA + 32, &mut row).unwrap();
+        for i in 0..16 {
+            let want =
+                if usize::from(indices[i]) < 16 { table[usize::from(indices[i])] } else { 0 };
+            assert_eq!(row[i], want, "vrgather.vv lane {i}");
+        }
+        mem.read_privileged(DATA + 48, &mut row).unwrap();
+        assert_eq!(row, [table[3]; 16], "vrgather.vi");
+    }
+
+    #[test]
     fn vector_arith_chain_reuses_the_previous_destination() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57

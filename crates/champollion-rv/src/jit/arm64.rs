@@ -1010,6 +1010,11 @@ impl Asm {
         assert!(imm < 16, "ext byte offset {imm}");
         self.emit(0x6e00_0000 | (rm as u32) << 16 | imm << 11 | (rn as u32) << 5 | rd as u32);
     }
+    /// `tbl vd.16b, {vn.16b}, vm.16b`: gather bytes from a 16-byte table; indices
+    /// outside the table produce zero.
+    pub fn vec_tbl(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x4e00_0000 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
     /// `ins vd.<T>[last], vn.<T>[0]`: the source's lane 0 into the top element.
     pub fn vec_ins_last(&mut self, rd: Reg, rn: Reg, bytes: u32) {
         assert!(matches!(bytes, 1 | 2 | 4 | 8), "element size {bytes}");
@@ -1193,6 +1198,13 @@ mod tests {
         a.vec_fmla_lane0(32, 16, 18, 15);
         a.vec_fmla_lane0(64, 16, 18, 15);
         assert_eq!(a.code, [0x4f8f_1250, 0x4fcf_1250]);
+    }
+
+    #[test]
+    fn tbl_matches_assembler() {
+        let mut a = Asm::new();
+        a.vec_tbl(18, 16, 17);
+        assert_eq!(a.code, [0x4e11_0212]);
     }
 
     /// The architecture's `DecodeBitMasks` for a 64-bit operation.
