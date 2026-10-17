@@ -1678,7 +1678,13 @@ impl Tx {
     /// bitwise ones are element-size independent and use the byte forms).
     fn vector_arith(&mut self, op: VArithOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
-        if mask || self.vec_regs != 1 {
+        if mask {
+            return false;
+        }
+        if op == VArithOp::Rol {
+            return self.vector_rol(vd, vs2, src);
+        }
+        if self.vec_regs != 1 {
             return false;
         }
         // vslidedown: elements move down by a constant, the top zero-filled. The guard
@@ -1772,6 +1778,54 @@ impl Tx {
         }
         self.v_str(FA, vd);
         self.vec_last = Some(vd);
+        true
+    }
+
+    /// Zvbb `vrol.vv` / `vrol.vx`: rotate left as a pair of signed shifts (NEON's
+    /// `ushl` shifts left for positive amounts and right for negative amounts) plus OR.
+    fn vector_rol(&mut self, vd: u8, vs2: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        let bits = bytes * 8;
+        let regs = self.vec_regs;
+        if !matches!(src, VSel::X(_) | VSel::V(_)) {
+            return false;
+        }
+        // NEON's `ushl` reads a signed byte per lane: a positive amount shifts left and
+        // a negative one shifts right. Rotate left by `k` as
+        // `(x << k) | (x >> (bits - k))`, with the amount reduced modulo the element
+        // width first. `k - bits` is the negated right amount; when `k` is zero the
+        // out-of-range shift produces zero, which is what the empty right half needs.
+        self.a.mov_imm(SRC0, u64::from(bits));
+        self.a.vec_dup(FR, SRC0, bytes);
+        for r in 0..regs {
+            let data = (vs2 + r as u8) & 31;
+            if self.vec_last != Some(data) {
+                self.v_ldr(FA, data);
+            }
+            match src {
+                VSel::X(rs1) => {
+                    let x = self.src(rs1, SRC0);
+                    self.a.mov_imm(SRC1, u64::from(bits - 1));
+                    self.a.and(SRC1, x, SRC1);
+                    self.a.vec_dup(FB, SRC1, bytes);
+                }
+                VSel::V(vs1) => {
+                    self.v_ldr(FB, (vs1 + r as u8) & 31);
+                    self.a.mov_imm(SRC0, u64::from(bits - 1));
+                    self.a.vec_dup(FC, SRC0, bytes);
+                    self.a.vec_and(FB, FB, FC);
+                }
+                _ => unreachable!("checked above"),
+            }
+            self.a.vec_orr(FC, FA, FA);
+            self.a.vec_ushl(bits, FA, FA, FB);
+            self.a.vec_sub(bits, FB, FB, FR);
+            self.a.vec_ushl(bits, FC, FC, FB);
+            self.a.vec_orr(FA, FA, FC);
+            self.v_str(FA, (vd + r as u8) & 31);
+        }
+        self.vec_last = if regs == 1 { Some(vd) } else { None };
+        self.vec_m2 = None;
         true
     }
 
