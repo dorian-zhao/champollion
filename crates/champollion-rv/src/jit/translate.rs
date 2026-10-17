@@ -1469,6 +1469,22 @@ impl Tx {
                     Access::Load
                 };
                 let operand = self.mem_operand(rs1, 0, 16);
+                if regs == 2 {
+                    match operand {
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, access));
+                            assert!(self.a.ldp_q_off(FA, FB, ADDR, 0));
+                        }
+                        None => {
+                            self.host_address();
+                            self.accesses.push((self.a.pos(), pc, self.retired, access));
+                            self.a.ldp_q(FA, FB, ADDR);
+                        }
+                    }
+                    self.v_str2(FA, FB, vd);
+                    self.vec_m2 = Some(vd);
+                    return true;
+                }
                 for r in 0..regs {
                     let dst = if regs == 2 && r == 1 { FB } else { FA };
                     match operand {
@@ -1501,6 +1517,22 @@ impl Tx {
             Inst::VLoad { kind: VMemKind::WholeRegister, vd, rs1, mask: false, nf, .. } => {
                 let n = u32::from(nf) + 1;
                 let operand = self.mem_operand(rs1, 0, 16);
+                if n == 2 {
+                    match operand {
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
+                            assert!(self.a.ldp_q_off(FA, FB, ADDR, 0));
+                        }
+                        None => {
+                            self.host_address();
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
+                            self.a.ldp_q(FA, FB, ADDR);
+                        }
+                    }
+                    self.v_str2(FA, FB, vd);
+                    self.vec_m2 = Some(vd);
+                    return true;
+                }
                 for k in 0..n {
                     let dst = if n == 2 && k == 1 { FB } else { FA };
                     match operand {
@@ -1532,6 +1564,24 @@ impl Tx {
             Inst::VStore { kind: VStoreKind::WholeRegister, vs3, rs1, mask: false, nf, .. } => {
                 let n = u32::from(nf) + 1;
                 let operand = self.mem_operand(rs1, 0, 16);
+                if n == 2 {
+                    if self.vec_m2 != Some(vs3) {
+                        self.v_ldr2(FA, FB, vs3);
+                    }
+                    match operand {
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                            assert!(self.a.stp_q_off(FA, FB, ADDR, 0));
+                        }
+                        None => {
+                            self.host_address();
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                            self.a.stp_q(FA, FB, ADDR);
+                        }
+                    }
+                    self.vec_m2 = Some(vs3);
+                    return true;
+                }
                 for k in 0..n {
                     let src = if n == 2 && k == 1 { FB } else { FA };
                     if !(n == 2 && self.vec_m2 == Some(vs3))
@@ -1562,6 +1612,24 @@ impl Tx {
             } if width.bytes() == u64::from(bytes) => {
                 let regs = self.vec_regs;
                 let operand = self.mem_operand(rs1, 0, 16);
+                if regs == 2 {
+                    if self.vec_m2 != Some(vs3) {
+                        self.v_ldr2(FA, FB, vs3);
+                    }
+                    match operand {
+                        Some(_) => {
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                            assert!(self.a.stp_q_off(FA, FB, ADDR, 0));
+                        }
+                        None => {
+                            self.host_address();
+                            self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
+                            self.a.stp_q(FA, FB, ADDR);
+                        }
+                    }
+                    self.vec_m2 = Some(vs3);
+                    return true;
+                }
                 for r in 0..regs {
                     let src = if regs == 2 && r == 1 { FB } else { FA };
                     if !(regs == 2 && self.vec_m2 == Some(vs3))

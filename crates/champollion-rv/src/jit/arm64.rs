@@ -957,6 +957,14 @@ impl Asm {
         );
         true
     }
+    /// `ldp q, q, [xn]`.
+    pub fn ldp_q(&mut self, rt: Reg, rt2: Reg, rn: Reg) {
+        assert!(self.ldp_q_off(rt, rt2, rn, 0));
+    }
+    /// `stp q, q, [xn]`.
+    pub fn stp_q(&mut self, rt: Reg, rt2: Reg, rn: Reg) {
+        assert!(self.stp_q_off(rt, rt2, rn, 0));
+    }
 
     /// The size field of the lane-wise integer ops: the element size in bits.
     const fn vec_size(size: u32) -> u32 {
