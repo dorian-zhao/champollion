@@ -110,7 +110,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(127);
             }
         };
-        let Some((interp, arg)) = shebang(&file) else { break };
+        let Some((interp, arg)) = shebang(file) else { break };
         depth += 1;
         if depth > 4 {
             eprintln!("rvrun: {}: too many levels of #! interpreters", path.display());
@@ -145,7 +145,7 @@ fn main() -> ExitCode {
 
     let image = std::fs::File::open(&path).ok();
     let (proc, mut main_thread) = match Process::spawn(
-        &file,
+        file,
         &argv,
         &envp,
         path.as_bytes(),
