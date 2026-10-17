@@ -381,6 +381,7 @@ impl Process {
         execfn: &[u8],
         host: Arc<dyn HostOs>,
         sysroot: Option<std::path::PathBuf>,
+        image: Option<std::os::unix::io::RawFd>,
     ) -> Result<(Arc<Self>, Thread), SpawnError> {
         // `RVRUN_TRACE_STARTUP=1`: which phase of building the process costs what.
         let trace = std::env::var_os("RVRUN_TRACE_STARTUP").is_some();
@@ -407,7 +408,16 @@ impl Process {
             None => GuestMemory::new().map_err(SpawnError::Reserve)?,
         };
         mark!("memory reserved");
-        let brk = loader::map_elf(&mem, &elf).map_err(SpawnError::Map)?;
+        // A non-PIE image can page in straight from the file (copy-on-write) instead of
+        // being copied into the reservation; anything the file mapping refuses falls
+        // back to the copying loader.
+        let brk = match image {
+            Some(fd) if !elf.pie => {
+                loader::map_elf_file(&mem, &elf, fd).or_else(|_| loader::map_elf(&mem, &elf))
+            }
+            _ => loader::map_elf(&mem, &elf),
+        }
+        .map_err(SpawnError::Map)?;
         mark!("elf mapped");
         mem.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::RW).map_err(SpawnError::Map)?;
         mem.map(SIGRETURN_TRAMPOLINE, GUEST_PAGE_SIZE, Prot::READ | Prot::EXEC)
@@ -1267,7 +1277,8 @@ mod tests {
     fn spawn() -> (Arc<Process>, Thread, Arc<FakeHost>) {
         let host = Arc::new(FakeHost::default());
         let (p, t) =
-            Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", host.clone(), None).unwrap();
+            Process::spawn(HELLO, &[b"hello".to_vec()], &[], b"hello", host.clone(), None, None)
+                .unwrap();
         (p, t, host)
     }
 

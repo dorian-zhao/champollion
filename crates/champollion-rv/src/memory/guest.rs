@@ -665,6 +665,55 @@ impl GuestMemory {
         self.changed(code);
     }
 
+    /// Map `len` bytes of a file privately (copy-on-write) at the host-page-aligned guest
+    /// `addr`, replacing what is there: an executable's segments, whose pages then page
+    /// in lazily instead of being copied. `offset` is host-page aligned.
+    pub fn map_file(
+        &self,
+        addr: u64,
+        len: u64,
+        prot: Prot,
+        file: (i32, u64),
+    ) -> Result<(), MapError> {
+        let hp = self.host_page;
+        let len = len.checked_next_multiple_of(hp).filter(|&l| l != 0).ok_or(MapError::Invalid)?;
+        let (fd, offset) = file;
+        if !addr.is_multiple_of(hp) || !offset.is_multiple_of(hp) {
+            return Err(MapError::Invalid);
+        }
+        let mut maps = self.maps_mut();
+        let r = self.check_range(addr, len)?;
+        self.unmap_locked(&mut maps, r.clone());
+        let host_prot = if prot.contains(Prot::WRITE) {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+        // SAFETY: replaces whole host pages of our own reservation, which no other
+        // mapping uses (they are free, or were just unmapped).
+        let rc = unsafe {
+            libc::mmap(
+                self.host(addr).cast(),
+                len as usize,
+                host_prot,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                fd,
+                offset as libc::off_t,
+            )
+        };
+        if rc == libc::MAP_FAILED {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            self.release(&maps, r, false);
+            return Err(MapError::Host(match e {
+                libc::EACCES => 13,
+                libc::ENODEV => 19,
+                _ => 12,
+            }));
+        }
+        self.insert_locked(&mut maps, r, prot);
+        Ok(())
+    }
+
     /// Map host memory shared across processes at a host-page-aligned guest range: a file
     /// (`Some((fd, offset))`, offset host-page aligned) or anonymous memory that a fork
     /// shares. At `addr`, replacing what is there, or anywhere below `limit`. The range is

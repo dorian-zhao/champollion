@@ -1,8 +1,8 @@
 #!/bin/sh
 # The daily-use benchmark gate: everyday shapes - process startup, a script loop, SQL -
-# built natively and for riscv64, timed side by side. Prints our speed as a percentage
-# of native next to the Rosetta 2 band (70-80% of native), and fails when a case
-# regresses past the committed baseline. Timings are the minimum of each run set:
+# built natively, for riscv64, and (when Rosetta 2 is installed) for x86_64, timed side
+# by side, which is what "Rosetta 2 class" actually means on this machine. Fails when a
+# case regresses past the committed baseline. Timings are the minimum of each run set:
 # the startup shapes are noisy, and the floor is what a regression would move.
 #
 #   tools/daily.sh                    # run and compare against tools/daily.baseline
@@ -49,6 +49,22 @@ if [ ! -x "$out/hello-native" ]; then
     cc -O2 "$out/hello.c" -o "$out/hello-native"
 fi
 
+# Rosetta 2 is the yardstick: the same sources for x86_64, when it is installed.
+rosetta=0
+if [ -f /Library/Apple/usr/libexec/oah/libRosettaRuntime ]; then
+    rosetta=1
+    if [ ! -x "$out/lua-x86" ]; then
+        cc -O2 -arch x86_64 -DLUA_USE_POSIX "$lua_src" -o "$out/lua-x86" -lm
+    fi
+    if [ ! -x "$out/sqlite3-x86" ]; then
+        cc -O2 -arch x86_64 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION \
+            "$cache/$sqlite/shell.c" "$cache/$sqlite/sqlite3.c" -o "$out/sqlite3-x86"
+    fi
+    if [ ! -x "$out/hello-x86" ]; then
+        cc -O2 -arch x86_64 "$out/hello.c" -o "$out/hello-x86"
+    fi
+fi
+
 # Snippet files keep every timing command free of shell quoting (hyperfine -N).
 printf 'local s=0\nfor i = 1, 3000000 do s = s + i * i * 0.5 end\nprint(s)\n' \
     > "$out/lua-compute.lua"
@@ -57,20 +73,30 @@ cp "$root/tests/programs/basics.sql" "$out/basics.sql"
 printf 'WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 1000000)\nSELECT count(*), sum(x) FROM c;\n' \
     > "$out/sqlite-cte.sql"
 
-# name, ours, native; the short-lived cases need more runs to settle.
+# runs, name, ours, native, [x86_64]; the short-lived cases need more runs to settle.
 bench() {
-    hyperfine -N --warmup 3 --runs "$1" --export-json "$out/$2.json" "$3" "$4" >/dev/null
+    runs=$1
+    name=$2
+    json="$out/$name.json"
+    if [ "$rosetta" = 1 ] && [ -n "${5:-}" ]; then
+        hyperfine -N --warmup 3 --runs "$runs" --export-json "$json" "$3" "$4" "$5" >/dev/null
+    else
+        hyperfine -N --warmup 3 --runs "$runs" --export-json "$json" "$3" "$4" >/dev/null
+    fi
 }
 
-bench "${DAILY_RUNS:-15}" hello "$rvrun $root/tests/fixtures/hello" "$out/hello-native"
+bench "${DAILY_RUNS:-15}" hello "$rvrun $root/tests/fixtures/hello" "$out/hello-native" \
+    "$out/hello-x86"
 bench "${DAILY_RUNS:-15}" lua-start "$rvrun $root/tests/fixtures/programs/lua $out/lua-start.lua" \
-    "$out/lua-native $out/lua-start.lua"
+    "$out/lua-native $out/lua-start.lua" "$out/lua-x86 $out/lua-start.lua"
 bench "${DAILY_HEAVY_RUNS:-7}" lua-compute "$rvrun $root/tests/fixtures/programs/lua $out/lua-compute.lua" \
-    "$out/lua-native $out/lua-compute.lua"
+    "$out/lua-native $out/lua-compute.lua" "$out/lua-x86 $out/lua-compute.lua"
 bench "${DAILY_HEAVY_RUNS:-7}" sqlite-script "$rvrun $root/tests/fixtures/programs/sqlite3 -init $out/basics.sql :memory:" \
-    "$out/sqlite3-native -init $out/basics.sql :memory:"
+    "$out/sqlite3-native -init $out/basics.sql :memory:" \
+    "$out/sqlite3-x86 -init $out/basics.sql :memory:"
 bench "${DAILY_HEAVY_RUNS:-7}" sqlite-cte "$rvrun $root/tests/fixtures/programs/sqlite3 -init $out/sqlite-cte.sql :memory:" \
-    "$out/sqlite3-native -init $out/sqlite-cte.sql :memory:"
+    "$out/sqlite3-native -init $out/sqlite-cte.sql :memory:" \
+    "$out/sqlite3-x86 -init $out/sqlite-cte.sql :memory:"
 
 python3 - "$root" "$out" "$update" <<'PY'
 import json
@@ -92,16 +118,32 @@ for name in cases:
     data = json.loads(pathlib.Path(f"{out}/{name}.json").read_text())
     ours = wall(data["results"][0]) * 1e3
     native = wall(data["results"][1]) * 1e3
-    rows.append((name, ours, native, ours / native))
+    ros = wall(data["results"][2]) * 1e3 if len(data["results"]) > 2 else None
+    rows.append((name, ours, native, ros))
 
-print(f"\n{'case':<15}{'ours':>10}{'native':>10}{'slowdown':>11}{'of native':>12}  rosetta")
-for name, ours, native, ratio in rows:
-    band = "yes" if ratio <= 1.43 else ""
-    print(f"{name:<15}{ours:>8.2f}ms{native:>8.2f}ms{ratio:>10.2f}x{100 / ratio:>10.0f}%   {band}")
+if any(ros is not None for _, _, _, ros in rows):
+    print(
+        f"\n{'case':<15}{'ours':>10}{'native':>10}{'rosetta':>10}"
+        f"{'ours/native':>13}{'ours/ros':>10}{'ros/native':>12}"
+    )
+    for name, ours, native, ros in rows:
+        ours_vs = f"{ours / native:>12.2f}x"
+        if ros is None:
+            print(f"{name:<15}{ours:>8.2f}ms{native:>8.2f}ms{'':>10}{ours_vs}")
+        else:
+            print(
+                f"{name:<15}{ours:>8.2f}ms{native:>8.2f}ms{ros:>8.2f}ms"
+                f"{ours_vs}{ours / ros:>9.2f}x{ros / native:>11.2f}x"
+            )
+else:
+    print(f"\n{'case':<15}{'ours':>10}{'native':>10}{'slowdown':>11}{'of native':>12}")
+    for name, ours, native, _ in rows:
+        print(f"{name:<15}{ours:>8.2f}ms{native:>8.2f}ms{ours / native:>10.2f}x"
+              f"{100 * native / ours:>10.0f}%")
 
 baseline = pathlib.Path(f"{root}/tools/daily.baseline")
 if update:
-    baseline.write_text("".join(f"{name} {ratio:.3f}\n" for name, _, _, ratio in rows))
+    baseline.write_text("".join(f"{name} {ours / native:.3f}\n" for name, ours, native, _ in rows))
     print(f"\nbaseline written to {baseline}")
     sys.exit(0)
 if not baseline.exists():
@@ -113,9 +155,9 @@ for line in baseline.read_text().splitlines():
     name, ratio = line.split()
     known[name] = float(ratio)
 regressed = [
-    f"{name}: {ratio:.2f}x (baseline {known[name]:.2f}x)"
-    for name, _, _, ratio in rows
-    if name in known and ratio > known[name] * 1.10
+    f"{name}: {ours / native:.2f}x (baseline {known[name]:.2f}x)"
+    for name, ours, native, _ in rows
+    if name in known and ours / native > known[name] * 1.10
 ]
 if regressed:
     print("\nREGRESSED past the baseline (tolerance 10%):")

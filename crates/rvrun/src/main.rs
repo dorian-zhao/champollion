@@ -142,6 +142,7 @@ fn main() -> ExitCode {
         .map(|(k, v)| [k.as_bytes(), b"=", v.as_bytes()].concat())
         .collect();
 
+    let image = std::fs::File::open(&path).ok();
     let (proc, mut main_thread) = match Process::spawn(
         &file,
         &argv,
@@ -149,6 +150,7 @@ fn main() -> ExitCode {
         path.as_bytes(),
         Arc::new(champollion_rv::host::Native::default()),
         sysroot.clone(),
+        image.as_ref().map(std::os::unix::io::AsRawFd::as_raw_fd),
     ) {
         Ok(p) => p,
         Err(champollion_rv::process::SpawnError::Interp(interp, e)) => {
@@ -185,7 +187,7 @@ fn main() -> ExitCode {
     let strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
     proc.log.strace.store(strace, std::sync::atomic::Ordering::Relaxed);
     trace.mark("signals");
-    let cache = CodeCache::new(&file);
+    let cache = CodeCache::new(std::path::Path::new(&path));
     trace.mark("cache");
     if std::env::var_os("RVRUN_JIT").is_none_or(|v| v != "0") {
         match champollion_rv::jit::Jit::new() {
@@ -322,7 +324,7 @@ fn default_cache_dir() -> Option<std::path::PathBuf> {
 }
 
 impl CodeCache {
-    fn new(file: &[u8]) -> Option<Self> {
+    fn new(path: &std::path::Path) -> Option<Self> {
         use std::hash::{Hash, Hasher};
         if std::env::var_os("RVRUN_CACHE").is_some_and(|v| v == "0") {
             return None;
@@ -332,9 +334,34 @@ impl CodeCache {
             None => default_cache_dir()?,
         };
         // SipHash with fixed keys: stable for a given build of rvrun, which is all a key
-        // must be (the build is part of it).
+        // must be (the build is part of it). The guest file enters through its identity -
+        // length, timestamps, device and inode, plus the first and last 64 KiB - instead
+        // of its full contents: hashing a 2 MiB static binary took about 0.6 ms on every
+        // exec, and any rewrite of the file moves one of these.
         let mut h = std::hash::DefaultHasher::new();
-        file.hash(&mut h);
+        let meta = std::fs::metadata(path).ok()?;
+        meta.len().hash(&mut h);
+        meta.modified().ok()?.hash(&mut h);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.dev().hash(&mut h);
+            meta.ino().hash(&mut h);
+        }
+        if let Ok(mut f) = std::fs::File::open(path) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut head = [0u8; 1 << 16];
+            let mut tail = [0u8; 1 << 16];
+            if let Ok(n) = f.read(&mut head) {
+                head[..n].hash(&mut h);
+            }
+            if meta.len() > (1 << 17)
+                && f.seek(SeekFrom::End(-(1 << 16))).is_ok()
+                && let Ok(n) = f.read(&mut tail)
+            {
+                tail[..n].hash(&mut h);
+            }
+        }
         env!("CARGO_PKG_VERSION").hash(&mut h);
         let exe = std::env::current_exe().and_then(std::fs::metadata).ok()?;
         exe.len().hash(&mut h);

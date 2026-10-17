@@ -37,6 +37,8 @@ pub enum LoadError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment<'a> {
     pub vaddr: u64,
+    /// File offset of the segment's contents (`p_offset`).
+    pub offset: u64,
     /// Size in memory; bytes past `data.len()` are zero-filled (`.bss`).
     pub mem_size: u64,
     /// File-backed contents (`p_filesz` bytes).
@@ -164,9 +166,73 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
         if phdr.is_none() && offset <= table.start && table.end <= end {
             phdr = Some(vaddr + (table.start - offset));
         }
-        segments.push(Segment { vaddr, mem_size, data, flags: seg_flags });
+        segments.push(Segment { vaddr, offset, mem_size, data, flags: seg_flags });
     }
     Ok(Elf { entry, flags, segments, phdr, phnum: phnum as u16, pie, interp })
+}
+
+/// Map the loadable segments file-backed (copy-on-write) from `file`, an open descriptor
+/// of the same bytes: pages then page in lazily instead of being copied into the
+/// reservation, which for a 2 MiB static binary saved most of the load. Only for images
+/// that never rewrite themselves - a PIE relocates its pages at load time and takes the
+/// copying path. Fails (before mapping anything when the shape is unusual) for the
+/// caller to fall back to [`map_elf`].
+pub fn map_elf_file(mem: &GuestMemory, elf: &Elf, file: i32) -> Result<u64, MapError> {
+    if elf.pie {
+        return Err(MapError::Invalid);
+    }
+    // The same page table as `map_elf`, after checking the file offsets are
+    // page-congruent with the addresses (as loadable segments must be).
+    let mut pages: BTreeMap<u64, Prot> = BTreeMap::new();
+    for seg in &elf.segments {
+        if seg.vaddr - page_down(seg.vaddr) != seg.offset - page_down(seg.offset) {
+            return Err(MapError::Invalid);
+        }
+        let prot = segment_prot(seg.flags);
+        let mut page = page_down(seg.vaddr);
+        while page < seg.vaddr + seg.mem_size {
+            *pages.entry(page).or_default() = pages.get(&page).copied().unwrap_or_default() | prot;
+            page += GUEST_PAGE_SIZE;
+        }
+    }
+    let mut runs: Vec<(u64, u64, Prot)> = Vec::new();
+    for (&page, &prot) in &pages {
+        match runs.last_mut() {
+            Some((start, end, run_prot)) if *end == page && *run_prot == prot => {
+                *end = page + GUEST_PAGE_SIZE;
+            }
+            _ => runs.push((page, page + GUEST_PAGE_SIZE, prot)),
+        }
+    }
+    // File-backed pages first (read-only; the runs' protections go on last), then each
+    // segment's zero-filled tail (`.bss`) anonymously. A trailing partial page that runs
+    // past the file is zero-filled by the kernel, so only whole tail pages are mapped.
+    for seg in &elf.segments {
+        let file_end = seg.vaddr + seg.data.len() as u64;
+        let mapped = file_end > seg.vaddr;
+        if mapped {
+            let start = page_down(seg.vaddr);
+            let len = page_up(file_end) - start;
+            // Temporarily writable: the bytes between the segment's end and its last
+            // page's boundary are whatever follows it in the file, not `.bss` zeros.
+            mem.map_file(start, len, Prot::READ | Prot::WRITE, (file, page_down(seg.offset)))?;
+            let tail = page_up(file_end) - file_end;
+            if tail > 0 {
+                let zeros = vec![0u8; tail as usize];
+                mem.write_privileged(file_end, &zeros).map_err(|_| MapError::Invalid)?;
+            }
+        }
+        let bss_start = if mapped { page_up(file_end) } else { page_down(seg.vaddr) };
+        let bss_end = page_up(seg.vaddr + seg.mem_size);
+        if bss_end > bss_start {
+            mem.map(bss_start, bss_end - bss_start, Prot::RW)?;
+        }
+    }
+    for &(start, end, prot) in &runs {
+        mem.protect(start, end - start, prot)?;
+    }
+    let end = elf.segments.iter().map(|s| s.vaddr + s.mem_size).max().unwrap_or(0);
+    Ok(page_up(end))
 }
 
 /// Copy every loadable segment into a single [`FlatMemory`] spanning them all, plus
@@ -217,14 +283,26 @@ pub fn map_elf(mem: &GuestMemory, elf: &Elf) -> Result<u64, MapError> {
             page += GUEST_PAGE_SIZE;
         }
     }
-    for &page in pages.keys() {
-        mem.map(page, GUEST_PAGE_SIZE, Prot::RW)?;
+    // Coalesce runs of equal-protection pages: mapping and protecting a page at a time
+    // meant about a thousand calls for a 2 MiB static binary, a millisecond of every
+    // exec.
+    let mut runs: Vec<(u64, u64, Prot)> = Vec::new();
+    for (&page, &prot) in &pages {
+        match runs.last_mut() {
+            Some((start, end, run_prot)) if *end == page && *run_prot == prot => {
+                *end = page + GUEST_PAGE_SIZE;
+            }
+            _ => runs.push((page, page + GUEST_PAGE_SIZE, prot)),
+        }
+    }
+    for &(start, end, _) in &runs {
+        mem.map(start, end - start, Prot::RW)?;
     }
     for seg in &elf.segments {
         mem.write_privileged(seg.vaddr, seg.data).map_err(|_| MapError::Invalid)?;
     }
-    for (&page, &prot) in &pages {
-        mem.protect(page, GUEST_PAGE_SIZE, prot)?;
+    for &(start, end, prot) in &runs {
+        mem.protect(start, end - start, prot)?;
     }
     let end = elf.segments.iter().map(|s| s.vaddr + s.mem_size).max().unwrap_or(0);
     Ok(page_up(end))
