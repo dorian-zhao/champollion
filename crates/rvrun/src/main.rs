@@ -95,12 +95,13 @@ fn main() -> ExitCode {
     let mut depth = 0;
     let mut opened = binfmt_fd();
     loop {
+        // Parse from a read-only mapping: the guest image is often megabytes, and
+        // reading it into a `Vec` on every exec showed up in the spawn trace.
         let read = match opened.take() {
-            Some(mut f) => {
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut f, &mut bytes).map(|_| bytes)
-            }
-            None => std::fs::read(&path),
+            Some(f) => map_read_only(&f),
+            None => std::fs::File::open(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|f| map_read_only(&f)),
         };
         file = match read {
             Ok(f) => f,
@@ -272,6 +273,33 @@ struct CodeCache {
 
 /// The program binfmt_misc opened for us (with the `O` flag, implied by `C`), which it
 /// passes as `AT_EXECFD`. Taken (and closed after reading), so the guest never sees it.
+/// A read-only mapping of `file`, for the rest of the run: parsing the guest image out
+/// of it faults in only the pages it reads, where reading a megabyte-large binary into a
+/// `Vec` on every exec cost a few hundred microseconds in the spawn trace. The mapping
+/// is the CLI's own image and deliberately never unmapped.
+fn map_read_only(file: &std::fs::File) -> Result<&'static [u8], String> {
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    if len == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: a fresh read-only private mapping of a file we own.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len as usize,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            std::os::fd::AsRawFd::as_raw_fd(file),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: `len` valid read-only bytes that live for the rest of the process.
+    Ok(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize) })
+}
+
 #[cfg(target_os = "linux")]
 fn binfmt_fd() -> Option<std::fs::File> {
     use std::os::fd::FromRawFd;

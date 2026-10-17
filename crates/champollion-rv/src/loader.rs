@@ -178,6 +178,16 @@ pub fn parse(file: &[u8]) -> Result<Elf<'_>, LoadError> {
 /// copying path. Fails (before mapping anything when the shape is unusual) for the
 /// caller to fall back to [`map_elf`].
 pub fn map_elf_file(mem: &GuestMemory, elf: &Elf, file: i32) -> Result<u64, MapError> {
+    let trace = std::env::var_os("RVRUN_TRACE_STARTUP").is_some();
+    let t0 = std::time::Instant::now();
+    macro_rules! mark {
+        ($what:expr) => {
+            if trace {
+                let us = t0.elapsed().as_secs_f64() * 1e6;
+                eprintln!("[map_elf_file] {us:>7.0}us {}", $what);
+            }
+        };
+    }
     if elf.pie {
         return Err(MapError::Invalid);
     }
@@ -195,6 +205,7 @@ pub fn map_elf_file(mem: &GuestMemory, elf: &Elf, file: i32) -> Result<u64, MapE
             page += GUEST_PAGE_SIZE;
         }
     }
+    mark!("page map built");
     let mut runs: Vec<(u64, u64, Prot)> = Vec::new();
     for (&page, &prot) in &pages {
         match runs.last_mut() {
@@ -228,9 +239,11 @@ pub fn map_elf_file(mem: &GuestMemory, elf: &Elf, file: i32) -> Result<u64, MapE
             mem.map(bss_start, bss_end - bss_start, Prot::RW)?;
         }
     }
+    mark!("segments mapped");
     for &(start, end, prot) in &runs {
         mem.protect(start, end - start, prot)?;
     }
+    mark!("protections set");
     let end = elf.segments.iter().map(|s| s.vaddr + s.mem_size).max().unwrap_or(0);
     Ok(page_up(end))
 }
