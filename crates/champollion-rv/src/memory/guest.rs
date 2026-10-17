@@ -915,14 +915,23 @@ impl GuestMemory {
 
     /// Read a NUL-terminated string of at most `max` bytes (excluding the NUL).
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<std::ffi::CString, MemFault> {
+        const CHUNK: usize = 256;
         let mut out = Vec::new();
-        for i in 0..=max as u64 {
-            let mut b = [0u8];
-            self.load(addr + i, &mut b, Prot::READ)?;
-            if b[0] == 0 {
+        let mut at = addr;
+        let mut buf = [0u8; CHUNK];
+        while out.len() <= max {
+            // Stay within one guest page: the next page may be unmapped even when this
+            // string is not, and taking the mapping lock once per byte is far too much
+            // for the path-heavy syscalls (openat, stat, access, ...).
+            let page_left = GUEST_PAGE_SIZE - (at & (GUEST_PAGE_SIZE - 1));
+            let chunk = (max + 1 - out.len()).min(page_left as usize).min(CHUNK);
+            self.load(at, &mut buf[..chunk], Prot::READ)?;
+            if let Some(nul) = buf[..chunk].iter().position(|&b| b == 0) {
+                out.extend_from_slice(&buf[..nul]);
                 return Ok(std::ffi::CString::new(out).unwrap());
             }
-            out.push(b[0]);
+            out.extend_from_slice(&buf[..chunk]);
+            at += chunk as u64;
         }
         Err(MemFault { addr })
     }
