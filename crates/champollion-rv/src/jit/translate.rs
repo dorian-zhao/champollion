@@ -1712,6 +1712,9 @@ impl Tx {
         if self.vec_regs != 1 {
             return false;
         }
+        if op == VArithOp::SlideUp {
+            return self.vector_slide_up(vd, vs2, src);
+        }
         // vslidedown: elements move down by a constant, the top zero-filled. The guard
         // pins vl to VLMAX, where the spec's "source read bounded by VLMAX" is just the
         // register's own elements - one byte-extract against a zero register.
@@ -1871,6 +1874,41 @@ impl Tx {
         }
         self.vec_last = if regs == 1 { Some(vd) } else { None };
         self.vec_m2 = None;
+        true
+    }
+
+    /// `vslideup.vi`: shift the source toward higher indices and keep the low
+    /// `offset * SEW` bytes of the old destination.
+    fn vector_slide_up(&mut self, vd: u8, vs2: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        let VSel::I(imm) = src else { return false };
+        let elems = 16 / bytes;
+        let offset = u32::from(imm);
+        if offset >= elems {
+            return true;
+        }
+        let shift = offset * bytes;
+        self.v_ldr(FA, vd);
+        self.v_ldr(FB, vs2);
+        if shift == 0 {
+            self.a.vec_orr(FA, FB, FB);
+        } else {
+            let low = if shift >= 8 { u64::MAX } else { (1u64 << (8 * shift)) - 1 };
+            let high = if shift <= 8 { 0 } else { (1u64 << (8 * (shift - 8))) - 1 };
+            self.a.mov_imm(SRC0, low);
+            self.a.vec_dup(FC, SRC0, 8);
+            self.a.mov_imm(SRC1, high);
+            self.a.vec_dup(FR, SRC1, 8);
+            self.a.vec_ext(FC, FC, FR, 8); // low half of FC, high half of FR
+            self.a.vec_movi_zero(FR);
+            self.a.vec_ext(FB, FR, FB, 16 - shift);
+            self.a.vec_bit(FB, FA, FC);
+            self.a.vec_orr(FA, FB, FB);
+        }
+        self.v_str(FA, vd);
+        self.vec_last = Some(vd);
+        self.vec_m2 = None;
+        self.vec_m2_b = None;
         true
     }
 

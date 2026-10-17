@@ -2310,6 +2310,15 @@ mod tests {
                 | (vd << 7)
                 | 0x57
         };
+        let vslideup_vi = |vd: u32, vs2: u32, imm: u32| {
+            (0b001110 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (imm << 15)
+                | (0b011 << 12)
+                | (vd << 7)
+                | 0x57
+        };
         let vfslide1down_vf = |vd: u32, vs2: u32, rs1: u32| {
             (0b001111 << 26)
                 | (1 << 25)
@@ -2339,6 +2348,17 @@ mod tests {
             vse32(16, 12),
             addi(12, 11, 96),
             vse32(17, 12),
+            addi(12, 11, 160),
+            vle32(19, 12),
+            vslideup_vi(18, 8, 2),
+            vslideup_vi(19, 19, 1),
+            vslideup_vi(20, 8, 3),
+            addi(12, 11, 112),
+            vse32(18, 12),
+            addi(12, 11, 128),
+            vse32(19, 12),
+            addi(12, 11, 144),
+            vse32(20, 12),
             ECALL,
         ];
         let setup_data = |mem: &GuestMemory| {
@@ -2347,6 +2367,10 @@ mod tests {
             }
             mem.write_privileged(DATA + 16, &2.5f32.to_bits().to_le_bytes()).unwrap();
             mem.write_privileged(DATA + 24, &1.0f64.to_bits().to_le_bytes()).unwrap();
+            for (i, v) in [10.0f32, 20.0, 30.0, 40.0].iter().enumerate() {
+                mem.write_privileged(DATA + 160 + 4 * i as u64, &v.to_bits().to_le_bytes())
+                    .unwrap();
+            }
         };
         let mem_i = setup(&prog);
         setup_data(&mem_i);
@@ -2361,15 +2385,30 @@ mod tests {
         setup_data(&mem_j);
         let mut cpu = CpuState::new(CODE);
         cpu.set_x(11, DATA);
-        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
         assert_eq!(got, want);
+        assert_eq!(cpu.v, oracle.v, "vector register file");
         assert_eq!(cpu, oracle, "whole state");
+        assert_eq!(jit.stats.interpreted.get("VArith"), None);
         let elem = |reg: usize, lane: usize| {
             u32::from_le_bytes(cpu.v[reg][4 * lane..4 * lane + 4].try_into().unwrap())
         };
         assert_eq!(elem(8, 0), 2.0f32.to_bits()); // the aliased slide's low element
         assert_eq!(elem(16, 3), 2.5f32.to_bits()); // the inserted scalar
         assert_eq!(elem(17, 3), 0x7fc0_0000); // canonical NaN: the double is not boxed
+        assert_eq!(
+            (elem(18, 0), elem(18, 1), elem(18, 2), elem(18, 3)),
+            (0, 0, 2.0f32.to_bits(), 3.0f32.to_bits())
+        );
+        assert_eq!(
+            (elem(19, 0), elem(19, 1), elem(19, 2), elem(19, 3)),
+            (10.0f32.to_bits(), 10.0f32.to_bits(), 20.0f32.to_bits(), 30.0f32.to_bits())
+        );
+        assert_eq!(
+            (elem(20, 0), elem(20, 1), elem(20, 2), elem(20, 3)),
+            (0, 0, 0, 2.0f32.to_bits())
+        );
     }
 
     /// The glibc scanner shape: `vle8ff.v`, `vmsne.vi`, `vmor.mm`, `vfirst.m`, and

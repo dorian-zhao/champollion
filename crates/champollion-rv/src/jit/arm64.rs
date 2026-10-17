@@ -1004,8 +1004,8 @@ impl Asm {
     pub fn vec_movi_zero(&mut self, rd: Reg) {
         self.emit(0x4f00_0400 | rd as u32);
     }
-    /// `ext vd.16b, vn.16b, vm.16b, #imm`: the 32-byte concatenation `vn:vm` shifted
-    /// right by `imm` bytes (0..=15), taking its low 16.
+    /// `ext vd.16b, vn.16b, vm.16b, #imm`: `vn[imm..16]` followed by `vm[0..imm]`
+    /// (0..=15).
     pub fn vec_ext(&mut self, rd: Reg, rn: Reg, rm: Reg, imm: u32) {
         assert!(imm < 16, "ext byte offset {imm}");
         self.emit(0x6e00_0000 | (rm as u32) << 16 | imm << 11 | (rn as u32) << 5 | rd as u32);
