@@ -1,6 +1,7 @@
 # Champollion
 
-Run RISC-V (RV64GC) Linux programs on arm64: Apple silicon Macs, and arm64 Linux hosts.
+Run RISC-V (RV64GC, plus the RVA23 userland extensions) Linux programs on arm64: Apple
+silicon Macs, and arm64 Linux hosts.
 
 Champollion is a user-mode binary translator from riscv64 Linux to arm64. It started as a learning project, which aims at what Rosetta 2 does for x86 programs: no emulated machine, no guest kernel, just the program translated to native code and running at close to native speed. A guest runs in one of two modes, sharing one translator:
 
@@ -13,10 +14,10 @@ The name comes from Jean-François Champollion, who deciphered the Rosetta Stone
 
 | | |
 | --- | --- |
-| Instruction set | RV64GC: I, M, A, F, D, C, Zicsr, Zifencei |
+| Instruction set | RV64GC (I, M, A, F, D, C) plus Zicsr, Zifencei, Zba, Zbb, Zbs, Zicond, Zfhmin, Zfa, and Zawrs. Zba/Zbb/Zbs/Zicond are advertised through `AT_HWCAP`, `riscv_hwprobe`, and `/proc/cpuinfo`; Zfhmin/Zfa/Zawrs execute but are not advertised yet. An RVV 1.0 subset (VLEN 128) is experimental behind `RVRUN_V=1`. |
 | Execution | A JIT to arm64 with block chaining and an inline jump cache, a caching interpreter, and a reference interpreter |
 | Programs | Static and dynamically linked (musl or glibc), multithreaded, with signals, sockets, `fork`/`execve`, and shared memory |
-| Known to run | busybox, Lua, SQLite, Go programs, Rust test binaries, CPython 3.14 (Alpine), and Debian trixie's userland: bash, coreutils, apt, dpkg, perl, python3 |
+| Known to run | busybox, Lua, SQLite, Go programs, Rust test binaries, CPython 3.14 (Alpine), Debian trixie's userland (bash, coreutils, apt, dpkg, perl, python3), and Ubuntu 26.04's RVA23U64 userland |
 | Debugging | A GDB remote stub (`rvrun -g PORT`) |
 
 Milestones M1 through M5 (interpreter, JIT, threads, signals, dynamic linking) are complete. M6 (VM mode) is working. See [`docs/design.md`](docs/design.md) for the design, the milestones, and the [known gaps](docs/design.md#known-gaps).
