@@ -16,6 +16,7 @@
 /// - `FenceI` (Zifencei): make this hart's earlier stores visible to its instruction fetches.
 /// - `Csr`: `src` is `rs1`, or the 5-bit immediate if `imm`. Only CSRs in [`Csr`] decode, and
 ///   writes to read-only ones are rejected here, so execution never sees an illegal access.
+///   `Hpm` exposes Zihpm's user-mode performance counters, currently backed by `instret`.
 /// - `Mop` (Zimop): writes zero to `rd`; `rs1`/`rs2` are ignored.
 /// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
 ///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
@@ -960,6 +961,7 @@ pub enum Csr {
     Cycle,
     Time,
     Instret,
+    Hpm(u8),
     /// `vl`: the active element count (read-only to the guest for our subset).
     Vl,
     /// `vtype`: the last `vset*`'s raw configuration (read-only here).
@@ -977,6 +979,7 @@ impl Csr {
             0xc00 => Csr::Cycle,
             0xc01 => Csr::Time,
             0xc02 => Csr::Instret,
+            0xc03..=0xc1f => Csr::Hpm((n - 0xc00) as u8),
             0xc20 => Csr::Vl,
             0xc21 => Csr::Vtype,
             0xc22 => Csr::Vlenb,
@@ -986,7 +989,10 @@ impl Csr {
 
     /// CSR numbers with bits 11:10 = 0b11 are read-only.
     fn read_only(self) -> bool {
-        matches!(self, Csr::Cycle | Csr::Time | Csr::Instret | Csr::Vl | Csr::Vtype | Csr::Vlenb)
+        matches!(
+            self,
+            Csr::Cycle | Csr::Time | Csr::Instret | Csr::Hpm(_) | Csr::Vl | Csr::Vtype | Csr::Vlenb
+        )
     }
 }
 

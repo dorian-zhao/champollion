@@ -30,6 +30,7 @@ const MULTI: &[(&str, Option<u64>)] = &[
     ("zbb", Some(1 << 4)),
     ("zbs", Some(1 << 5)),
     ("zicond", Some(1 << 35)),
+    ("zihpm", None),
 ];
 
 /// `riscv_hwprobe` bits for key `RISCV_HWPROBE_KEY_IMA_EXT_0` that are not derived from
@@ -122,7 +123,7 @@ mod tests {
     #[test]
     fn the_isa_string_names_every_extension() {
         let plain = Machine::with_vector(false).isa_string();
-        assert_eq!(plain, "rv64imafdc_zicsr_zifencei_zba_zbb_zbs_zicond");
+        assert_eq!(plain, "rv64imafdc_zicsr_zifencei_zba_zbb_zbs_zicond_zihpm");
         assert!(Machine::with_vector(true).isa_string().starts_with("rv64imafdcv_"));
     }
 

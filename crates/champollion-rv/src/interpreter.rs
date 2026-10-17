@@ -592,7 +592,7 @@ fn read_csr(cpu: &CpuState, csr: Csr) -> u64 {
         Csr::Frm => (fcsr >> 5) & 0b111,
         Csr::Fcsr => fcsr & 0xff,
         // No cycle model: report retired instructions, which is monotonic and cheap.
-        Csr::Cycle | Csr::Instret => cpu.instret,
+        Csr::Cycle | Csr::Instret | Csr::Hpm(_) => cpu.instret,
         Csr::Time => host_time(),
         Csr::Vl => cpu.vl,
         Csr::Vtype => cpu.vtype,
@@ -606,7 +606,9 @@ fn write_csr(cpu: &mut CpuState, csr: Csr, v: u64) {
         Csr::Fflags => (cpu.fcsr & !0x1f) | (v & 0x1f),
         Csr::Frm => (cpu.fcsr & !0xe0) | ((v & 0b111) << 5),
         Csr::Fcsr => v & 0xff,
-        Csr::Cycle | Csr::Time | Csr::Instret => unreachable!("read-only, rejected by decode"),
+        Csr::Cycle | Csr::Time | Csr::Instret | Csr::Hpm(_) => {
+            unreachable!("read-only, rejected by decode")
+        }
         Csr::Vl | Csr::Vtype | Csr::Vlenb => unreachable!("read-only, rejected by decode"),
     };
 }
@@ -1618,13 +1620,23 @@ mod tests {
     fn counters() {
         let csr = |rd: u32, n: u32| n << 20 | 0b010 << 12 | rd << 7 | 0x73;
         let (cpu, _) = exec(
-            &[addi(0, 0, 0), csr(10, 0xc02), csr(11, 0xc00), csr(12, 0xc01), csr(13, 0xc01)],
+            &[
+                addi(0, 0, 0),
+                csr(10, 0xc02),
+                csr(11, 0xc00),
+                csr(12, 0xc01),
+                csr(13, 0xc01),
+                csr(14, 0xc03),
+                csr(15, 0xc1f),
+            ],
             &[],
         );
         assert_eq!(cpu.x[10], 1, "instret counts instructions retired before it");
         assert_eq!(cpu.x[11], 2, "cycle reports instret");
         assert!(cpu.x[12] > 0 && cpu.x[13] >= cpu.x[12], "time is monotonic");
-        assert_eq!(cpu.instret, 5);
+        assert_eq!(cpu.x[14], 5, "Zihpm counter 3 reports instret");
+        assert_eq!(cpu.x[15], 6, "Zihpm counter 31 reports instret");
+        assert_eq!(cpu.instret, 7);
     }
 
     #[test]
