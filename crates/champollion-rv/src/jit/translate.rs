@@ -2741,9 +2741,6 @@ pub fn translate(
                 )
             })
             .any(|&(inst, _)| is_vector(inst));
-    // A `vsetvl` changes the vector state within the block, so an internalized edge must
-    // not skip the entry guard: such blocks keep the dispatcher re-entry.
-    let has_vset = block.iter().any(|&(inst, _)| matches!(inst, Inst::VSetvl { .. }));
     let mut tx = Tx {
         a: Asm::new(),
         tails: Vec::new(),
@@ -3034,6 +3031,10 @@ pub fn translate(
                             lt: code_pos[u.t],
                         });
                     } else if let Some(t) = if unroll.is_none() {
+                        // A vset after this branch cannot affect the loop body.
+                        let has_vset = block[..=i]
+                            .iter()
+                            .any(|&(inst, _)| matches!(inst, Inst::VSetvl { .. }));
                         internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge)
                     } else {
                         None
@@ -3083,6 +3084,8 @@ pub fn translate(
                     break;
                 }
                 let t = if unroll.is_none() {
+                    let has_vset =
+                        block[..=i].iter().any(|&(inst, _)| matches!(inst, Inst::VSetvl { .. }));
                     internal_edge(&pcs, &carry_clean, target, i, has_vset, tx.edge)
                 } else {
                     None
