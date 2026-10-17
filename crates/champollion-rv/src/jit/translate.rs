@@ -311,6 +311,10 @@ struct Tx {
     /// The guest m2 vector group currently held in `FA`/`FB`, when its two chunks can
     /// survive a vector load/store or the macc family.
     vec_m2: Option<u8>,
+    /// A second m2 group in `FC`/`FR`. The nanogpt-shaped macc loop loads its source
+    /// and accumulator back to back, so keeping both groups resident avoids reloading
+    /// both sides from `CpuState`.
+    vec_m2_b: Option<u8>,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -472,15 +476,17 @@ impl Tx {
 
     /// Translate one non-control-flow instruction. Returns false if unsupported.
     fn simple(&mut self, inst: Inst, pc: u64) -> bool {
-        if !matches!(
+        if !(matches!(
             inst,
             Inst::VArith { mask: false, .. }
                 | Inst::VFMa { mask: false, .. }
                 | Inst::VLoad { mask: false, .. }
                 | Inst::VStore { mask: false, .. }
-        ) {
+        ) || is_integer_only(inst))
+        {
             self.vec_last = None;
             self.vec_m2 = None;
+            self.vec_m2_b = None;
         }
         match inst {
             Inst::Lui { rd, imm } => self.constant(rd, sext(imm)),
@@ -1464,6 +1470,12 @@ impl Tx {
         let Some((_, bytes)) = self.vec else {
             return false;
         };
+        if !matches!(
+            inst,
+            Inst::VLoad { kind: VMemKind::Unit, .. } | Inst::VStore { kind: VStoreKind::Unit, .. }
+        ) {
+            self.vec_m2_b = None;
+        }
         match inst {
             Inst::VLoad { width, kind, vd, rs1, mask: false, nf: 0, .. }
                 if matches!(kind, VMemKind::Unit | VMemKind::FaultOnlyFirst)
@@ -1485,19 +1497,19 @@ impl Tx {
                 };
                 let operand = self.mem_operand(rs1, 0, 16);
                 if regs == 2 {
+                    let (first, second) = self.m2_slot(vd);
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, access));
-                            assert!(self.a.ldp_q_off(FA, FB, ADDR, 0));
+                            assert!(self.a.ldp_q_off(first, second, ADDR, 0));
                         }
                         None => {
                             self.host_address();
                             self.accesses.push((self.a.pos(), pc, self.retired, access));
-                            self.a.ldp_q(FA, FB, ADDR);
+                            self.a.ldp_q(first, second, ADDR);
                         }
                     }
-                    self.v_str2(FA, FB, vd);
-                    self.vec_m2 = Some(vd);
+                    self.v_str2(first, second, vd);
                     return true;
                 }
                 for r in 0..regs {
@@ -1628,21 +1640,25 @@ impl Tx {
                 let regs = self.vec_regs;
                 let operand = self.mem_operand(rs1, 0, 16);
                 if regs == 2 {
-                    if self.vec_m2 != Some(vs3) {
-                        self.v_ldr2(FA, FB, vs3);
-                    }
+                    let pair = match self.m2_cached(vs3) {
+                        Some(pair) => pair,
+                        None => {
+                            let pair = self.m2_slot(vs3);
+                            self.v_ldr2(pair.0, pair.1, vs3);
+                            pair
+                        }
+                    };
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
-                            assert!(self.a.stp_q_off(FA, FB, ADDR, 0));
+                            assert!(self.a.stp_q_off(pair.0, pair.1, ADDR, 0));
                         }
                         None => {
                             self.host_address();
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
-                            self.a.stp_q(FA, FB, ADDR);
+                            self.a.stp_q(pair.0, pair.1, ADDR);
                         }
                     }
-                    self.vec_m2 = Some(vs3);
                     return true;
                 }
                 for r in 0..regs {
@@ -1678,6 +1694,7 @@ impl Tx {
     /// bitwise ones are element-size independent and use the byte forms).
     fn vector_arith(&mut self, op: VArithOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
+        self.vec_m2_b = None;
         if mask {
             return false;
         }
@@ -1988,6 +2005,7 @@ impl Tx {
             return self.vector_fma_m2_macc(vd, vs2, rs1, bytes);
         }
         self.vec_m2 = None;
+        self.vec_m2_b = None;
         let vs1 = match src {
             VSel::F(rs1) => {
                 self.vector_fscalar(rs1, FB, bytes);
@@ -2049,25 +2067,43 @@ impl Tx {
     }
 
     /// The e32/m2 `vfmacc.vf` shape: keep the two-q accumulator in FA/FB and broadcast
-    /// the scalar once into FR. The source group is one q register at a time in FC.
+    /// the scalar with the by-element form of FMLA. Two groups can stay resident (one
+    /// in each pair of scratch registers), which is exactly the load/load/macc/store
+    /// loop the GPT benchmark emits.
     fn vector_fma_m2_macc(&mut self, vd: u8, vs2: u8, rs1: u8, bytes: u32) -> bool {
         let bits = bytes * 8;
-        if self.vec_m2 != Some(vd) {
-            self.v_ldr2(FA, FB, vd);
-            self.vec_m2 = Some(vd);
-        }
-        self.vector_fscalar(rs1, FR, bytes);
-        for r in 0..2 {
-            let dst = if r == 0 { FA } else { FB };
-            let src = if vs2 == vd {
-                dst
+        let Some(f) = FHOST_REG[rs1 as usize] else {
+            return false;
+        };
+        let dest = match self.m2_cached(vd) {
+            Some(pair) => pair,
+            None => {
+                let pair = self.m2_slot(vd);
+                self.v_ldr2(pair.0, pair.1, vd);
+                pair
+            }
+        };
+        if vs2 == vd {
+            self.a.vec_fmla_lane0(bits, dest.0, dest.0, f);
+            self.a.vec_fmla_lane0(bits, dest.1, dest.1, f);
+        } else if let Some(src) = self.m2_cached(vs2) {
+            self.a.vec_fmla_lane0(bits, dest.0, src.0, f);
+            self.a.vec_fmla_lane0(bits, dest.1, src.1, f);
+        } else {
+            // No free pair: borrow the pair the destination does not occupy, one q at
+            // a time. That pair no longer holds a valid cached group.
+            let tmp = if dest.0 == FA { FC } else { FA };
+            if tmp == FC {
+                self.vec_m2_b = None;
             } else {
-                self.v_ldr(FC, (vs2 + r as u8) & 31);
-                FC
-            };
-            self.a.vec_fmla(bits, dst, src, FR);
+                self.vec_m2 = None;
+            }
+            self.v_ldr(tmp, vs2);
+            self.a.vec_fmla_lane0(bits, dest.0, tmp, f);
+            self.v_ldr(tmp, vs2 + 1);
+            self.a.vec_fmla_lane0(bits, dest.1, tmp, f);
         }
-        self.v_str2(FA, FB, vd);
+        self.v_str2(dest.0, dest.1, vd);
         true
     }
 
@@ -2341,6 +2377,33 @@ impl Tx {
         assert!(self.a.stp_q_off(first, second, CTX, v_offset(v)));
     }
 
+    /// The host registers holding a cached m2 group, if any.
+    fn m2_cached(&self, group: u8) -> Option<(Reg, Reg)> {
+        if self.vec_m2 == Some(group) {
+            Some((FA, FB))
+        } else if self.vec_m2_b == Some(group) {
+            Some((FC, FR))
+        } else {
+            None
+        }
+    }
+
+    /// Pick the slot for a new m2 group, preferring an empty slot and evicting the
+    /// second slot when both are occupied. The caller still has to load the group.
+    fn m2_slot(&mut self, group: u8) -> (Reg, Reg) {
+        if self.vec_m2 == Some(group) {
+            (FA, FB)
+        } else if self.vec_m2_b == Some(group) {
+            (FC, FR)
+        } else if self.vec_m2.is_none() {
+            self.vec_m2 = Some(group);
+            (FA, FB)
+        } else {
+            self.vec_m2_b = Some(group);
+            (FC, FR)
+        }
+    }
+
     /// Zba word adds: `b + (zero-extended a << shift)`. In the ARM extended-register
     /// form register 31 reads as SP, not XZR, so a zero `b` cannot take the one-instruction
     /// form — the zero-extended source is the whole result then.
@@ -2555,6 +2618,26 @@ fn is_vector(inst: Inst) -> bool {
             | Inst::VIndexStore { .. }
             | Inst::VWiden { .. }
     )
+}
+
+/// Whether an instruction only touches the integer register file, so the vector
+/// scratch-register caches stay valid across it.
+fn is_integer_only(inst: Inst) -> bool {
+    match inst {
+        Inst::Op { op, .. } | Inst::OpImm { op, .. } => {
+            !matches!(op, AluOp::Cpop | AluOp::Brev8 | AluOp::OrcB)
+        }
+        Inst::Op32 { op, .. } => op != AluOp32::Cpop,
+        Inst::OpImm32 { .. }
+        | Inst::Load { .. }
+        | Inst::Store { .. }
+        | Inst::Branch { .. }
+        | Inst::Jal { .. }
+        | Inst::Jalr { .. }
+        | Inst::Lui { .. }
+        | Inst::Auipc { .. } => true,
+        _ => false,
+    }
 }
 
 /// Whether translating `inst` leaves `ADDR` alone, apart from [`Tx::mem_operand`], so the
@@ -2972,6 +3055,7 @@ pub fn translate(
         edge: None,
         vec_last: None,
         vec_m2: None,
+        vec_m2_b: None,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.

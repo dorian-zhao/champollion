@@ -770,6 +770,137 @@ mod tests {
     }
 
     #[test]
+    fn vector_m2_unit_groups_stay_resident() {
+        // The GPT inner loop loads the source and accumulator with unit-stride m2
+        // loads, then runs vfmacc.vf before storing the accumulator. Both groups should
+        // stay in scratch registers through the macc.
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle32 = |vd: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse32 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b110 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vfmacc_vf = |vd: u32, vs2: u32, f: u32| {
+            (0x2c << 26) | (1 << 25) | (vs2 << 20) | (f << 15) | (0b101 << 12) | (vd << 7) | 0x57
+        };
+        let prog = [
+            vsetivli(0, 8, 0xd1),              // e32, m2
+            op_fp(0b11110, 0b00, 0, 0, 10, 0), // fmv.w.x f0, a0 (2.0)
+            vle32(8, 11),                      // v8-v9 = b
+            vle32(10, 12),                     // v10-v11 = a
+            vfmacc_vf(10, 8, 0),               // a += 2 × b
+            vse32(10, 13),
+            ECALL,
+        ];
+        let data = |mem: &GuestMemory| {
+            let b: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let a: [f32; 8] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
+            for (i, v) in b.iter().chain(a.iter()).enumerate() {
+                mem.write_privileged(DATA + 4 * i as u64, &v.to_bits().to_le_bytes()).unwrap();
+            }
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in
+                [(11u8, DATA), (12, DATA + 32), (13, DATA + 64), (10, 2.0f32.to_bits() as u64)]
+            {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem_i = setup(&prog);
+        data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        assert_eq!(jit.stats.interpreted.get("VFMa"), None);
+        assert_eq!(jit.stats.interpreted.get("VLoad"), None);
+        assert_eq!(jit.stats.interpreted.get("VStore"), None);
+        let mut out = [0u8; 32];
+        mem_j.read_privileged(DATA + 64, &mut out).unwrap();
+        for i in 0..8 {
+            let want = 0.5 + 0.5 * i as f32 + 2.0 * (i as f32 + 1.0);
+            assert_eq!(
+                f32::from_le_bytes(out[4 * i..4 * i + 4].try_into().unwrap()),
+                want,
+                "lane {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_m2_f64_macc_stays_resident() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle64 = |vd: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse64 =
+            |vs3: u32, rs1: u32| (1 << 25) | (0b111 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vfmacc_vf = |vd: u32, vs2: u32, f: u32| {
+            (0x2c << 26) | (1 << 25) | (vs2 << 20) | (f << 15) | (0b101 << 12) | (vd << 7) | 0x57
+        };
+        let prog = [
+            vsetivli(0, 4, 0xd9),              // e64, m2
+            op_fp(0b11110, 0b01, 0, 0, 10, 0), // fmv.d.x f0, a0 (2.0)
+            vle64(8, 11),
+            vle64(10, 12),
+            vfmacc_vf(10, 8, 0),
+            vse64(10, 13),
+            ECALL,
+        ];
+        let data = |mem: &GuestMemory| {
+            let b: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+            let a: [f64; 4] = [0.5, 1.5, 2.5, 3.5];
+            for (i, v) in b.iter().chain(a.iter()).enumerate() {
+                mem.write_privileged(DATA + 8 * i as u64, &v.to_bits().to_le_bytes()).unwrap();
+            }
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 32), (13, DATA + 64), (10, 2.0f64.to_bits())] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem_i = setup(&prog);
+        data(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        data(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        assert_eq!(jit.stats.interpreted.get("VFMa"), None);
+        let mut out = [0u8; 32];
+        mem_j.read_privileged(DATA + 64, &mut out).unwrap();
+        for i in 0..4 {
+            let want = 0.5 + i as f64 + 2.0 * (i as f64 + 1.0);
+            assert_eq!(
+                f64::from_le_bytes(out[8 * i..8 * i + 8].try_into().unwrap()),
+                want,
+                "lane {i}"
+            );
+        }
+    }
+
+    #[test]
     fn fboxed_entry_guard_matches_the_interpreter() {
         // A loop that reads a single a *previous* block loaded: the translation assumes
         // it boxed, checks that once at the loop head, and skips the per-use canonical-

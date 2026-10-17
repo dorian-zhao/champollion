@@ -1083,6 +1083,16 @@ impl Asm {
             0x4e20_cc00 | Self::fp_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
         );
     }
+    /// `fmla vd.4s/2d, vn.4s/2d, vm.s/d[0]`: fused multiply-add with lane 0 of `vm`
+    /// broadcast, without first materializing a duplicate.
+    pub fn vec_fmla_lane0(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        let base = match size {
+            32 => 0x4f80_1000,
+            64 => 0x4fc0_1000,
+            _ => panic!("no by-element fmla for {size}-bit lanes"),
+        };
+        self.emit(base | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
     /// `fmls vd, vn, vm`: `vd -= vn × vm`, fused.
     pub fn vec_fmls(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
         self.emit(
@@ -1175,6 +1185,14 @@ mod tests {
         a.vec_fcvtn(19, 20);
         a.vec_fcvtn2(19, 20);
         assert_eq!(a.code, [0x0e21_7a30, 0x4e21_7a32, 0x0e21_6a93, 0x4e21_6a93]);
+    }
+
+    #[test]
+    fn fmla_lane0_matches_assembler() {
+        let mut a = Asm::new();
+        a.vec_fmla_lane0(32, 16, 18, 15);
+        a.vec_fmla_lane0(64, 16, 18, 15);
+        assert_eq!(a.code, [0x4f8f_1250, 0x4fcf_1250]);
     }
 
     /// The architecture's `DecodeBitMasks` for a 64-bit operation.
