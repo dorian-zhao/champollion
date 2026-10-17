@@ -22,6 +22,8 @@
 int main(int argc, char **argv) {
     CHECK("argc", argc == 3);
     CHECK("argv", argc == 3 && strcmp(argv[2], "second arg") == 0);
+    pid_t pid1 = getpid(), pid2 = getpid();
+    CHECK("getpid", pid1 > 0 && pid1 == pid2);
     const char *env = getenv("CHAMPOLLION_TEST");
     CHECK("environ", env && strcmp(env, "yes") == 0);
 

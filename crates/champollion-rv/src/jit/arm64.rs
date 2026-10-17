@@ -638,6 +638,10 @@ impl Asm {
     pub fn ret(&mut self) {
         self.emit(0xd65f_03c0);
     }
+    /// `svc #0`: enter the host kernel.
+    pub fn svc(&mut self) {
+        self.emit(0xd400_0001);
+    }
     /// `adrp rd, #pages`: the address of the 4 KiB page `pages` pages from this one (±4 GiB).
     pub fn adrp(&mut self, rd: Reg, pages: i32) {
         assert!((-(1 << 20)..1 << 20).contains(&pages), "adrp out of range: {pages}");

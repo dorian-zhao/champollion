@@ -3018,6 +3018,38 @@ pub fn translate(
                 ended = true;
                 break;
             }
+            Inst::Ecall if tx.identity => {
+                // Linux's asm-generic numbers, arguments, and return register line up
+                // for these calls, and none of them touches guest memory. Run them in
+                // generated code and chain straight to the next block; anything else
+                // still leaves to the dispatcher.
+                let mut fast_branches = Vec::new();
+                for nr in [57u32, 172] {
+                    // close, getpid
+                    tx.a.cmp_imm(7, nr);
+                    let b = tx.a.pos();
+                    tx.a.b_cond(Cond::Eq, b);
+                    fast_branches.push(b);
+                }
+                exits.push((tx.a.pos(), None));
+                tx.exit(Tail::Static { pc: at, code: exit::ECALL });
+                let fast = tx.a.pos();
+                for b in fast_branches {
+                    tx.a.patch(b, fast);
+                }
+                // The ecall retires once; the block's entry counted everything before it.
+                tx.a.add_imm(INSTRET_REG, INSTRET_REG, 1);
+                // Host x8 is guest ra; the host ABI wants the syscall number there.
+                tx.a.mov(ADDR, 8);
+                tx.a.mov(8, 7); // host syscall number is guest a7
+                tx.a.svc();
+                tx.a.mov(8, ADDR);
+                tx.interrupt_check(Some(next));
+                tx.a.mov_imm(ADDR, next);
+                tx.indirect(false);
+                ended = true;
+                break;
+            }
             Inst::Ecall => {
                 exits.push((tx.a.pos(), None));
                 tx.exit(Tail::Static { pc: at, code: exit::ECALL });
