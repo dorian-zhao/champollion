@@ -38,6 +38,9 @@ int main(int argc, char **argv) {
     CHECK("fstat", fstat(fd, &st) == 0 && st.st_size == 11 && S_ISREG(st.st_mode));
     CHECK("close", close(fd) == 0);
     CHECK("stat", stat(path, &st) == 0 && st.st_size == 11);
+    char exe[4096];
+    ssize_t exe_len = readlink("/proc/self/exe", exe, sizeof exe);
+    CHECK("exe", exe_len > 0 && exe[0] == '/' && (size_t)exe_len < sizeof exe);
     CHECK("enoent", open("/nonexistent/champollion", O_RDONLY) < 0 && errno == ENOENT);
     CHECK("ebadf", close(fd) < 0 && errno == EBADF);
 

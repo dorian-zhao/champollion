@@ -1772,8 +1772,9 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             let path = cstr(a[1])?;
             // There is no /proc on macOS; answer the one entry nearly every program asks.
             if path.as_bytes() == b"/proc/self/exe" {
-                let n = p.exe.len().min(a[3] as usize);
-                put(p, a[2], &p.exe[..n])?;
+                let exe = p.exe_path();
+                let n = exe.len().min(a[3] as usize);
+                put(p, a[2], &exe[..n])?;
                 return Ok(n as u64);
             }
             host.readlinkat(fd, &p.host_path(&path, false), buf(a[2], a[3], Prot::WRITE)?)

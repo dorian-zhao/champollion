@@ -169,8 +169,10 @@ pub struct Process {
     slots: Mutex<Vec<bool>>,
     brk: Mutex<Brk>,
     pub log: SyscallLog,
-    /// Absolute path of the executable, for `/proc/self/exe`.
-    pub exe: Vec<u8>,
+    /// The executable path as the guest invoked it, and its canonical form once
+    /// `/proc/self/exe` is read.
+    exe: Vec<u8>,
+    exe_canonical: std::sync::OnceLock<Vec<u8>>,
     /// Where the guest's absolute paths are looked up first (see [`Process::host_path`]).
     pub sysroot: Option<std::path::PathBuf>,
     /// tid of the thread that ends the process by returning from [`Process::run`].
@@ -476,12 +478,7 @@ impl Process {
 
         let mut cpu = CpuState::new(start);
         cpu.x[2] = sp;
-        let exe = {
-            use std::os::unix::ffi::{OsStrExt, OsStringExt};
-            let path = std::ffi::OsStr::from_bytes(execfn);
-            std::fs::canonicalize(path)
-                .map_or_else(|_| execfn.to_vec(), |p| p.into_os_string().into_vec())
-        };
+        let exe = execfn.to_vec();
         let brk = Mutex::new(Brk { start: brk, cur: brk });
         let threads = Threads { live: 1, next_tid: id.pid + 1, last_status: 0 };
         let main_signals = Arc::new(ThreadSignals::default());
@@ -507,6 +504,7 @@ impl Process {
             brk,
             log: SyscallLog::default(),
             exe,
+            exe_canonical: std::sync::OnceLock::new(),
             sysroot,
             main_tid: std::sync::atomic::AtomicU32::new(id.pid),
             orphaned: AtomicBool::new(false),
@@ -515,6 +513,7 @@ impl Process {
             itimer: Mutex::default(),
             itimer_changed: Condvar::new(),
         });
+        mark!("process built");
         Ok((
             process,
             Thread {
@@ -674,6 +673,18 @@ impl Process {
                 }
             }
         }
+    }
+
+    /// The executable path resolved for `/proc/self/exe`. Canonicalizing is deferred
+    /// until the guest actually reads it: most short-lived programs never do, and the
+    /// file-system lookup belongs on the first read, not every spawn.
+    pub fn exe_path(&self) -> &[u8] {
+        self.exe_canonical.get_or_init(|| {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let path = std::ffi::OsStr::from_bytes(&self.exe);
+            std::fs::canonicalize(path)
+                .map_or_else(|_| self.exe.clone(), |p| p.into_os_string().into_vec())
+        })
     }
 
     /// The host path for guest path `path`: on macOS, `/dev/shm` (POSIX shared memory and
