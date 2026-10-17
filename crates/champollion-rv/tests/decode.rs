@@ -536,6 +536,8 @@ fn rv64zb() {
         ("c.lh a1, 2(s1)", Load { width: L::H, rd: A1, rs1: S1, offset: 2 }),
         ("c.mop.1", OpImm { op: A::Add, rd: 0, rs1: 0, imm: 0 }),
         ("c.mop.15", OpImm { op: A::Add, rd: 0, rs1: 0, imm: 0 }),
+        ("mop.r.0 a0, a1", Mop { rd: A0 }),
+        ("mop.rr.7 a2, a3, a4", Mop { rd: A2 }),
     ];
     check(
         include_str!("../../../tests/fixtures/rv64zb.s"),

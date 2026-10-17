@@ -16,6 +16,7 @@
 /// - `FenceI` (Zifencei): make this hart's earlier stores visible to its instruction fetches.
 /// - `Csr`: `src` is `rs1`, or the 5-bit immediate if `imm`. Only CSRs in [`Csr`] decode, and
 ///   writes to read-only ones are rejected here, so execution never sees an illegal access.
+/// - `Mop` (Zimop): writes zero to `rd`; `rs1`/`rs2` are ignored.
 /// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
 ///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
 /// - F/D instructions: register numbers name `f` registers, except the base address of
@@ -91,6 +92,9 @@ pub enum Inst {
     /// Zawrs `wrs.nto`/`wrs.sto`: waits for a reservation set that never exists under
     /// emulation, so it is a no-op (the surrounding spin loop still runs).
     Wrs,
+    Mop {
+        rd: u8,
+    },
     Csr {
         op: CsrOp,
         csr: Csr,
@@ -1476,6 +1480,8 @@ pub fn decode(w: u32) -> Result<Inst, DecodeError> {
         }
         SYSTEM if w == ECALL => Inst::Ecall,
         SYSTEM if w == EBREAK => Inst::Ebreak,
+        // Zimop: both MOP.R and MOP.RR live in SYSTEM funct3 100 and write zero.
+        SYSTEM if f3 == 0b100 => Inst::Mop { rd },
         // Zawrs: wrs.nto/wrs.sto (funct12 0x00D/0x01D, all operand fields zero).
         SYSTEM if f3 == 0 && matches!(w >> 20, 0x00d | 0x01d) && rs1 == 0 && rd == 0 => Inst::Wrs,
         _ => return illegal,
@@ -1663,7 +1669,6 @@ mod tests {
             op_fp(0b00100, 0b10, 0b000, 1, 2, 3), // fsgnj.h: Zfh
             0xc000_1073,           // csrrw cycle: read-only CSR
             0xc011_6073,           // csrrsi time, 2: writes a read-only CSR
-            0x0010_4073,           // SYSTEM funct3 100: reserved
             amo(0b00010, 0b010, 1, 2, 3), // lr.w with rs2 != 0
             amo(0b00000, 0b000, 1, 2, 3), // amoadd.b: Zabha
             amo(0b00101, 0b011, 1, 2, 3), // amocas.d: Zacas

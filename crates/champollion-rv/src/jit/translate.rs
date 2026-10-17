@@ -532,6 +532,7 @@ impl Tx {
             }
             // Conservatively a full barrier; mapping pred/succ to dmb variants comes later.
             Inst::Fence { .. } => self.a.dmb_ish(),
+            Inst::Mop { rd } => self.constant(rd, 0),
             // F/D data movement. Doubles are moved as raw bits; singles are NaN-boxed when
             // written to an f register.
             Inst::FLoad { width, rd, rs1, offset } => {
@@ -2390,7 +2391,8 @@ fn int_dest(inst: Inst) -> Option<u8> {
         | Inst::OpImm32 { rd, .. }
         | Inst::Op { rd, .. }
         | Inst::Op32 { rd, .. }
-        | Inst::Load { rd, .. } => Some(rd),
+        | Inst::Load { rd, .. }
+        | Inst::Mop { rd } => Some(rd),
         _ => None,
     }
 }

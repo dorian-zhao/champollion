@@ -103,6 +103,7 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         // This interpreter fetches from memory on every step, so it has no stale code to
         // discard; the caching engine flushes its decoded blocks here.
         Inst::FenceI => {}
+        Inst::Mop { rd } => cpu.set_x(rd, 0),
         Inst::Csr { op, csr, rd, src, imm } => {
             let operand = if imm { src as u64 } else { cpu.x(src) };
             let old = read_csr(cpu, csr);
@@ -1093,6 +1094,22 @@ mod tests {
         assert_eq!(cpu.x[12], BASE + 8);
         assert_eq!(cpu.x[13], BASE + 12 - 0x1000);
         assert_eq!(cpu.x[0], 0);
+    }
+
+    #[test]
+    fn zimop_writes_zero() {
+        let (cpu, _) = exec(
+            &[
+                0x81c5_c573, // mop.r.0 a0, a1
+                0xcee6_c673, // mop.rr.7 a2, a3, a4
+            ],
+            &[(10, 7), (11, 0x55), (12, 9), (13, 0x66), (14, 0x77)],
+        );
+        assert_eq!(cpu.x[10], 0);
+        assert_eq!(cpu.x[12], 0);
+        assert_eq!(cpu.x[11], 0x55);
+        assert_eq!(cpu.x[13], 0x66);
+        assert_eq!(cpu.x[14], 0x77);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Zba, Zbb, Zbs, Zicond, Zbkb, Zbc, Zbkx, Zcmop, and the Zcb compressed forms, one
 # instruction per line; see crates/champollion-rv/tests/decode.rs.
-.option arch, +zba,+zbb,+zbs,+zicond,+zbkb,+zbc,+zbkx,+zcmop,+zcb
+.option arch, +zba,+zbb,+zbs,+zicond,+zbkb,+zbc,+zbkx,+zcmop,+zcb,+zimop
 # Zba
 sh1add a0, a1, a2
 sh2add a3, a4, a5
@@ -76,3 +76,6 @@ xperm8 a0, a1, a2
 c.lh a1, 2(s1)
 c.mop.1
 c.mop.15
+# Zimop
+mop.r.0 a0, a1
+mop.rr.7 a2, a3, a4
