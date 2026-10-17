@@ -224,6 +224,14 @@ fn main() -> ExitCode {
     if let (Some(cache), Some(jit)) = (&cache, &main_thread.jit)
         && jit.profiler.is_none()
     {
+        if std::env::var_os("RVRUN_DIAG").is_some() {
+            eprintln!(
+                "[cache] cacheable={} translations={} restored={}",
+                jit.cacheable(),
+                jit.stats.translations,
+                jit.stats.restored
+            );
+        }
         cache.save(jit);
     }
     if let (Some(path), Some(p)) =
@@ -354,12 +362,24 @@ fn default_cache_dir() -> Option<std::path::PathBuf> {
 impl CodeCache {
     fn new(path: &std::path::Path) -> Option<Self> {
         use std::hash::{Hash, Hasher};
+        let diag = std::env::var_os("RVRUN_DIAG").is_some();
+        macro_rules! bail {
+            ($what:expr) => {{
+                if diag {
+                    eprintln!("[cache] disabled: {}", $what);
+                }
+                return None;
+            }};
+        }
         if std::env::var_os("RVRUN_CACHE").is_some_and(|v| v == "0") {
             return None;
         }
         let dir = match std::env::var_os("RVRUN_CACHE_DIR") {
             Some(dir) => std::path::PathBuf::from(dir),
-            None => default_cache_dir()?,
+            None => match default_cache_dir() {
+                Some(dir) => dir,
+                None => bail!("no cache directory"),
+            },
         };
         // SipHash with fixed keys: stable for a given build of rvrun, which is all a key
         // must be (the build is part of it). The guest file enters through its identity -
@@ -367,9 +387,15 @@ impl CodeCache {
         // of its full contents: hashing a 2 MiB static binary took about 0.6 ms on every
         // exec, and any rewrite of the file moves one of these.
         let mut h = std::hash::DefaultHasher::new();
-        let meta = std::fs::metadata(path).ok()?;
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) => bail!(format!("{}: {e}", path.display())),
+        };
         meta.len().hash(&mut h);
-        meta.modified().ok()?.hash(&mut h);
+        match meta.modified() {
+            Ok(m) => m.hash(&mut h),
+            Err(e) => bail!(format!("modified: {e}")),
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -391,9 +417,21 @@ impl CodeCache {
             }
         }
         env!("CARGO_PKG_VERSION").hash(&mut h);
-        let exe = std::env::current_exe().and_then(std::fs::metadata).ok()?;
+        // binfmt_misc's `F` flag pins a snapshot of the interpreter that the container's
+        // namespace cannot reach by path, so `current_exe` fails for the Linux handler;
+        // `/proc/self/exe` still stats the live inode.
+        let exe = match std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .or_else(|_| std::fs::metadata("/proc/self/exe"))
+        {
+            Ok(exe) => exe,
+            Err(e) => bail!(format!("current_exe: {e}")),
+        };
         exe.len().hash(&mut h);
-        exe.modified().ok()?.hash(&mut h);
+        match exe.modified() {
+            Ok(m) => m.hash(&mut h),
+            Err(e) => bail!(format!("exe modified: {e}")),
+        }
         let key = h.finish();
         Some(Self { path: dir.join(format!("{key:016x}.jit")), key })
     }
