@@ -232,6 +232,9 @@ pub struct GuestMemory {
     /// Unmapped host pages, already emptied, still to be made inaccessible once no TLB can
     /// point at them (see [`GuestMemory::settle`]).
     pending: Mutex<Vec<Range<u64>>>,
+    /// Set by [`GuestMemory::leak_at_exit`]: the process is exiting, so the reservation
+    /// stays mapped and the kernel reclaims it.
+    leaked: std::sync::atomic::AtomicBool,
 }
 
 /// A TLB user that is not using its TLB.
@@ -367,6 +370,7 @@ impl GuestMemory {
             maps: RwLock::default(),
             generation: AtomicU64::new(0),
             code_generation: AtomicU64::new(0),
+            leaked: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -930,12 +934,24 @@ pub(super) unsafe fn atomic_copy_in(dst: *mut u8, buf: &[u8]) {
 
 impl Drop for GuestMemory {
     fn drop(&mut self) {
+        if self.leaked.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         for (start, len) in self.owned {
             if len > 0 {
                 // SAFETY: unmapping exactly what `new` mapped.
                 unsafe { libc::munmap(start, len) };
             }
         }
+    }
+}
+
+impl GuestMemory {
+    /// Skip unmapping the reservation when this drops: only for a process that is about
+    /// to exit, where the kernel reclaims the address space anyway. Unmapping the 264 GiB
+    /// range explicitly costs about a millisecond on macOS, on every rvrun invocation.
+    pub fn leak_at_exit(&self) {
+        self.leaked.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

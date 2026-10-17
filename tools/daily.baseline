@@ -1,5 +1,5 @@
-hello 2.758
-lua-start 2.648
-lua-compute 2.238
-sqlite-script 2.415
-sqlite-cte 2.075
+hello 2.411
+lua-start 2.542
+lua-compute 2.230
+sqlite-script 2.413
+sqlite-cte 2.081

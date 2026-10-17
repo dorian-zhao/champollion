@@ -314,6 +314,12 @@ impl Jit {
         self.profiler = Some(profile::Profiler::start(self.code.base() as usize, CODE_SIZE));
     }
 
+    /// Skip unmapping the code buffer at drop; only for a process that is about to exit,
+    /// where the kernel reclaims the address space.
+    pub fn leak_at_exit(&mut self) {
+        self.code.leak_at_exit();
+    }
+
     /// Link the new block at `at` (guest `pc`) into the graph: exits already waiting for
     /// `pc` now jump straight to it, and its own static exits jump straight to their
     /// targets if those are translated (or wait for them).

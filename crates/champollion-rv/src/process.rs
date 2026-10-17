@@ -382,7 +382,19 @@ impl Process {
         host: Arc<dyn HostOs>,
         sysroot: Option<std::path::PathBuf>,
     ) -> Result<(Arc<Self>, Thread), SpawnError> {
+        // `RVRUN_TRACE_STARTUP=1`: which phase of building the process costs what.
+        let trace = std::env::var_os("RVRUN_TRACE_STARTUP").is_some();
+        let trace_start = std::time::Instant::now();
+        macro_rules! mark {
+            ($what:expr) => {
+                if trace {
+                    let us = trace_start.elapsed().as_secs_f64() * 1e6;
+                    eprintln!("[spawn] {us:>7.0}us {}", $what);
+                }
+            };
+        }
         let mut elf = loader::parse(file).map_err(SpawnError::Load)?;
+        mark!("elf parsed");
         if elf.pie {
             elf.relocate(PIE_BASE);
         }
@@ -394,7 +406,9 @@ impl Process {
             Some(mem) => mem,
             None => GuestMemory::new().map_err(SpawnError::Reserve)?,
         };
+        mark!("memory reserved");
         let brk = loader::map_elf(&mem, &elf).map_err(SpawnError::Map)?;
+        mark!("elf mapped");
         mem.map(STACK_TOP - STACK_SIZE, STACK_SIZE, Prot::RW).map_err(SpawnError::Map)?;
         mem.map(SIGRETURN_TRAMPOLINE, GUEST_PAGE_SIZE, Prot::READ | Prot::EXEC)
             .map_err(SpawnError::Map)?;
@@ -448,6 +462,7 @@ impl Process {
         let init = StackInit { argv, envp, execfn, random, auxv: &auxv };
         let sp = loader::build_stack(&mem, STACK_TOP, &init)
             .map_err(|_| SpawnError::Map(MapError::NoSpace))?;
+        mark!("stack built");
 
         let mut cpu = CpuState::new(start);
         cpu.x[2] = sp;

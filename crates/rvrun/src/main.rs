@@ -32,6 +32,16 @@ const USAGE: &str =
     "usage: rvrun [-g PORT] [-L SYSROOT] [-0 ARGV0] <riscv64-linux-elf or script> [args...]";
 
 fn main() -> ExitCode {
+    // `RVRUN_TRACE_STARTUP=1`: where a short-lived guest's time goes before its code runs.
+    struct Trace(Option<std::time::Instant>);
+    impl Trace {
+        fn mark(&self, what: &str) {
+            if let Some(t) = self.0 {
+                eprintln!("[start] {:>7.0}us {what}", t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+    }
+    let trace = Trace(std::env::var_os("RVRUN_TRACE_STARTUP").map(|_| std::time::Instant::now()));
     let mut args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut gdb_port = None;
     let mut argv0 = None;
@@ -119,6 +129,7 @@ fn main() -> ExitCode {
         );
     }
     let path = path.into_os_string();
+    trace.mark("args");
 
     // The guest gets `args` (argv[0] first) and inherits our environment.
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
@@ -154,6 +165,7 @@ fn main() -> ExitCode {
             return ExitCode::from(126);
         }
     };
+    trace.mark("spawn");
     // Started by binfmt_misc (VM mode), the kernel itself knows how to run guest programs.
     let native_exec = preserved_argv0() && sysroot.is_none();
     proc.set_exec(Box::new(move |req| {
@@ -172,7 +184,9 @@ fn main() -> ExitCode {
     champollion_rv::host::forward_signals(proc.clone());
     let strace = std::env::var_os("RVRUN_STRACE").is_some_and(|v| v != "0");
     proc.log.strace.store(strace, std::sync::atomic::Ordering::Relaxed);
+    trace.mark("signals");
     let cache = CodeCache::new(&file);
+    trace.mark("cache");
     if std::env::var_os("RVRUN_JIT").is_none_or(|v| v != "0") {
         match champollion_rv::jit::Jit::new() {
             Ok(mut jit) => {
@@ -184,6 +198,7 @@ fn main() -> ExitCode {
                 }
                 main_thread.jit = Some(jit);
                 proc.jit.store(true, std::sync::atomic::Ordering::Relaxed);
+                trace.mark("jit");
             }
             Err(e) => eprintln!("rvrun: JIT unavailable ({e}); interpreting"),
         }
@@ -202,6 +217,7 @@ fn main() -> ExitCode {
             }
         },
     };
+    trace.mark("ran");
     if let (Some(cache), Some(jit)) = (&cache, &main_thread.jit)
         && jit.profiler.is_none()
     {
@@ -221,6 +237,13 @@ fn main() -> ExitCode {
             eprintln!("[rvrun] {}", jit.stats.report());
         }
     }
+    // The kernel reclaims the address space at exit; unmapping the guest reservation
+    // explicitly costs about a millisecond per invocation on macOS.
+    proc.mem.leak_at_exit();
+    if let Some(jit) = main_thread.jit.as_mut() {
+        jit.leak_at_exit();
+    }
+    trace.mark("cleanup");
     exit.terminate(&main_thread.cpu)
 }
 

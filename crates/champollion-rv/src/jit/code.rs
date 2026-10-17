@@ -26,6 +26,9 @@ pub struct CodeBuffer {
     used: usize,
     /// Byte ranges written since the last commit.
     dirty: Vec<(usize, usize)>,
+    /// Set by [`CodeBuffer::leak_at_exit`]: the process is exiting, so the kernel
+    /// reclaims the mapping.
+    leaked: bool,
     /// Whether this thread has the region writable (macOS).
     #[cfg(target_os = "macos")]
     writable: bool,
@@ -67,6 +70,7 @@ impl CodeBuffer {
             data_size,
             used: 0,
             dirty: Vec::new(),
+            leaked: false,
             #[cfg(target_os = "macos")]
             writable: false,
         })
@@ -213,8 +217,18 @@ unsafe fn flush_icache(start: *mut u8, len: usize) {
 
 impl Drop for CodeBuffer {
     fn drop(&mut self) {
+        if self.leaked {
+            return;
+        }
         // SAFETY: unmapping exactly what `new` mapped.
         unsafe { libc::munmap(self.base.cast(), self.size + self.data_size) };
+    }
+}
+
+impl CodeBuffer {
+    /// Skip unmapping when this drops; only for a process that is about to exit.
+    pub fn leak_at_exit(&mut self) {
+        self.leaked = true;
     }
 }
 

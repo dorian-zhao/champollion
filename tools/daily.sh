@@ -2,7 +2,8 @@
 # The daily-use benchmark gate: everyday shapes - process startup, a script loop, SQL -
 # built natively and for riscv64, timed side by side. Prints our speed as a percentage
 # of native next to the Rosetta 2 band (70-80% of native), and fails when a case
-# regresses past the committed baseline.
+# regresses past the committed baseline. Timings are the minimum of each run set:
+# the startup shapes are noisy, and the floor is what a regression would move.
 #
 #   tools/daily.sh                    # run and compare against tools/daily.baseline
 #   tools/daily.sh --update-baseline  # accept the current numbers
@@ -16,7 +17,6 @@ out="$root/target/daily"
 mkdir -p "$out"
 update=0
 [ "${1:-}" = "--update-baseline" ] && update=1
-runs=${DAILY_RUNS:-7}
 
 (cd "$root" && cargo build --release -p rvrun >/dev/null)
 rvrun="$root/target/release/rvrun"
@@ -57,19 +57,19 @@ cp "$root/tests/programs/basics.sql" "$out/basics.sql"
 printf 'WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 1000000)\nSELECT count(*), sum(x) FROM c;\n' \
     > "$out/sqlite-cte.sql"
 
-# name, ours, native
+# name, ours, native; the short-lived cases need more runs to settle.
 bench() {
-    hyperfine -N --warmup 2 --runs "$runs" --export-json "$out/$1.json" "$2" "$3" >/dev/null
+    hyperfine -N --warmup 3 --runs "$1" --export-json "$out/$2.json" "$3" "$4" >/dev/null
 }
 
-bench hello "$rvrun $root/tests/fixtures/hello" "$out/hello-native"
-bench lua-start "$rvrun $root/tests/fixtures/programs/lua $out/lua-start.lua" \
+bench "${DAILY_RUNS:-15}" hello "$rvrun $root/tests/fixtures/hello" "$out/hello-native"
+bench "${DAILY_RUNS:-15}" lua-start "$rvrun $root/tests/fixtures/programs/lua $out/lua-start.lua" \
     "$out/lua-native $out/lua-start.lua"
-bench lua-compute "$rvrun $root/tests/fixtures/programs/lua $out/lua-compute.lua" \
+bench "${DAILY_HEAVY_RUNS:-7}" lua-compute "$rvrun $root/tests/fixtures/programs/lua $out/lua-compute.lua" \
     "$out/lua-native $out/lua-compute.lua"
-bench sqlite-script "$rvrun $root/tests/fixtures/programs/sqlite3 -init $out/basics.sql :memory:" \
+bench "${DAILY_HEAVY_RUNS:-7}" sqlite-script "$rvrun $root/tests/fixtures/programs/sqlite3 -init $out/basics.sql :memory:" \
     "$out/sqlite3-native -init $out/basics.sql :memory:"
-bench sqlite-cte "$rvrun $root/tests/fixtures/programs/sqlite3 -init $out/sqlite-cte.sql :memory:" \
+bench "${DAILY_HEAVY_RUNS:-7}" sqlite-cte "$rvrun $root/tests/fixtures/programs/sqlite3 -init $out/sqlite-cte.sql :memory:" \
     "$out/sqlite3-native -init $out/sqlite-cte.sql :memory:"
 
 python3 - "$root" "$out" "$update" <<'PY'
@@ -83,8 +83,8 @@ cases = ["hello", "lua-start", "lua-compute", "sqlite-script", "sqlite-cte"]
 def wall(entry):
     summary = entry.get("summary", entry)
     if "time_wall_clock" in summary:  # nested per-metric summaries
-        return summary["time_wall_clock"]["median"]
-    return summary["median"]
+        return summary["time_wall_clock"]["min"]
+    return summary["min"]
 
 
 rows = []

@@ -422,8 +422,7 @@ impl Tx {
         let here = (self.block_word + self.a.pos() as i64) * 4;
         self.a.adrp(SRC0, ((self.jump_cache >> 12) - (here >> 12)) as i32);
         self.a.add_lsl(DST, SRC0, DST, 4);
-        self.a.ldr_off(SRC0, DST, 0);
-        self.a.ldr_off(SRC1, DST, 8);
+        self.a.ldp(SRC0, SRC1, DST); // (guest pc, code address) in one load
         self.a.cmp(SRC0, ADDR);
         let miss = self.a.pos();
         self.a.b_cond(Cond::Ne, miss); // patched once the tail exists

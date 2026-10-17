@@ -587,6 +587,10 @@ impl Asm {
         let imm7 = ((offset / 8) as u32) & 0x7f;
         self.emit(0xa8c0_0000 | imm7 << 15 | (rt2 as u32) << 10 | (rn as u32) << 5 | rt as u32);
     }
+    /// `ldp rt, rt2, [rn]`: two adjacent 8-byte loads in one instruction.
+    pub fn ldp(&mut self, rt: Reg, rt2: Reg, rn: Reg) {
+        self.emit(0xa940_0000 | (rt2 as u32) << 10 | (rn as u32) << 5 | rt as u32);
+    }
 
     // ---- branches ----
 
