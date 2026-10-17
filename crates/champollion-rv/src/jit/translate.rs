@@ -28,6 +28,7 @@
 //! can repoint that `b` straight at the next block.
 
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::arm64::{Asm, AtomicOp, Cond, FmaKind, Fp, FpOp, FpRound, Mem, Reg, XZR};
 use crate::cpu::CpuState;
@@ -39,6 +40,15 @@ use crate::decoder::{
 use crate::memory::{
     CONTROL_OFFSET, FAST_RANGE_COUNT, FAST_RANGE_STRIDE, FAST_RANGES_OFFSET, GUARD_SIZE, GUEST_SIZE,
 };
+
+static STAT_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
+
+/// Whether a Linux identity guest can pass `newfstatat` straight to the host.
+/// This is cleared when a sysroot changes guest paths.
+pub fn set_stat_passthrough(enabled: bool) {
+    STAT_PASSTHROUGH.store(enabled, Ordering::Relaxed);
+}
+
 const _: () = assert!(CONTROL_OFFSET.is_multiple_of(4096) && CONTROL_OFFSET >> 12 < 4096);
 
 pub const CTX: Reg = 28;
@@ -3235,6 +3245,7 @@ pub fn translate(
                 // for these calls. close and getpid do not touch guest memory; read and
                 // write can run inline when their buffer falls in one of the recently
                 // mapped ranges recorded in the control area.
+                let stat_passthrough = STAT_PASSTHROUGH.load(Ordering::Relaxed);
                 let mut close_branches = Vec::new();
                 for nr in [57u32, 172] {
                     tx.a.cmp_imm(7, nr);
@@ -3248,6 +3259,13 @@ pub fn translate(
                     let b = tx.a.pos();
                     tx.a.b_cond(Cond::Eq, b);
                     rw_branches.push(b);
+                }
+                let mut stat_branches = Vec::new();
+                if stat_passthrough {
+                    tx.a.cmp_imm(7, 79);
+                    let b = tx.a.pos();
+                    tx.a.b_cond(Cond::Eq, b);
+                    stat_branches.push(b);
                 }
                 let slow = tx.a.pos();
                 exits.push((slow, None));
@@ -3311,6 +3329,9 @@ pub fn translate(
                 tx.a.b(slow);
                 let fast = tx.a.pos();
                 for b in close_branches {
+                    tx.a.patch(b, fast);
+                }
+                for b in stat_branches {
                     tx.a.patch(b, fast);
                 }
                 for b in hit_branches {

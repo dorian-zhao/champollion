@@ -131,6 +131,7 @@ fn main() -> ExitCode {
     }
     let path = path.into_os_string();
     trace.mark("args");
+    champollion_rv::jit::translate::set_stat_passthrough(sysroot.is_none());
 
     // The guest gets `args` (argv[0] first) and inherits our environment.
     let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
