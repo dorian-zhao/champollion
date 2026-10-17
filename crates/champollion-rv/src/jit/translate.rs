@@ -1681,8 +1681,11 @@ impl Tx {
         if mask {
             return false;
         }
-        if op == VArithOp::Rol {
-            return self.vector_rol(vd, vs2, src);
+        if matches!(op, VArithOp::Rol | VArithOp::Ror) {
+            return self.vector_rotate(vd, vs2, src, op == VArithOp::Rol);
+        }
+        if op == VArithOp::Sll {
+            return self.vector_sll(vd, vs2, src);
         }
         if self.vec_regs != 1 {
             return false;
@@ -1781,20 +1784,19 @@ impl Tx {
         true
     }
 
-    /// Zvbb `vrol.vv` / `vrol.vx`: rotate left as a pair of signed shifts (NEON's
-    /// `ushl` shifts left for positive amounts and right for negative amounts) plus OR.
-    fn vector_rol(&mut self, vd: u8, vs2: u8, src: VSel) -> bool {
+    /// Zvbb rotates: a pair of signed shifts (NEON's `ushl` shifts left for positive
+    /// amounts and right for negative amounts) plus OR.
+    fn vector_rotate(&mut self, vd: u8, vs2: u8, src: VSel, left: bool) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
         let bits = bytes * 8;
         let regs = self.vec_regs;
-        if !matches!(src, VSel::X(_) | VSel::V(_)) {
+        if !matches!(src, VSel::I(_) | VSel::X(_) | VSel::V(_)) {
             return false;
         }
         // NEON's `ushl` reads a signed byte per lane: a positive amount shifts left and
-        // a negative one shifts right. Rotate left by `k` as
-        // `(x << k) | (x >> (bits - k))`, with the amount reduced modulo the element
-        // width first. `k - bits` is the negated right amount; when `k` is zero the
-        // out-of-range shift produces zero, which is what the empty right half needs.
+        // a negative one shifts right. The amount is reduced modulo the element width.
+        // Rotating left by `k` is `(x << k) | (x >> (bits - k))`; rotating right swaps
+        // the two halves. When `k` is zero, the out-of-range half shifts to zero.
         self.a.mov_imm(SRC0, u64::from(bits));
         self.a.vec_dup(FR, SRC0, bytes);
         for r in 0..regs {
@@ -1802,31 +1804,71 @@ impl Tx {
             if self.vec_last != Some(data) {
                 self.v_ldr(FA, data);
             }
-            match src {
-                VSel::X(rs1) => {
-                    let x = self.src(rs1, SRC0);
-                    self.a.mov_imm(SRC1, u64::from(bits - 1));
-                    self.a.and(SRC1, x, SRC1);
-                    self.a.vec_dup(FB, SRC1, bytes);
-                }
-                VSel::V(vs1) => {
-                    self.v_ldr(FB, (vs1 + r as u8) & 31);
-                    self.a.mov_imm(SRC0, u64::from(bits - 1));
-                    self.a.vec_dup(FC, SRC0, bytes);
-                    self.a.vec_and(FB, FB, FC);
-                }
-                _ => unreachable!("checked above"),
-            }
+            self.vector_amount(src, r as u8, bits, bytes, FB);
             self.a.vec_orr(FC, FA, FA);
-            self.a.vec_ushl(bits, FA, FA, FB);
-            self.a.vec_sub(bits, FB, FB, FR);
-            self.a.vec_ushl(bits, FC, FC, FB);
+            if left {
+                self.a.vec_ushl(bits, FA, FA, FB);
+                self.a.vec_sub(bits, FB, FB, FR);
+                self.a.vec_ushl(bits, FC, FC, FB);
+            } else {
+                self.a.vec_sub(bits, FB, FR, FB);
+                self.a.vec_ushl(bits, FC, FC, FB);
+                self.a.vec_sub(bits, FB, FB, FR);
+                self.a.vec_ushl(bits, FA, FA, FB);
+            }
             self.a.vec_orr(FA, FA, FC);
             self.v_str(FA, (vd + r as u8) & 31);
         }
         self.vec_last = if regs == 1 { Some(vd) } else { None };
         self.vec_m2 = None;
         true
+    }
+
+    /// `vsll.vi` / `vsll.vx` / `vsll.vv`: the amount is reduced modulo the element width
+    /// before NEON's signed per-lane shift sees it.
+    fn vector_sll(&mut self, vd: u8, vs2: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        let bits = bytes * 8;
+        let regs = self.vec_regs;
+        if !matches!(src, VSel::I(_) | VSel::X(_) | VSel::V(_)) {
+            return false;
+        }
+        for r in 0..regs {
+            let data = (vs2 + r as u8) & 31;
+            if self.vec_last != Some(data) {
+                self.v_ldr(FA, data);
+            }
+            self.vector_amount(src, r as u8, bits, bytes, FB);
+            self.a.vec_ushl(bits, FA, FA, FB);
+            self.v_str(FA, (vd + r as u8) & 31);
+        }
+        self.vec_last = if regs == 1 { Some(vd) } else { None };
+        self.vec_m2 = None;
+        true
+    }
+
+    /// Put a shift amount masked to `bits - 1` into `dst` for vector group `r`.
+    fn vector_amount(&mut self, src: VSel, r: u8, bits: u32, bytes: u32, dst: Reg) {
+        match src {
+            VSel::I(imm) => {
+                let k = (imm as u32) & (bits - 1);
+                self.a.mov_imm(SRC0, u64::from(k));
+                self.a.vec_dup(dst, SRC0, bytes);
+            }
+            VSel::X(rs1) => {
+                let x = self.src(rs1, SRC0);
+                self.a.mov_imm(SRC1, u64::from(bits - 1));
+                self.a.and(SRC1, x, SRC1);
+                self.a.vec_dup(dst, SRC1, bytes);
+            }
+            VSel::V(vs1) => {
+                self.v_ldr(dst, (vs1 + r) & 31);
+                self.a.mov_imm(SRC0, u64::from(bits - 1));
+                self.a.vec_dup(FC, SRC0, bytes);
+                self.a.vec_and(dst, dst, FC);
+            }
+            _ => unreachable!("only vector shift sources are passed here"),
+        }
     }
 
     /// The right shift for a prepared per-lane amount in `FB`.

@@ -1730,6 +1730,164 @@ mod tests {
     }
 
     #[test]
+    fn vector_sll_and_ror_match_the_interpreter() {
+        fn ror(x: u64, bits: u32, sh: u64) -> u64 {
+            let sh = (sh % u64::from(bits)) as u32;
+            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            ((x >> sh) | (x << ((bits - sh) % bits))) & mask
+        }
+        fn check(
+            prog: &[u32],
+            data: &dyn Fn(&GuestMemory),
+            init: &dyn Fn(&mut CpuState),
+        ) -> GuestMemory {
+            let mem_i = setup(prog);
+            data(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            init(&mut oracle);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(prog);
+            data(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            init(&mut cpu);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu.v, oracle.v, "vector register file");
+            assert_eq!(cpu, oracle);
+            assert_eq!(
+                jit.stats.interpreted.get("VArith"),
+                None,
+                "vsll/vror should stay in the JIT"
+            );
+            mem_j
+        }
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle =
+            |wf3: u32, vd: u32, rs1: u32| (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |wf3: u32, vs3: u32, rs1: u32| {
+            (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vx = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (rs1 << 15) | (0b100 << 12) | (vd << 7) | 0x57
+        };
+        let vi = |f6: u32, vd: u32, vs2: u32, imm: u32| {
+            (f6 << 26) | (1 << 25) | (vs2 << 20) | (imm << 15) | (0b011 << 12) | (vd << 7) | 0x57
+        };
+
+        let bytes: [u8; 16] = [
+            0x81, 0x12, 0x40, 0x01, 0xff, 0x80, 0x7f, 0xaa, 0x55, 0x0f, 0xf0, 0x13, 0x37, 0x99,
+            0xcc, 0x66,
+        ];
+        let byte_amounts: [u8; 16] = [1, 3, 7, 9, 15, 0, 2, 4, 6, 8, 10, 12, 14, 5, 11, 13];
+        let prog8 = [
+            vsetivli(0, 16, 0xc0),
+            vle(0b000, 1, 11),
+            vle(0b000, 2, 12),
+            vv(0b100101, 1, 1, 2),  // vsll.vv v1, v1, v2
+            vx(0b010100, 3, 1, 14), // vror.vx v3, v1, a4
+            vx(0b100101, 1, 1, 15), // vsll.vx v1, v1, a5
+            vi(0b010100, 4, 1, 13), // vror.vi v4, v1, 13
+            vi(0b100101, 5, 1, 2),  // vsll.vi v5, v1, 2
+            vse(0b000, 3, 13),
+            addi(13, 13, 16),
+            vse(0b000, 1, 13),
+            addi(13, 13, 16),
+            vse(0b000, 4, 13),
+            addi(13, 13, 16),
+            vse(0b000, 5, 13),
+            ECALL,
+        ];
+        let data8 = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &bytes).unwrap();
+            mem.write_privileged(DATA + 16, &byte_amounts).unwrap();
+        };
+        let init8 = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, 9), (15, 3)] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem = check(&prog8, &data8, &init8);
+        let shifted: Vec<u8> = bytes
+            .iter()
+            .zip(byte_amounts)
+            .map(|(&x, amount)| x.wrapping_shl(u32::from(amount & 7)))
+            .collect();
+        let mut row = [0u8; 16];
+        mem.read_privileged(DATA + 32, &mut row).unwrap();
+        for (i, &x) in shifted.iter().enumerate() {
+            assert_eq!(row[i], ror(u64::from(x), 8, 9) as u8, "e8 vror lane {i}");
+        }
+        mem.read_privileged(DATA + 48, &mut row).unwrap();
+        for (i, &x) in shifted.iter().enumerate() {
+            assert_eq!(row[i], x.wrapping_shl(3), "e8 vsll lane {i}");
+        }
+        mem.read_privileged(DATA + 64, &mut row).unwrap();
+        for (i, &x) in shifted.iter().enumerate() {
+            let x = x.wrapping_shl(3);
+            assert_eq!(row[i], ror(u64::from(x), 8, 13) as u8, "e8 vror.vi lane {i}");
+        }
+        mem.read_privileged(DATA + 80, &mut row).unwrap();
+        for (i, &x) in shifted.iter().enumerate() {
+            assert_eq!(row[i], x.wrapping_shl(3).wrapping_shl(2), "e8 vsll.vi lane {i}");
+        }
+
+        let words: [u32; 8] = [
+            0x8000_0001,
+            0x1234_5678,
+            0xdead_beef,
+            0xffff_ffff,
+            0x0102_0304,
+            0x7fff_ffff,
+            0x0000_0001,
+            0x89ab_cdef,
+        ];
+        let amounts: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let progm2 = [
+            vsetivli(0, 8, 0xd1),
+            vle(0b110, 10, 11),
+            vle(0b110, 12, 12),
+            vv(0b100101, 10, 10, 12), // vsll.vv m2
+            vx(0b010100, 14, 10, 14), // vror.vx m2
+            vse(0b110, 10, 13),
+            addi(13, 13, 32),
+            vse(0b110, 14, 13),
+            ECALL,
+        ];
+        let datam2 = |mem: &GuestMemory| {
+            for (i, &x) in words.iter().chain(amounts.iter()).enumerate() {
+                mem.write_privileged(DATA + 4 * i as u64, &x.to_le_bytes()).unwrap();
+            }
+        };
+        let initm2 = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 32), (13, DATA + 64), (14, 33)] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem = check(&progm2, &datam2, &initm2);
+        let shifted: Vec<u32> =
+            words.iter().zip(amounts).map(|(&x, amount)| x.wrapping_shl(amount & 31)).collect();
+        for (offset, want_ror) in [(64u64, false), (96, true)] {
+            let mut row = [0u8; 32];
+            mem.read_privileged(DATA + offset, &mut row).unwrap();
+            for (i, &x) in shifted.iter().enumerate() {
+                let got = u32::from_le_bytes(row[4 * i..4 * i + 4].try_into().unwrap());
+                let want = if want_ror { ror(u64::from(x), 32, 1) as u32 } else { x };
+                assert_eq!(got, want, "m2 lane {i}");
+            }
+        }
+    }
+
+    #[test]
     fn vector_arith_chain_reuses_the_previous_destination() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
