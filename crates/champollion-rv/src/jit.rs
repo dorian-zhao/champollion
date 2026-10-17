@@ -2019,6 +2019,93 @@ mod tests {
     }
 
     #[test]
+    fn vector_andn_matches_the_interpreter() {
+        fn check(
+            prog: &[u32],
+            data: &dyn Fn(&GuestMemory),
+            init: &dyn Fn(&mut CpuState),
+        ) -> GuestMemory {
+            let mem_i = setup(prog);
+            data(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            init(&mut oracle);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(prog);
+            data(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            init(&mut cpu);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle);
+            assert_eq!(jit.stats.interpreted.get("VArith"), None);
+            mem_j
+        }
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle =
+            |wf3: u32, vd: u32, rs1: u32| (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |wf3: u32, vs3: u32, rs1: u32| {
+            (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let vv = |vd: u32, vs2: u32, vs1: u32| {
+            (0b000001 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vx = |vd: u32, vs2: u32, rs1: u32| {
+            (0b000001 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (rs1 << 15)
+                | (0b100 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let bytes: [u8; 16] = [
+            0x81, 0x12, 0x40, 0x01, 0xff, 0x80, 0x7f, 0xaa, 0x55, 0x0f, 0xf0, 0x13, 0x37, 0x99,
+            0xcc, 0x66,
+        ];
+        let mask: [u8; 16] = [
+            0x0f, 0xf0, 0xaa, 0x55, 0x00, 0xff, 0x80, 0x7f, 0x33, 0xcc, 0x0f, 0xf0, 0x5a, 0xa5,
+            0x01, 0xfe,
+        ];
+        let prog = [
+            vsetivli(0, 16, 0xc0),
+            vle(0b000, 1, 11),
+            vle(0b000, 2, 12),
+            vv(3, 1, 2),
+            vx(4, 1, 14),
+            vse(0b000, 3, 13),
+            addi(13, 13, 16),
+            vse(0b000, 4, 13),
+            ECALL,
+        ];
+        let data = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &bytes).unwrap();
+            mem.write_privileged(DATA + 16, &mask).unwrap();
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, 0x0f)] {
+                cpu.set_x(r, v);
+            }
+        };
+        let mem = check(&prog, &data, &init);
+        let mut row = [0u8; 16];
+        mem.read_privileged(DATA + 32, &mut row).unwrap();
+        for i in 0..16 {
+            assert_eq!(row[i], bytes[i] & !mask[i], "vandn.vv lane {i}");
+        }
+        mem.read_privileged(DATA + 48, &mut row).unwrap();
+        for i in 0..16 {
+            assert_eq!(row[i], bytes[i] & !0x0f, "vandn.vx lane {i}");
+        }
+    }
+
+    #[test]
     fn vector_arith_chain_reuses_the_previous_destination() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57

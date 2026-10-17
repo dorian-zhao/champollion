@@ -1738,6 +1738,7 @@ impl Tx {
                 | VArithOp::Rsub
                 | VArithOp::Sub
                 | VArithOp::And
+                | VArithOp::Andn
                 | VArithOp::Or
                 | VArithOp::Xor
                 | VArithOp::Mul
@@ -1795,6 +1796,10 @@ impl Tx {
                     VArithOp::Sub => self.a.vec_sub(bits, FA, FA, FB),
                     VArithOp::Rsub => self.a.vec_sub(bits, FA, FB, FA),
                     VArithOp::And => self.a.vec_and(FA, FA, FB),
+                    VArithOp::Andn => {
+                        self.a.mvn16b(FB, FB);
+                        self.a.vec_and(FA, FA, FB);
+                    }
                     VArithOp::Or => self.a.vec_orr(FA, FA, FB),
                     VArithOp::Mul => self.a.vec_mul(bits, FA, FA, FB),
                     _ => self.a.vec_eor(FA, FA, FB),
