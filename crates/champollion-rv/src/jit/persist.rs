@@ -19,7 +19,10 @@ use super::fault::Site;
 use super::{Jit, translate};
 use crate::memory::GuestMemory;
 
-const MAGIC: &[u8; 8] = b"CHMPJIT3";
+/// Snapshot format and translation-semantics version. Bump it whenever generated code
+/// changes in a way an older snapshot would not match, even if the trampoline layout did
+/// not change.
+const MAGIC: &[u8; 8] = b"CHMPJIT4";
 
 impl Jit {
     /// Whether the translations so far can be saved (see the module docs).
