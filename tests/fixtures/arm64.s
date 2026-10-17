@@ -254,3 +254,5 @@ fneg v4.4s, v5.4s
 fneg v6.2d, v7.2d
 dup v8.4s, v9.s[0]
 dup v10.2d, v11.d[0]
+ldp q0, q1, [x2]
+stp q3, q4, [x5, #48]

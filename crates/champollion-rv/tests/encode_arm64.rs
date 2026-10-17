@@ -270,6 +270,8 @@ fn matches_assembler() {
     a.vec_fneg(64, 6, 7);
     a.vec_dup_lane0(32, 8, 9);
     a.vec_dup_lane0(64, 10, 11);
+    assert!(a.ldp_q_off(0, 1, 2, 0));
+    assert!(a.stp_q_off(3, 4, 5, 48));
     let len = a.code.len();
     assert!(!a.ldr_imm(Mem::U64, 0, 17, 32768));
     assert!(!a.str_imm(Mem::U8, 0, 17, -257));

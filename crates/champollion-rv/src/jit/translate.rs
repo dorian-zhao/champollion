@@ -298,6 +298,9 @@ struct Tx {
     /// The guest vector register currently held in `FA` after a translated `VArith`.
     /// Consecutive operations on the same destination can skip its next `ldr q`.
     vec_last: Option<u8>,
+    /// The guest m2 vector group currently held in `FA`/`FB`, when its two chunks can
+    /// survive a vector load/store or the macc family.
+    vec_m2: Option<u8>,
 }
 
 fn fp(w: FWidth) -> Fp {
@@ -462,10 +465,12 @@ impl Tx {
         if !matches!(
             inst,
             Inst::VArith { mask: false, .. }
+                | Inst::VFMa { mask: false, .. }
                 | Inst::VLoad { mask: false, .. }
                 | Inst::VStore { mask: false, .. }
         ) {
             self.vec_last = None;
+            self.vec_m2 = None;
         }
         match inst {
             Inst::Lui { rd, imm } => self.constant(rd, sext(imm)),
@@ -1443,11 +1448,6 @@ impl Tx {
         let Some((_, bytes)) = self.vec else {
             return false;
         };
-        // The base-register cache assumes the previous access left its masked base in
-        // ADDR and that `keeps_addr` held since; the vector arms below address memory
-        // through their own registers, so they neither trust a cached base nor leave one
-        // behind.
-        self.addr_base = None;
         match inst {
             Inst::VLoad { width, kind, vd, rs1, mask: false, nf: 0, .. }
                 if matches!(kind, VMemKind::Unit | VMemKind::FaultOnlyFirst)
@@ -1468,23 +1468,30 @@ impl Tx {
                     Access::Load
                 };
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.a.mov(SRC0, ADDR);
                 for r in 0..regs {
+                    let dst = if regs == 2 && r == 1 { FB } else { FA };
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, access));
-                            assert!(self.a.ldr_q_off(FA, SRC0, r * 16));
+                            assert!(self.a.ldr_q_off(dst, ADDR, r * 16));
                         }
                         None => {
-                            self.a.add_imm(ADDR, SRC0, r * 16);
+                            if r != 0 {
+                                self.a.add_imm(ADDR, ADDR, r * 16);
+                            }
                             self.accesses.push((self.a.pos(), pc, self.retired, access));
-                            self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg());
+                            self.a.ldr_q_reg(dst, self.base_reg(), self.index_reg());
                         }
                     }
-                    self.v_str(FA, (vd + r as u8) & 31);
+                    if regs != 2 {
+                        self.v_str(dst, (vd + r as u8) & 31);
+                    }
                 }
-                self.addr_base = None;
+                if regs == 2 {
+                    self.v_str2(FA, FB, vd);
+                }
                 self.vec_last = if regs == 1 { Some(vd) } else { None };
+                self.vec_m2 = if regs == 2 { Some(vd) } else { None };
                 true
             }
             // Whole-register moves carry `nf` 16-byte registers whatever vl and vtype
@@ -1493,47 +1500,60 @@ impl Tx {
             Inst::VLoad { kind: VMemKind::WholeRegister, vd, rs1, mask: false, nf, .. } => {
                 let n = u32::from(nf) + 1;
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.a.mov(SRC0, ADDR); // the guest address, kept across the v-file stores
                 for k in 0..n {
+                    let dst = if n == 2 && k == 1 { FB } else { FA };
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
-                            assert!(self.a.ldr_q_off(FA, SRC0, k * 16));
+                            assert!(self.a.ldr_q_off(dst, ADDR, k * 16));
                         }
                         None => {
-                            self.a.add_imm(ADDR, SRC0, k * 16);
+                            if k != 0 {
+                                self.a.add_imm(ADDR, ADDR, k * 16);
+                            }
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
-                            self.a.ldr_q_reg(FA, self.base_reg(), self.index_reg());
+                            self.a.ldr_q_reg(dst, self.base_reg(), self.index_reg());
                         }
                     }
-                    self.v_str(FA, (vd + k as u8) & 31);
+                    if n > 2 {
+                        self.v_str(dst, (vd + k as u8) & 31);
+                    }
                 }
-                self.addr_base = None;
+                if n == 1 {
+                    self.v_str(FA, vd);
+                } else if n == 2 {
+                    self.v_str2(FA, FB, vd);
+                }
                 self.vec_last = if n == 1 { Some(vd) } else { None };
+                self.vec_m2 = if n == 2 { Some(vd) } else { None };
                 true
             }
             Inst::VStore { kind: VStoreKind::WholeRegister, vs3, rs1, mask: false, nf, .. } => {
                 let n = u32::from(nf) + 1;
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.a.mov(SRC0, ADDR);
                 for k in 0..n {
-                    if n != 1 || self.vec_last != Some((vs3 + k as u8) & 31) {
-                        self.v_ldr(FA, (vs3 + k as u8) & 31);
+                    let src = if n == 2 && k == 1 { FB } else { FA };
+                    if !(n == 2 && self.vec_m2 == Some(vs3))
+                        && !(n == 1 && self.vec_last == Some((vs3 + k as u8) & 31))
+                    {
+                        self.v_ldr(src, (vs3 + k as u8) & 31);
                     }
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
-                            assert!(self.a.str_q_off(FA, SRC0, k * 16));
+                            assert!(self.a.str_q_off(src, ADDR, k * 16));
                         }
                         None => {
-                            self.a.add_imm(ADDR, SRC0, k * 16);
+                            if k != 0 {
+                                self.a.add_imm(ADDR, ADDR, k * 16);
+                            }
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
-                            self.a.str_q_reg(FA, self.base_reg(), self.index_reg());
+                            self.a.str_q_reg(src, self.base_reg(), self.index_reg());
                         }
                     }
                 }
-                self.addr_base = None;
                 self.vec_last = if n == 1 { Some(vs3) } else { None };
+                self.vec_m2 = if n == 2 { Some(vs3) } else { None };
                 true
             }
             Inst::VStore {
@@ -1541,25 +1561,29 @@ impl Tx {
             } if width.bytes() == u64::from(bytes) => {
                 let regs = self.vec_regs;
                 let operand = self.mem_operand(rs1, 0, 16);
-                self.a.mov(SRC0, ADDR);
                 for r in 0..regs {
-                    if regs != 1 || self.vec_last != Some((vs3 + r as u8) & 31) {
-                        self.v_ldr(FA, (vs3 + r as u8) & 31);
+                    let src = if regs == 2 && r == 1 { FB } else { FA };
+                    if !(regs == 2 && self.vec_m2 == Some(vs3))
+                        && (regs != 1 || self.vec_last != Some((vs3 + r as u8) & 31))
+                    {
+                        self.v_ldr(src, (vs3 + r as u8) & 31);
                     }
                     match operand {
                         Some(_) => {
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
-                            assert!(self.a.str_q_off(FA, SRC0, r * 16));
+                            assert!(self.a.str_q_off(src, ADDR, r * 16));
                         }
                         None => {
-                            self.a.add_imm(ADDR, SRC0, r * 16);
+                            if r != 0 {
+                                self.a.add_imm(ADDR, ADDR, r * 16);
+                            }
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
-                            self.a.str_q_reg(FA, self.base_reg(), self.index_reg());
+                            self.a.str_q_reg(src, self.base_reg(), self.index_reg());
                         }
                     }
                 }
-                self.addr_base = None;
                 self.vec_last = if regs == 1 { Some(vs3) } else { None };
+                self.vec_m2 = if regs == 2 { Some(vs3) } else { None };
                 true
             }
             _ => false,
@@ -1745,6 +1769,13 @@ impl Tx {
         }
         let bits = bytes * 8;
         let regs = self.vec_regs;
+        if regs == 2
+            && op == VFMaOp::Macc
+            && let VSel::F(rs1) = src
+        {
+            return self.vector_fma_m2_macc(vd, vs2, rs1, bytes);
+        }
+        self.vec_m2 = None;
         let vs1 = match src {
             VSel::F(rs1) => {
                 self.vector_fscalar(rs1, FB, bytes);
@@ -1802,6 +1833,29 @@ impl Tx {
             };
             self.v_str(out, (vd + r as u8) & 31);
         }
+        true
+    }
+
+    /// The e32/m2 `vfmacc.vf` shape: keep the two-q accumulator in FA/FB and broadcast
+    /// the scalar once into FR. The source group is one q register at a time in FC.
+    fn vector_fma_m2_macc(&mut self, vd: u8, vs2: u8, rs1: u8, bytes: u32) -> bool {
+        let bits = bytes * 8;
+        if self.vec_m2 != Some(vd) {
+            self.v_ldr2(FA, FB, vd);
+            self.vec_m2 = Some(vd);
+        }
+        self.vector_fscalar(rs1, FR, bytes);
+        for r in 0..2 {
+            let dst = if r == 0 { FA } else { FB };
+            let src = if vs2 == vd {
+                dst
+            } else {
+                self.v_ldr(FC, (vs2 + r as u8) & 31);
+                FC
+            };
+            self.a.vec_fmla(bits, dst, src, FR);
+        }
+        self.v_str2(FA, FB, vd);
         true
     }
 
@@ -2063,6 +2117,18 @@ impl Tx {
         assert!(self.a.str_q_off(src, CTX, v_offset(v)));
     }
 
+    /// Load an m2 group's two chunks with one `ldp q`.
+    fn v_ldr2(&mut self, first: Reg, second: Reg, v: u8) {
+        assert!(v_offset(v) + 16 <= 1008);
+        assert!(self.a.ldp_q_off(first, second, CTX, v_offset(v)));
+    }
+
+    /// Store an m2 group's two chunks with one `stp q`.
+    fn v_str2(&mut self, first: Reg, second: Reg, v: u8) {
+        assert!(v_offset(v) + 16 <= 1008);
+        assert!(self.a.stp_q_off(first, second, CTX, v_offset(v)));
+    }
+
     /// Zba word adds: `b + (zero-extended a << shift)`. In the ARM extended-register
     /// form register 31 reads as SP, not XZR, so a zero `b` cannot take the one-instruction
     /// form — the zero-extended source is the whole result then.
@@ -2304,7 +2370,9 @@ fn keeps_addr(inst: Inst) -> bool {
         | Inst::FCvtFromInt { .. }
         | Inst::FMvFromInt { .. }
         | Inst::FMvToInt { .. }
-        | Inst::FSgnj { .. } => true,
+        | Inst::FSgnj { .. }
+        | Inst::VFArith { .. }
+        | Inst::VFMa { .. } => true,
         _ => mem_base(inst).is_some(),
     }
 }
@@ -2688,6 +2756,7 @@ pub fn translate(
         fboxed: 0,
         edge: None,
         vec_last: None,
+        vec_m2: None,
     };
     // instret: add the number of instructions this block retires, up front. Every exit is
     // at the end of the block, so the count is static; this stays right under chaining.

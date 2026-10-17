@@ -937,6 +937,26 @@ impl Asm {
     pub fn str_q_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) {
         self.emit(0x3ca0_6800 | (rm as u32) << 16 | (rn as u32) << 5 | rt as u32);
     }
+    /// `ldp q, q, [xn, #offset]`: two adjacent 16-byte vector loads.
+    pub fn ldp_q_off(&mut self, rt: Reg, rt2: Reg, rn: Reg, offset: u32) -> bool {
+        if !offset.is_multiple_of(16) || offset > 1008 {
+            return false;
+        }
+        self.emit(
+            0xad40_0000 | (offset / 16) << 15 | (rt2 as u32) << 10 | (rn as u32) << 5 | rt as u32,
+        );
+        true
+    }
+    /// `stp q, q, [xn, #offset]`: the matching pair store.
+    pub fn stp_q_off(&mut self, rt: Reg, rt2: Reg, rn: Reg, offset: u32) -> bool {
+        if !offset.is_multiple_of(16) || offset > 1008 {
+            return false;
+        }
+        self.emit(
+            0xad00_0000 | (offset / 16) << 15 | (rt2 as u32) << 10 | (rn as u32) << 5 | rt as u32,
+        );
+        true
+    }
 
     /// The size field of the lane-wise integer ops: the element size in bits.
     const fn vec_size(size: u32) -> u32 {
