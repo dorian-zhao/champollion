@@ -663,6 +663,43 @@ mod tests {
     }
 
     #[test]
+    fn vector_half_conversions_match_the_interpreter() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let convert = |selector: u32, vd: u32, vs2: u32| {
+            (0b010010 << 26) | (1 << 25) | (vs2 << 20) | (selector << 15) | (vd << 7) | 0x57
+        };
+        let prog = [
+            vsetivli(0, 8, 0xc8), // e16, m1, ta, ma
+            convert(0x0c, 4, 2),  // vfwcvt.f.f.v v4, v2
+            convert(0x14, 6, 4),  // vfncvt.f.f.w v6, v4
+            ECALL,
+        ];
+        let init = |cpu: &mut CpuState| {
+            for (i, bits) in [0x3c00u16, 0xc000, 0x7c00, 0x7e00].into_iter().enumerate() {
+                cpu.v[2][2 * i..2 * i + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        };
+        let mem_i = setup(&prog);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        assert_eq!(jit.stats.interpreted.get("VFHalfConvert"), None);
+    }
+
+    #[test]
     fn vector_m2_groups_match_the_interpreter() {
         // The axpy shape clang emits for `a += s * b`: e32/m2 with whole-register
         // moves and a vfmacc.vf over the two-register group.

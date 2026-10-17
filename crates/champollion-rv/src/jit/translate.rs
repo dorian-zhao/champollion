@@ -630,6 +630,11 @@ impl Tx {
                     return false;
                 }
             }
+            Inst::VFHalfConvert { widening, vd, vs2, mask: false } => {
+                if !self.vector_half_convert(widening, vd, vs2, false) {
+                    return false;
+                }
+            }
             // vfslide1down.vf: like the integer slide, dropping the float scalar into
             // the freed top element. The up form stays on the interpreter until
             // something needs it.
@@ -1824,6 +1829,38 @@ impl Tx {
             }
             self.v_str(FA, (vd + r as u8) & 31);
         }
+        true
+    }
+
+    /// Zvfhmin's widening/narrowing f16↔f32 conversions at the pinned e16/m1 state.
+    /// The widening form writes a two-register destination group; the narrowing form
+    /// reads a two-register source group. Masked forms stay on the interpreter.
+    fn vector_half_convert(&mut self, widening: bool, vd: u8, vs2: u8, mask: bool) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if mask || bytes != 2 || self.vec_regs != 1 {
+            return false;
+        }
+        if widening {
+            if vd > 30 {
+                return false;
+            }
+            self.v_ldr(FA, vs2);
+            self.a.vec_fcvtl(FB, FA);
+            self.a.vec_fcvtl2(FC, FA);
+            self.v_str(FB, vd);
+            self.v_str(FC, vd + 1);
+        } else {
+            if vs2 > 30 || vd > 29 {
+                return false;
+            }
+            self.v_ldr(FA, vs2);
+            self.v_ldr(FB, vs2 + 1);
+            self.a.vec_fcvtn(FC, FA);
+            self.a.vec_fcvtn2(FC, FB);
+            self.v_str(FC, vd);
+        }
+        self.vec_last = None;
+        self.vec_m2 = None;
         true
     }
 

@@ -1099,6 +1099,22 @@ impl Asm {
         let imm5 = if size == 64 { 8 } else { 4 };
         self.emit(0x4e00_0400 | imm5 << 16 | (rn as u32) << 5 | rd as u32);
     }
+    /// `fcvtl v.4s, v.4h`: widen the low four f16 lanes.
+    pub fn vec_fcvtl(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x0e21_7800 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `fcvtl2 v.4s, v.8h`: widen the high four f16 lanes.
+    pub fn vec_fcvtl2(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e21_7800 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `fcvtn v.4h, v.4s`: narrow four f32 lanes into the low half.
+    pub fn vec_fcvtn(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x0e21_6800 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `fcvtn2 v.8h, v.4s`: narrow four f32 lanes into the high half.
+    pub fn vec_fcvtn2(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e21_6800 | (rn as u32) << 5 | rd as u32);
+    }
     /// `cmn wn, #imm` (sets flags for wn + imm).
     pub fn cmn_imm_w(&mut self, rn: Reg, imm: u32) {
         self.imm12(0x3100_0000, XZR, rn, imm);
@@ -1149,6 +1165,16 @@ mod tests {
         assert_eq!(logical_imm(u64::MAX, 64), None);
         assert_eq!(logical_imm(0x1234, 64), None);
         assert_eq!(logical_imm(0xffff_fffe, 32), Some((0, 31, 30)));
+    }
+
+    #[test]
+    fn half_conversions_match_assembler() {
+        let mut a = Asm::new();
+        a.vec_fcvtl(16, 17);
+        a.vec_fcvtl2(18, 17);
+        a.vec_fcvtn(19, 20);
+        a.vec_fcvtn2(19, 20);
+        assert_eq!(a.code, [0x0e21_7a30, 0x4e21_7a32, 0x0e21_6a93, 0x4e21_6a93]);
     }
 
     /// The architecture's `DecodeBitMasks` for a 64-bit operation.
