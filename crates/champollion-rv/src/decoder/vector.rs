@@ -405,6 +405,8 @@ fn decode_fp(
             0x03 => Ok(Inst::VFUnary { op: VFUnaryOp::FX, vd, vs2, mask }),
             0x06 => Ok(Inst::VFUnary { op: VFUnaryOp::RtzXuF, vd, vs2, mask }),
             0x07 => Ok(Inst::VFUnary { op: VFUnaryOp::RtzXF, vd, vs2, mask }),
+            0x0c => Ok(Inst::VFHalfConvert { widening: true, vd, vs2, mask }),
+            0x14 => Ok(Inst::VFHalfConvert { widening: false, vd, vs2, mask }),
             _ => Err(illegal(w)),
         },
         // vfmv.f.s: element 0 into f[rd].

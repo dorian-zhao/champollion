@@ -474,6 +474,13 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
             let rm = rounding(cpu, decoder::RM_DYN)?;
             vector::exec_funary(cpu, op, vd, vs2, mask, rm);
         }
+        Inst::VFHalfConvert { widening, vd, vs2, mask } => {
+            if vector::sew_bytes(cpu) != 2 {
+                return Err(Trap::IllegalInstruction { pc, err: DecodeError::Reserved });
+            }
+            let rm = rounding(cpu, decoder::RM_DYN)?;
+            vector::exec_half_convert(cpu, widening, vd, vs2, mask, rm);
+        }
         Inst::VFCmp { op, vd, vs2, src, mask } => {
             fp_sew(cpu, pc)?;
             vector::exec_fcmp(cpu, op, vd, vs2, src, mask);

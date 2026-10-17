@@ -2321,6 +2321,7 @@ fn is_vector(inst: Inst) -> bool {
             | Inst::VStore { .. }
             | Inst::VArith { .. }
             | Inst::VFSlide1 { .. }
+            | Inst::VFHalfConvert { .. }
             | Inst::VCmp { .. }
             | Inst::VMask { .. }
             | Inst::Vmv { .. }

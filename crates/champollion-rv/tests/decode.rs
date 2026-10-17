@@ -974,6 +974,8 @@ fn rv64v() {
         ("vfclass.v v1, v2", VFUnary { op: FUn::Class, vd: 1, vs2: 2, mask: false }),
         ("vfcvt.x.f.v v1, v2", VFUnary { op: FUn::XF, vd: 1, vs2: 2, mask: false }),
         ("vfcvt.rtz.xu.f.v v1, v2", VFUnary { op: FUn::RtzXuF, vd: 1, vs2: 2, mask: false }),
+        ("vfwcvt.f.f.v v1, v2", VFHalfConvert { widening: true, vd: 1, vs2: 2, mask: false }),
+        ("vfncvt.f.f.w v3, v4", VFHalfConvert { widening: false, vd: 3, vs2: 4, mask: false }),
         ("vmfeq.vv v1, v2, v3", VFCmp { op: FCm::Eq, vd: 1, vs2: 2, src: V(3), mask: false }),
         ("vmflt.vf v1, v2, fa0", VFCmp { op: FCm::Lt, vd: 1, vs2: 2, src: F(10), mask: false }),
         ("vfredosum.vs v1, v2, v3", VFRed { op: FRed::Osum, vd: 1, vs1: 3, vs2: 2 }),

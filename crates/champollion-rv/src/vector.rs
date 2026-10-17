@@ -707,6 +707,28 @@ pub fn exec_funary(cpu: &mut CpuState, op: VFUnaryOp, vd: u8, vs2: u8, mask: boo
     }
 }
 
+/// Zvfhmin's two conversions: `vfwcvt.f.f.v` reads f16 and writes f32, while
+/// `vfncvt.f.f.w` reads f32 and writes f16.
+pub fn exec_half_convert(cpu: &mut CpuState, widening: bool, vd: u8, vs2: u8, mask: bool, rm: Rm) {
+    let vl = cpu.vl;
+    for i in 0..vl {
+        if mask && !mask_get(cpu, 0, i) {
+            continue;
+        }
+        if widening {
+            let half = get_elem(cpu, vs2, i, 2) as u16;
+            let (single, flags) = fpu::f16_to_f32(half);
+            cpu.fcsr |= u32::from(flags);
+            set_elem(cpu, vd, i, 4, u64::from(single));
+        } else {
+            let single = get_elem(cpu, vs2, i, 4) as u32;
+            let (half, flags) = fpu::f32_to_f16(single, rm);
+            cpu.fcsr |= u32::from(flags);
+            set_elem(cpu, vd, i, 2, u64::from(half));
+        }
+    }
+}
+
 /// Mask-producing float compares. Like the integer form, masked-off bits clear.
 pub fn exec_fcmp(cpu: &mut CpuState, op: VFCmpOp, vd: u8, vs2: u8, src: VSel, mask: bool) {
     let vl = cpu.vl;
@@ -881,6 +903,19 @@ mod tests {
         set_elem(&mut c, 2, 0, 2, 0x0780);
         exec_narrow(&mut c, false, false, 1, 2, VSel::I(3));
         assert_eq!(get_elem(&c, 1, 0, 1), 0xf0);
+    }
+
+    #[test]
+    fn half_conversions_widen_and_narrow() {
+        let mut c = machine(1 << 3, 4); // e16, m1
+        load(&mut c, 2, &[0x3c00, 0xc000, 0x7c00, 0x7e00], 2);
+        exec_half_convert(&mut c, true, 1, 2, false, Rm::Rne);
+        assert_eq!(elems(&c, 1, 4, 4), [0x3f80_0000, 0xc000_0000, 0x7f80_0000, 0x7fc0_0000]);
+
+        let mut c = machine(1 << 3, 2); // e16, m1
+        load(&mut c, 2, &[0x3f80_0000, 0x4000_0000], 4);
+        exec_half_convert(&mut c, false, 1, 2, false, Rm::Rne);
+        assert_eq!(elems(&c, 1, 2, 2), [0x3c00, 0x4000]);
     }
 
     #[test]

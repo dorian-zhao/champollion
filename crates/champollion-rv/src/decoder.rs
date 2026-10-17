@@ -20,6 +20,7 @@
 /// - `Mop` (Zimop): writes zero to `rd`; `rs1`/`rs2` are ignored.
 /// - `Lr` / `Sc` / `Amo`: `aq`/`rl` are the acquire/release ordering bits. `Sc` writes 0 to
 ///   `rd` on success, nonzero on failure; `Amo` writes the old memory value to `rd`.
+/// - `VFHalfConvert`: Zvfhmin widens f16 to f32 or narrows f32 to f16; it requires e16.
 /// - F/D instructions: register numbers name `f` registers, except the base address of
 ///   loads/stores, the `x` destination of `FMvToInt`/`FCmp`/`FClass`/`FCvtToInt`, and the
 ///   `x` source of `FMvFromInt`/`FCvtFromInt`. `rm` is the raw rounding-mode field.
@@ -327,6 +328,13 @@ pub enum Inst {
     /// Single-source float ops: `vfsqrt.v`, `vfclass.v`, and the `vfcvt` family.
     VFUnary {
         op: VFUnaryOp,
+        vd: u8,
+        vs2: u8,
+        mask: bool,
+    },
+    /// Zvfhmin float conversion between f16 and f32.
+    VFHalfConvert {
+        widening: bool,
         vd: u8,
         vs2: u8,
         mask: bool,
