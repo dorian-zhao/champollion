@@ -134,9 +134,9 @@ For a release-only install (no checkout), the full walkthrough with the
 download command, Docker bind mounts, hash verification, and troubleshooting is
 in the [OrbStack guide](https://champollion.aqeo.dev/start/orbstack/).
 
-OrbStack is recommended for most users because it avoids a VM boot and image
-unpack on every run, keeps images warm, and uses the Docker workflow people
-already have. `rvcontainer` remains useful for an Apple-only
+OrbStack is recommended for most users because it avoids starting a VM and
+unpacking the image on every run, reuses existing image caches, and follows the
+standard Docker workflow. `rvcontainer` remains useful for an Apple-only
 Virtualization.framework stack or for testing the launcher itself.
 
 ### Alternative on macOS: `rvcontainer`
