@@ -753,6 +753,16 @@ impl Asm {
     pub fn umov_d1(&mut self, rd: Reg, vn: Reg) {
         self.emit(0x4e18_3c00 | (vn as u32) << 5 | rd as u32);
     }
+    /// `umov wd, vn.s[lane]`.
+    pub fn vec_umov_s(&mut self, rd: Reg, vn: Reg, lane: u32) {
+        assert!(lane < 4);
+        self.emit(0x0e04_3c00 | lane << 19 | (vn as u32) << 5 | rd as u32);
+    }
+    /// `umov xd, vn.d[lane]`.
+    pub fn vec_umov_d(&mut self, rd: Reg, vn: Reg, lane: u32) {
+        assert!(lane < 2);
+        self.emit(0x4e08_3c00 | lane << 20 | (vn as u32) << 5 | rd as u32);
+    }
     /// `extr rd, rn, rm, #lsb`: a 128-bit right shift's low word.
     pub fn extr(&mut self, rd: Reg, rn: Reg, rm: Reg, lsb: u32) {
         assert!(lsb < 64);

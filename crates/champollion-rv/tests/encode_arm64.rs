@@ -145,6 +145,8 @@ fn matches_assembler() {
     a.vec_xtn(16, 21, 22);
     a.vec_xtn(32, 23, 24);
     a.vec_xtn(64, 25, 26);
+    a.vec_umov_s(27, 28, 3);
+    a.vec_umov_d(29, 30, 1);
     a.fp_arith(FpOp::Add, Fp::S, 16, 17, 18);
     a.fp_arith(FpOp::Sub, Fp::D, 16, 17, 18);
     a.fp_arith(FpOp::Mul, Fp::S, 19, 20, 21);

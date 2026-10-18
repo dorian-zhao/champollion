@@ -34,8 +34,8 @@ use super::arm64::{Asm, AtomicOp, Cond, FmaKind, Fp, FpOp, FpRound, Mem, Reg, XZ
 use crate::cpu::CpuState;
 use crate::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, FArithOp, FCmpOp, FWidth, FmaOp, Inst,
-    IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VFArithOp, VFMaOp, VMaskOp,
-    VMemKind, VRedOp, VSel, VSetKind, VStoreKind, VUnaryOp,
+    IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VFArithOp, VFMaOp, VFRedOp,
+    VMaskOp, VMemKind, VRedOp, VSel, VSetKind, VStoreKind, VUnaryOp,
 };
 use crate::memory::{
     CONTROL_OFFSET, FAST_RANGE_COUNT, FAST_RANGE_STRIDE, FAST_RANGES_OFFSET, GUARD_SIZE, GUEST_SIZE,
@@ -682,6 +682,11 @@ impl Tx {
             }
             Inst::VFMa { op, vd, vs2, src, mask: false } => {
                 if !self.vector_fma(op, vd, vs2, src, false) {
+                    return false;
+                }
+            }
+            Inst::VFRed { op, vd, vs1, vs2 } => {
+                if !self.vector_fred(op, vd, vs1, vs2) {
                     return false;
                 }
             }
@@ -2898,6 +2903,40 @@ impl Tx {
         true
     }
 
+    /// `vfredusum`/`vfredosum`: seed element 0 plus the source lanes, folded left to
+    /// right. At m1 f32 has four lanes and f64 two, so scalar FADD is both simple and
+    /// matches the ordered semantics.
+    fn vector_fred(&mut self, op: VFRedOp, vd: u8, vs1: u8, vs2: u8) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if self.vec_regs != 1
+            || !matches!(bytes, 4 | 8)
+            || !matches!(op, VFRedOp::Usum | VFRedOp::Osum)
+        {
+            return false;
+        }
+        let (fp, lanes) = if bytes == 4 { (Fp::S, 4) } else { (Fp::D, 2) };
+        self.v_ldr(FA, vs1);
+        self.v_ldr(FB, vs2);
+        self.a.fmov_to_gpr(fp, SRC0, FA);
+        self.a.fmov_from_gpr(fp, FA, SRC0);
+        for i in 0..lanes {
+            if bytes == 4 {
+                self.a.vec_umov_s(SRC0, FB, i);
+                self.a.fmov_from_gpr(Fp::S, FC, SRC0);
+            } else {
+                self.a.vec_umov_d(SRC0, FB, i);
+                self.a.fmov_from_gpr(Fp::D, FC, SRC0);
+            }
+            self.a.fp_arith(FpOp::Add, fp, FA, FA, FC);
+        }
+        self.a.fmov_to_gpr(fp, SRC0, FA);
+        self.v_ldr(FB, vd);
+        self.a.fmov_from_gpr(fp, FA, SRC0);
+        self.a.vec_ins_lane0(bytes, FB, FA);
+        self.v_str(FB, vd);
+        true
+    }
+
     /// The e32/m2 `vfmacc.vf` shape: keep the two-q accumulator in FA/FB and broadcast
     /// the scalar with the by-element form of FMLA. Two groups can stay resident (one
     /// in each pair of scratch registers), which is exactly the load/load/macc/store
@@ -3440,6 +3479,7 @@ fn is_vector(inst: Inst) -> bool {
         Inst::VLoad { .. }
             | Inst::VStore { .. }
             | Inst::VArith { .. }
+            | Inst::VFRed { .. }
             | Inst::VFSlide1 { .. }
             | Inst::VFHalfConvert { .. }
             | Inst::VCmp { .. }

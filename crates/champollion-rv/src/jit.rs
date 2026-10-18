@@ -2352,6 +2352,66 @@ mod tests {
     }
 
     #[test]
+    fn vfred_ordered_sums_stay_in_the_jit() {
+        fn check(vtype: u32, avl: u32, wf3: u32, f6: u32, data: [u8; 16], seed: [u8; 16]) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vfred = |f6: u32, vd: u32, vs1: u32, vs2: u32| {
+                (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+            };
+            let prog = [vsetivli(0, avl, vtype), vfred(f6, 3, 2, 1), vse(wf3, 3, 12), ECALL];
+            let mem_i = setup(&prog);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(12, DATA + 0x200);
+            oracle.v[1] = data;
+            oracle.v[2] = seed;
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(12, DATA + 0x200);
+            cpu.v[1] = data;
+            cpu.v[2] = seed;
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "vfred state");
+            assert_eq!(jit.stats.interpreted.get("VFRed"), None, "vfred stays in the JIT");
+            let mut a = [0u8; 16];
+            let mut b = [0u8; 16];
+            mem_j.read_privileged(DATA + 0x200, &mut a).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut b).unwrap();
+            assert_eq!(a, b, "vfred result");
+        }
+
+        let f32_data = [1.5f32, -2.25, 3.75, 0.5]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .chain([0u8; 0])
+            .collect::<Vec<_>>();
+        let mut f32_data_arr = [0u8; 16];
+        f32_data_arr.copy_from_slice(&f32_data);
+        let mut f32_seed = [0u8; 16];
+        f32_seed[..4].copy_from_slice(&7.0f32.to_le_bytes());
+        let mut f64_data = [0u8; 16];
+        f64_data[..8].copy_from_slice(&1.25f64.to_le_bytes());
+        f64_data[8..].copy_from_slice(&(-3.5f64).to_le_bytes());
+        let mut f64_seed = [0u8; 16];
+        f64_seed[..8].copy_from_slice(&2.0f64.to_le_bytes());
+        check(0xd0, 4, 6, 1, f32_data_arr, f32_seed); // vfredusum f32
+        check(0xd0, 4, 6, 3, f32_data_arr, f32_seed); // vfredosum f32
+        check(0xd8, 2, 7, 1, f64_data, f64_seed); // vfredusum f64
+        check(0xd8, 2, 7, 3, f64_data, f64_seed); // vfredosum f64
+    }
+
+    #[test]
     fn m4_and_m8_arithmetic_stay_in_the_jit() {
         fn check(vtype: u32, avl: u32, wf3: u32, bytes: usize) {
             let vsetivli = |rd: u32, avl: u32, vtype: u32| {
