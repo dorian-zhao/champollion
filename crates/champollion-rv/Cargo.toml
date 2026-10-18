@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-champollion-softfloat = { version = "0.1.0", path = "../softfloat" }
+champollion-softfloat = { version = "0.1.1", path = "../softfloat" }
 gdbstub = "0.7"
 gdbstub_arch = "0.3"
 libc = "0.2.190"
