@@ -650,6 +650,16 @@ impl Tx {
                     return false;
                 }
             }
+            Inst::VMacc { add, vd, vs2, src } => {
+                if !self.vector_macc(add, vd, vs2, src) {
+                    return false;
+                }
+            }
+            Inst::VExt { sext, narrow, vd, vs2 } => {
+                if !self.vector_ext(sext, u32::from(narrow), vd, vs2) {
+                    return false;
+                }
+            }
             Inst::VMask { op, vd, vs1, vs2 } => {
                 if !self.vector_mask(op, vd, vs1, vs2) {
                     return false;
@@ -2189,6 +2199,46 @@ impl Tx {
         self.a.fmov_from_gpr(if bytes == 8 { Fp::D } else { Fp::S }, FA, SRC0);
         self.a.vec_ins_lane0(bytes, FB, FA);
         self.v_str(FB, vd);
+        true
+    }
+
+    /// `vmacc` (`vd += vs2*src`) and `vmadd` (`vd = src*vd + vs2`) at m1.
+    fn vector_macc(&mut self, add: bool, vd: u8, vs2: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if self.vec_regs != 1 || bytes == 8 {
+            return false;
+        }
+        self.v_ldr(FA, vd);
+        self.v_ldr(FB, vs2);
+        if !self.vector_operand(src, FC, bytes) {
+            return false;
+        }
+        if add {
+            self.a.vec_mla(bytes * 8, FA, FB, FC);
+            self.v_str(FA, vd);
+        } else {
+            self.a.vec_mla(bytes * 8, FB, FA, FC);
+            self.v_str(FB, vd);
+        }
+        true
+    }
+
+    /// `vsext`/`vzext`: widen the low SEW/narrow bits of every element.
+    fn vector_ext(&mut self, sext: bool, narrow: u32, vd: u8, vs2: u8) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if self.vec_regs != 1 || !matches!(narrow, 2 | 4 | 8) {
+            return false;
+        }
+        let mut bits = bytes * 8 / narrow;
+        if !matches!(bits, 8 | 16 | 32) {
+            return false;
+        }
+        self.v_ldr(FA, vs2);
+        while bits < bytes * 8 {
+            self.a.vec_shift_long(sext, bits, FA, FA);
+            bits *= 2;
+        }
+        self.v_str(FA, vd);
         true
     }
 

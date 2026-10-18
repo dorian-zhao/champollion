@@ -124,6 +124,15 @@ addv b28, v29.16b
 addv h30, v31.8h
 addv s28, v29.4s
 addp d30, v31.2d
+mla v20.16b, v21.16b, v22.16b
+mla v23.8h, v24.8h, v25.8h
+mla v26.4s, v27.4s, v28.4s
+sshll v20.8h, v21.8b, #0
+ushll v22.8h, v23.8b, #0
+sshll v24.4s, v25.4h, #0
+ushll v26.4s, v27.4h, #0
+sshll v28.2d, v29.2s, #0
+ushll v30.2d, v31.2s, #0
 fadd s16, s17, s18
 fsub d16, d17, d18
 fmul s19, s20, s21

@@ -2028,6 +2028,168 @@ mod tests {
     }
 
     #[test]
+    fn vmacc_ops_stay_in_the_jit() {
+        fn check(wf3: u32, vtype: u32, avl: u32, data: Vec<u8>) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vle = |wf3: u32, vd: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+                (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+            };
+            let vx = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
+                (f6 << 26)
+                    | (1 << 25)
+                    | (vs2 << 20)
+                    | (rs1 << 15)
+                    | (0b100 << 12)
+                    | (vd << 7)
+                    | 0x57
+            };
+            let prog = [
+                vsetivli(0, avl, vtype),
+                vle(wf3, 1, 11),
+                vle(wf3, 2, 12),
+                vle(wf3, 3, 13),
+                vle(wf3, 4, 13),
+                vle(wf3, 5, 13),
+                vle(wf3, 6, 13),
+                vv(0b101101, 3, 1, 2),  // vmacc.vv v3, v1, v2
+                vv(0b101001, 4, 1, 2),  // vmadd.vv v4, v1, v2
+                vx(0b101101, 5, 1, 15), // vmacc.vx v5, v1, a5
+                vx(0b101001, 6, 1, 15), // vmadd.vx v6, v1, a5
+                vse(wf3, 3, 14),
+                addi(14, 14, 16),
+                vse(wf3, 4, 14),
+                addi(14, 14, 16),
+                vse(wf3, 5, 14),
+                addi(14, 14, 16),
+                vse(wf3, 6, 14),
+                ECALL,
+            ];
+            let fill = |mem: &GuestMemory| {
+                mem.write_privileged(DATA, &data).unwrap();
+            };
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            for (r, v) in
+                [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, DATA + 0x200), (15, 3)]
+            {
+                oracle.set_x(r, v);
+            }
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            for (r, v) in
+                [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, DATA + 0x200), (15, 3)]
+            {
+                cpu.set_x(r, v);
+            }
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "vmacc state");
+            assert_eq!(jit.stats.interpreted.get("VMacc"), None, "vmacc stays in the JIT");
+            let mut got_bytes = [0u8; 64];
+            let mut want_bytes = [0u8; 64];
+            let n = 16 * 4;
+            mem_j.read_privileged(DATA + 0x200, &mut got_bytes[..n]).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut want_bytes[..n]).unwrap();
+            assert_eq!(got_bytes[..n], want_bytes[..n], "vmacc result");
+        }
+
+        let e8: Vec<u8> = (0u8..48).map(|i| i.wrapping_mul(29).wrapping_add(3)).collect();
+        let e16: Vec<u8> = (0u16..24)
+            .map(|i| i.wrapping_mul(9001).wrapping_add(5))
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let e32: Vec<u8> = (0u32..12)
+            .map(|i| i.wrapping_mul(0x4000_0001).wrapping_add(7))
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        check(0, 0xc0, 16, e8);
+        check(5, 0xc8, 8, e16);
+        check(6, 0xd0, 4, e32);
+    }
+
+    #[test]
+    fn vext_ops_stay_in_the_jit() {
+        fn check(wf3: u32, vtype: u32, avl: u32, width_code: u32, sext: bool, data: Vec<u8>) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vle = |wf3: u32, vd: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vs1 = (width_code << 1) | u32::from(sext);
+            let vext = |vd: u32, vs2: u32| {
+                (0b010010 << 26)
+                    | (1 << 25)
+                    | (vs2 << 20)
+                    | (vs1 << 15)
+                    | (0b010 << 12)
+                    | (vd << 7)
+                    | 0x57
+            };
+            let prog =
+                [vsetivli(0, avl, vtype), vle(wf3, 1, 11), vext(2, 1), vse(wf3, 2, 12), ECALL];
+            let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data).unwrap();
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(11, DATA);
+            oracle.set_x(12, DATA + 0x200);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 0x200);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "vext state");
+            assert_eq!(jit.stats.interpreted.get("VExt"), None, "vext stays in the JIT");
+            let mut got_bytes = [0u8; 16];
+            let mut want_bytes = [0u8; 16];
+            mem_j.read_privileged(DATA + 0x200, &mut got_bytes).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut want_bytes).unwrap();
+            assert_eq!(got_bytes, want_bytes, "vext result");
+        }
+
+        let data: Vec<u8> = vec![
+            0x80, 0x7f, 0xff, 0x01, 0x00, 0xaa, 0x55, 0xc3, 0x3c, 0xfe, 0x02, 0x81, 0x10, 0xef,
+            0x71, 0x8e,
+        ];
+        for sext in [false, true] {
+            check(5, 0xc8, 8, 3, sext, data.clone()); // e16 <- e8
+            check(6, 0xd0, 4, 2, sext, data.clone()); // e32 <- e8
+            check(6, 0xd0, 4, 3, sext, data.clone()); // e32 <- e16
+            check(7, 0xd8, 2, 3, sext, data.clone()); // e64 <- e32
+            check(7, 0xd8, 2, 2, sext, data.clone()); // e64 <- e16
+            check(7, 0xd8, 2, 1, sext, data.clone()); // e64 <- e8
+        }
+    }
+
+    #[test]
     fn vector_shift_sub_mul_match_the_interpreter() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57

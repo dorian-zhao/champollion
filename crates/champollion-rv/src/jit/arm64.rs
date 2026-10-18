@@ -1132,6 +1132,24 @@ impl Asm {
             0x4e20_9c00 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
         );
     }
+    /// `mla vd, vn, vm`: `vd += vn * vm` at 8/16/32-bit lanes.
+    pub fn vec_mla(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        assert!(matches!(size, 8 | 16 | 32), "vector mla has no {size}-bit form");
+        self.emit(
+            0x4e20_9400 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// `sshll`/`ushll vd, vn, #0`: widen each source lane.
+    pub fn vec_shift_long(&mut self, signed: bool, from_bits: u32, rd: Reg, rn: Reg) {
+        let size = match from_bits {
+            8 => 0x0008_0000,
+            16 => 0x0010_0000,
+            32 => 0x0020_0000,
+            _ => panic!("shift-long has no {from_bits}-bit source"),
+        };
+        let sign = if signed { 0x0f00_0000 } else { 0x2f00_0000 };
+        self.emit(sign | 0x0000_a400 | size | (rn as u32) << 5 | rd as u32);
+    }
     /// `umin vd.8h/4s, vn, vm`: unsigned lane-wise minimum.
     pub fn vec_umin(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
         self.emit(
@@ -1274,6 +1292,15 @@ pub fn encode_branch_to(word: u32, delta: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_long_encodings() {
+        let mut a = Asm::new();
+        a.vec_shift_long(true, 8, 20, 21);
+        a.vec_shift_long(false, 8, 22, 23);
+        a.vec_shift_long(true, 16, 24, 25);
+        assert_eq!(a.code, [0x0f08_a6b4, 0x2f08_a6f6, 0x0f10_a738]);
+    }
 
     #[test]
     fn logical_immediates() {
