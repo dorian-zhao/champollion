@@ -2451,7 +2451,7 @@ mod tests {
 
     #[test]
     fn vnarrow_stays_in_the_jit() {
-        fn check(vtype: u32, avl: u32, wf3: u32, f6: u32, source: [[u8; 16]; 2]) {
+        fn check(vtype: u32, avl: u32, wf3: u32, f6: u32, source: [[u8; 16]; 2], masked: bool) {
             let vsetivli = |rd: u32, avl: u32, vtype: u32| {
                 (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
             };
@@ -2460,7 +2460,7 @@ mod tests {
             };
             let vn = |f6: u32, vd: u32, vs2: u32, imm: u32| {
                 (f6 << 26)
-                    | (1 << 25)
+                    | (u32::from(!masked) << 25)
                     | (vs2 << 20)
                     | (imm << 15)
                     | (0b011 << 12)
@@ -2473,6 +2473,11 @@ mod tests {
             oracle.set_x(12, DATA + 0x200);
             oracle.v[1] = source[0];
             oracle.v[2] = source[1];
+            oracle.v[3] = [0xa5; 16];
+            oracle.v[0] = [
+                0x03, 0x5a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff,
+            ];
             let want = loop {
                 if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
                     break t;
@@ -2483,6 +2488,11 @@ mod tests {
             cpu.set_x(12, DATA + 0x200);
             cpu.v[1] = source[0];
             cpu.v[2] = source[1];
+            cpu.v[3] = [0xa5; 16];
+            cpu.v[0] = [
+                0x03, 0x5a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff,
+            ];
             let mut jit = Jit::new().unwrap();
             let got = jit.run(&mut cpu, &mem_j);
             assert_eq!(got, want);
@@ -2513,10 +2523,14 @@ mod tests {
                 *b = (r * 16 + i).wrapping_mul(41).wrapping_add(5) as u8;
             }
         }
-        check(0xc0, 16, 0, 0x2c, s8); // vnsrl.vi e8
-        check(0xc0, 16, 0, 0x2d, s8); // vnsra.vi e8
-        check(0xc8, 8, 5, 0x2c, s16); // vnsrl.vi e16
-        check(0xd0, 4, 6, 0x2c, s32); // vnsrl.vi e32
+        check(0xc0, 16, 0, 0x2c, s8, false); // vnsrl.vi e8
+        check(0xc0, 16, 0, 0x2d, s8, false); // vnsra.vi e8
+        check(0xc8, 8, 5, 0x2c, s16, false); // vnsrl.vi e16
+        check(0xd0, 4, 6, 0x2c, s32, false); // vnsrl.vi e32
+        check(0xc0, 16, 0, 0x2c, s8, true); // vnsrl.vi e8, v0.t
+        check(0xc0, 16, 0, 0x2d, s8, true); // vnsra.vi e8, v0.t
+        check(0xc8, 8, 5, 0x2c, s16, true); // vnsrl.vi e16, v0.t
+        check(0xd0, 4, 6, 0x2c, s32, true); // vnsrl.vi e32, v0.t
     }
 
     #[test]

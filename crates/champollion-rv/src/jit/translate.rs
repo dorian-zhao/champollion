@@ -2344,7 +2344,10 @@ impl Tx {
     /// `vnsrl.vi`/`vnsra.vi`: shift the m2 source and narrow it into one m1 register.
     fn vector_narrow(&mut self, sra: bool, mask: bool, vd: u8, vs2: u8, src: VSel) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
-        if mask || self.vec_regs != 1 || !matches!(bytes, 1 | 2 | 4) {
+        if self.vec_regs != 1 || !matches!(bytes, 1 | 2 | 4) {
+            return false;
+        }
+        if mask && vd == 0 {
             return false;
         }
         let VSel::I(imm) = src else { return false };
@@ -2366,7 +2369,16 @@ impl Tx {
         self.a.vec_xtn(wide_bits, FA, FA);
         self.a.vec_xtn(wide_bits, FB, FB);
         self.a.vec_ins_last(FA, FB, 8);
-        self.v_str(FA, vd);
+        if mask {
+            // The source group is dead now, so FB can hold the old destination.
+            self.v_ldr(FB, vd);
+            self.vector_mask_expand(bytes);
+            self.a.vec_bit(FB, FA, FR);
+            self.v_str(FB, vd);
+            self.vec_last = None;
+        } else {
+            self.v_str(FA, vd);
+        }
         true
     }
 
