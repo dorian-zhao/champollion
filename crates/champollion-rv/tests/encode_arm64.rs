@@ -126,6 +126,12 @@ fn matches_assembler() {
     a.vec_uaddlp(8, 22, 23);
     a.vec_uaddlp(16, 24, 25);
     a.vec_uaddlp(32, 26, 27);
+    a.vec_ins_lane0(1, 28, 29);
+    a.vec_ins_lane0(2, 30, 31);
+    a.vec_addv(8, 28, 29);
+    a.vec_addv(16, 30, 31);
+    a.vec_addv(32, 28, 29);
+    a.vec_addp_d(30, 31);
     a.fp_arith(FpOp::Add, Fp::S, 16, 17, 18);
     a.fp_arith(FpOp::Sub, Fp::D, 16, 17, 18);
     a.fp_arith(FpOp::Mul, Fp::S, 19, 20, 21);

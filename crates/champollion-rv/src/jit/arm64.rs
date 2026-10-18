@@ -1147,6 +1147,25 @@ impl Asm {
     pub fn vec_ins_s0(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x6e04_0400 | (rn as u32) << 5 | rd as u32);
     }
+    /// Insert lane 0 of `rn` into lane 0 of `rd` at the given element size in bytes.
+    pub fn vec_ins_lane0(&mut self, bytes: u32, rd: Reg, rn: Reg) {
+        assert!(matches!(bytes, 1 | 2 | 4 | 8), "element size {bytes}");
+        self.emit(0x6e00_0400 | bytes << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// Horizontal add: `addv b/h/s`, reducing 16b/8h/4s to lane 0.
+    pub fn vec_addv(&mut self, bits: u32, rd: Reg, rn: Reg) {
+        let size = match bits {
+            8 => 0x0000_0000,
+            16 => 0x0040_0000,
+            32 => 0x0080_0000,
+            _ => panic!("addv has no {bits}-bit form"),
+        };
+        self.emit(0x4e31_b800 | size | (rn as u32) << 5 | rd as u32);
+    }
+    /// `addp d, v.2d`: add the two 64-bit lanes.
+    pub fn vec_addp_d(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x5ef1_b800 | (rn as u32) << 5 | rd as u32);
+    }
     /// `.4s` vs `.2d` for the float vector ops: bit 22 of the size field.
     const fn fp_size(size: u32) -> u32 {
         if size == 64 { 0x0040_0000 } else { 0 }

@@ -35,7 +35,7 @@ use crate::cpu::CpuState;
 use crate::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, FArithOp, FCmpOp, FWidth, FmaOp, Inst,
     IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VFArithOp, VFMaOp, VMaskOp,
-    VMemKind, VSel, VSetKind, VStoreKind, VUnaryOp,
+    VMemKind, VRedOp, VSel, VSetKind, VStoreKind, VUnaryOp,
 };
 use crate::memory::{
     CONTROL_OFFSET, FAST_RANGE_COUNT, FAST_RANGE_STRIDE, FAST_RANGES_OFFSET, GUARD_SIZE, GUEST_SIZE,
@@ -642,6 +642,11 @@ impl Tx {
             }
             Inst::VUnary { op, mask, vd, vs2 } => {
                 if !self.vector_unary(op, mask, vd, vs2) {
+                    return false;
+                }
+            }
+            Inst::VRed { op, vd, vs1, vs2 } => {
+                if !self.vector_red(op, vd, vs1, vs2) {
                     return false;
                 }
             }
@@ -2089,6 +2094,102 @@ impl Tx {
         self.a.vec_tbl(FC, FB, FR);
         self.a.vec_shl_16b(r, r, 4);
         self.a.vec_orr(r, r, FC);
+    }
+
+    /// The bitwise and sum reductions at m1 with a full `vl`.
+    fn vector_red(&mut self, op: VRedOp, vd: u8, vs1: u8, vs2: u8) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if self.vec_regs != 1 {
+            return false;
+        }
+        self.v_ldr(FA, vs2);
+        self.v_ldr(FB, vd);
+        self.v_ldr(FR, vs1);
+        match bytes {
+            1 | 2 | 4 | 8 => {}
+            _ => unreachable!(),
+        }
+        if op == VRedOp::Sum {
+            match bytes {
+                1 | 2 | 4 => {
+                    self.a.vec_addv(bytes * 8, FA, FA);
+                    self.a.fmov_to_gpr(Fp::S, SRC0, FA);
+                }
+                8 => {
+                    self.a.vec_addp_d(FA, FA);
+                    self.a.fmov_to_gpr(Fp::D, SRC0, FA);
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let shifts: &[u32] = match bytes {
+                1 => &[8, 4, 2, 1],
+                2 => &[8, 4, 2],
+                4 => &[8, 4],
+                8 => &[8],
+                _ => unreachable!(),
+            };
+            for &imm in shifts {
+                self.a.vec_ext(FC, FA, FA, imm);
+                match op {
+                    VRedOp::And => self.a.vec_and(FA, FA, FC),
+                    VRedOp::Or => self.a.vec_orr(FA, FA, FC),
+                    VRedOp::Xor => self.a.vec_eor(FA, FA, FC),
+                    VRedOp::Sum => unreachable!(),
+                }
+            }
+            self.a.fmov_to_gpr(if bytes == 8 { Fp::D } else { Fp::S }, SRC0, FA);
+        }
+        self.a.fmov_to_gpr(if bytes == 8 { Fp::D } else { Fp::S }, SRC1, FR);
+        match bytes {
+            1 => {
+                self.a.and_imm(SRC0, SRC0, 0xff).unwrap();
+                self.a.and_imm(SRC1, SRC1, 0xff).unwrap();
+                match op {
+                    VRedOp::Sum => {
+                        self.a.add(SRC0, SRC0, SRC1);
+                        self.a.and_imm(SRC0, SRC0, 0xff).unwrap();
+                    }
+                    VRedOp::And => self.a.and(SRC0, SRC0, SRC1),
+                    VRedOp::Or => self.a.orr(SRC0, SRC0, SRC1),
+                    VRedOp::Xor => self.a.eor(SRC0, SRC0, SRC1),
+                }
+            }
+            2 => {
+                self.a.and_imm(SRC0, SRC0, 0xffff).unwrap();
+                self.a.and_imm(SRC1, SRC1, 0xffff).unwrap();
+                match op {
+                    VRedOp::Sum => {
+                        self.a.add(SRC0, SRC0, SRC1);
+                        self.a.and_imm(SRC0, SRC0, 0xffff).unwrap();
+                    }
+                    VRedOp::And => self.a.and(SRC0, SRC0, SRC1),
+                    VRedOp::Or => self.a.orr(SRC0, SRC0, SRC1),
+                    VRedOp::Xor => self.a.eor(SRC0, SRC0, SRC1),
+                }
+            }
+            4 => {
+                self.a.and_imm(SRC0, SRC0, 0xffff_ffff).unwrap();
+                self.a.and_imm(SRC1, SRC1, 0xffff_ffff).unwrap();
+                match op {
+                    VRedOp::Sum => self.a.add_w(SRC0, SRC0, SRC1),
+                    VRedOp::And => self.a.and(SRC0, SRC0, SRC1),
+                    VRedOp::Or => self.a.orr(SRC0, SRC0, SRC1),
+                    VRedOp::Xor => self.a.eor(SRC0, SRC0, SRC1),
+                }
+            }
+            8 => match op {
+                VRedOp::Sum => self.a.add(SRC0, SRC0, SRC1),
+                VRedOp::And => self.a.and(SRC0, SRC0, SRC1),
+                VRedOp::Or => self.a.orr(SRC0, SRC0, SRC1),
+                VRedOp::Xor => self.a.eor(SRC0, SRC0, SRC1),
+            },
+            _ => unreachable!(),
+        }
+        self.a.fmov_from_gpr(if bytes == 8 { Fp::D } else { Fp::S }, FA, SRC0);
+        self.a.vec_ins_lane0(bytes, FB, FA);
+        self.v_str(FB, vd);
+        true
     }
 
     /// A lane-wise unmasked arithmetic op, one NEON instruction per element width (the

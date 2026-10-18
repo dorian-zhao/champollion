@@ -118,6 +118,12 @@ cnt v20.16b, v21.16b
 uaddlp v22.8h, v23.16b
 uaddlp v24.4s, v25.8h
 uaddlp v26.2d, v27.4s
+mov v28.b[0], v29.b[0]
+mov v30.h[0], v31.h[0]
+addv b28, v29.16b
+addv h30, v31.8h
+addv s28, v29.4s
+addp d30, v31.2d
 fadd s16, s17, s18
 fsub d16, d17, d18
 fmul s19, s20, s21

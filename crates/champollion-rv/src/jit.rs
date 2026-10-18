@@ -1935,6 +1935,99 @@ mod tests {
     }
 
     #[test]
+    fn vred_ops_stay_in_the_jit() {
+        fn check(
+            f6: u32,
+            wf3: u32,
+            vtype: u32,
+            avl: u32,
+            bytes: usize,
+            data: Vec<u8>,
+            seed: Vec<u8>,
+        ) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vle = |wf3: u32, vd: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vred = |vd: u32, vs1: u32, vs2: u32| {
+                (f6 << 26)
+                    | (1 << 25)
+                    | (vs2 << 20)
+                    | (vs1 << 15)
+                    | (0b010 << 12)
+                    | (vd << 7)
+                    | 0x57
+            };
+            let prog = [
+                vsetivli(0, avl, vtype),
+                vle(wf3, 1, 11),
+                vle(wf3, 2, 12),
+                vred(3, 2, 1),
+                vse(wf3, 3, 13),
+                ECALL,
+            ];
+            let fill = |mem: &GuestMemory| {
+                mem.write_privileged(DATA, &data).unwrap();
+                mem.write_privileged(DATA + 16, &seed).unwrap();
+            };
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(11, DATA);
+            oracle.set_x(12, DATA + 16);
+            oracle.set_x(13, DATA + 0x200);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 16);
+            cpu.set_x(13, DATA + 0x200);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "vred state");
+            assert_eq!(jit.stats.interpreted.get("VRed"), None, "vred stays in the JIT");
+            let mut got_bytes = vec![0u8; bytes];
+            let mut want_bytes = vec![0u8; bytes];
+            mem_j.read_privileged(DATA + 0x200, &mut got_bytes).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut want_bytes).unwrap();
+            assert_eq!(got_bytes, want_bytes, "vredsum result");
+        }
+
+        let e8: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(37).wrapping_add(200)).collect();
+        let e16: Vec<u8> = (0u16..8)
+            .map(|i| i.wrapping_mul(9001).wrapping_add(60000))
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let e32: Vec<u8> = (0u32..4)
+            .map(|i| i.wrapping_mul(0x4000_0001).wrapping_add(0xf000_0000))
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let e64: Vec<u8> = [u64::MAX, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seed8 = [7u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let seed16: Vec<u8> =
+            [1u16, 0, 0, 0, 0, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seed32: Vec<u8> = [3u32, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seed64: Vec<u8> = [5u64, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        for f6 in 0..4 {
+            check(f6, 0, 0xc0, 16, 16, e8.clone(), seed8.to_vec());
+            check(f6, 5, 0xc8, 8, 16, e16.clone(), seed16.clone());
+            check(f6, 6, 0xd0, 4, 16, e32.clone(), seed32.clone());
+            check(f6, 7, 0xd8, 2, 16, e64.clone(), seed64.clone());
+        }
+    }
+
+    #[test]
     fn vector_shift_sub_mul_match_the_interpreter() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
