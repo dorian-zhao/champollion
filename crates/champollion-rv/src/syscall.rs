@@ -40,6 +40,7 @@ pub mod errno {
     pub const ENOSYS: i32 = 38;
     pub const ENOPROTOOPT: i32 = 92;
     pub const EOPNOTSUPP: i32 = 95;
+    pub const ENODATA: i32 = 61;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ETIMEDOUT: i32 = 110;
     pub const EINTR: i32 = 4;
@@ -64,6 +65,18 @@ macro_rules! syscalls {
 }
 
 syscalls! {
+    SETXATTR = 5 "setxattr",
+    LSETXATTR = 6 "lsetxattr",
+    FSETXATTR = 7 "fsetxattr",
+    GETXATTR = 8 "getxattr",
+    LGETXATTR = 9 "lgetxattr",
+    FGETXATTR = 10 "fgetxattr",
+    LISTXATTR = 11 "listxattr",
+    LLISTXATTR = 12 "llistxattr",
+    FLISTXATTR = 13 "flistxattr",
+    REMOVEXATTR = 14 "removexattr",
+    LREMOVEXATTR = 15 "lremovexattr",
+    FREMOVEXATTR = 16 "fremovexattr",
     GETCWD = 17 "getcwd",
     EVENTFD2 = 19 "eventfd2",
     EPOLL_CREATE1 = 20 "epoll_create1",
@@ -536,6 +549,45 @@ pub trait HostOs: Send + Sync {
         path: Option<&CStr>,
         times: Option<[TimeSpec; 2]>,
         flags: i32,
+    ) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// Extended attributes. `path` and `fd` are mutually exclusive; `follow` is true
+    /// for the plain calls and false for the `l*` variants.
+    fn xattr_set(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        name: &CStr,
+        value: &[u8],
+        flags: i32,
+        follow: bool,
+    ) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    fn xattr_get(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        name: &CStr,
+        follow: bool,
+    ) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    fn xattr_list(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        follow: bool,
+    ) -> Result<Vec<u8>, i32> {
+        Err(errno::ENOSYS)
+    }
+    fn xattr_remove(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        name: &CStr,
+        follow: bool,
     ) -> SysResult {
         Err(errno::ENOSYS)
     }
@@ -1157,6 +1209,18 @@ fn put(p: &Process, addr: u64, bytes: &[u8]) -> Result<(), i32> {
     p.mem.write(addr, bytes).map_err(efault)
 }
 
+fn xattr_output(p: &Process, addr: u64, size: u64, value: &[u8]) -> SysResult {
+    let len = value.len() as u64;
+    if size == 0 {
+        return Ok(len);
+    }
+    if size < len {
+        return Err(errno::ERANGE);
+    }
+    put(p, addr, value)?;
+    Ok(len)
+}
+
 /// Handle the `ecall` at `t.cpu.pc`: read the request from the thread's registers, perform
 /// it, write the result to `a0`, and advance past the `ecall`.
 pub fn dispatch(p: &Process, t: &mut Thread) -> Flow {
@@ -1335,6 +1399,70 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
     let buf = |addr, len, need| p.mem.host_buf(addr, len, need).map_err(efault);
     let cstr = |addr| p.mem.read_cstr(addr, PATH_MAX).map_err(efault);
     match nr {
+        nr @ (nr::SETXATTR | nr::LSETXATTR | nr::FSETXATTR) => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                let (fd, path, follow) = match nr {
+                    nr::FSETXATTR => (Some(fd), None, true),
+                    nr::LSETXATTR => (None, Some(cstr(a[0])?), false),
+                    _ => (None, Some(cstr(a[0])?), true),
+                };
+                let name = cstr(a[1])?;
+                let size = usize::try_from(a[3]).map_err(|_| errno::EINVAL)?;
+                if size > 1 << 20 {
+                    return Err(errno::E2BIG);
+                }
+                let mut value = vec![0u8; size];
+                p.mem.read(a[2], &mut value).map_err(efault)?;
+                let host_path =
+                    path.as_ref().map(|path| p.host_path(path, follow));
+                host.xattr_set(fd, host_path.as_deref(), &name, &value, a[4] as i32, follow)
+            }
+        }
+        nr @ (nr::GETXATTR | nr::LGETXATTR | nr::FGETXATTR) => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                let (fd, path, follow, name_addr) = match nr {
+                    nr::FGETXATTR => (Some(fd), None, true, a[1]),
+                    nr::LGETXATTR => (None, Some(cstr(a[0])?), false, a[1]),
+                    _ => (None, Some(cstr(a[0])?), true, a[1]),
+                };
+                let name = cstr(name_addr)?;
+                let host_path = path.as_ref().map(|path| p.host_path(path, follow));
+                let value = host.xattr_get(fd, host_path.as_deref(), &name, follow)?;
+                xattr_output(p, a[2], a[3], &value)
+            }
+        }
+        nr @ (nr::LISTXATTR | nr::LLISTXATTR | nr::FLISTXATTR) => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                let (fd, path, follow) = match nr {
+                    nr::FLISTXATTR => (Some(fd), None, true),
+                    nr::LLISTXATTR => (None, Some(cstr(a[0])?), false),
+                    _ => (None, Some(cstr(a[0])?), true),
+                };
+                let host_path = path.as_ref().map(|path| p.host_path(path, follow));
+                let value = host.xattr_list(fd, host_path.as_deref(), follow)?;
+                xattr_output(p, a[1], a[2], &value)
+            }
+        }
+        nr @ (nr::REMOVEXATTR | nr::LREMOVEXATTR | nr::FREMOVEXATTR) => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                let (fd, path, follow, name_addr) = match nr {
+                    nr::FREMOVEXATTR => (Some(fd), None, true, a[1]),
+                    nr::LREMOVEXATTR => (None, Some(cstr(a[0])?), false, a[1]),
+                    _ => (None, Some(cstr(a[0])?), true, a[1]),
+                };
+                let name = cstr(name_addr)?;
+                let host_path = path.as_ref().map(|path| p.host_path(path, follow));
+                host.xattr_remove(fd, host_path.as_deref(), &name, follow)
+            }
+        }
         nr::READ => host.read(fd, buf(a[1], a[2], Prot::WRITE)?),
         nr::WRITE => host.write(fd, buf(a[1], a[2], Prot::READ)?),
         nr::READV | nr::WRITEV => {

@@ -262,6 +262,17 @@ fn dirfd(linux: i32) -> i32 {
     if linux == AT_FDCWD { libc::AT_FDCWD } else { linux }
 }
 
+fn xattr_flags(linux: i32, follow: bool) -> Result<i32, i32> {
+    let mut flags = if follow { 0 } else { libc::XATTR_NOFOLLOW };
+    match linux {
+        0 => {}
+        1 => flags |= libc::XATTR_CREATE,
+        2 => flags |= libc::XATTR_REPLACE,
+        _ => return Err(errno::EINVAL),
+    }
+    Ok(flags)
+}
+
 /// Darwin errno -> Linux errno. Values 1–34 agree except 11 (Darwin `EDEADLK`, Linux
 /// `EAGAIN`).
 pub(super) fn linux_errno(e: i32) -> i32 {
@@ -278,6 +289,7 @@ pub(super) fn linux_errno(e: i32) -> i32 {
         libc::ENOPROTOOPT => 92,
         libc::EPROTONOSUPPORT => 93,
         libc::ENOTSUP => 95,
+        libc::ENOATTR => 61,
         libc::EAFNOSUPPORT => 97,
         libc::EADDRINUSE => 98,
         libc::EADDRNOTAVAIL => 99,
@@ -1116,6 +1128,156 @@ impl HostOs for DarwinHost {
         }
     }
 
+    fn xattr_set(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        name: &CStr,
+        value: &[u8],
+        flags: i32,
+        follow: bool,
+    ) -> SysResult {
+        let options = xattr_flags(flags, follow)?;
+        match (fd, path) {
+            (Some(fd), None) => check(unsafe {
+                libc::fsetxattr(
+                    fd,
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    options,
+                )
+            } as isize),
+            (None, Some(path)) => check(unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    options,
+                )
+            } as isize),
+            _ => Err(errno::EINVAL),
+        }
+    }
+
+    fn xattr_get(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        name: &CStr,
+        follow: bool,
+    ) -> Result<Vec<u8>, i32> {
+        let options = xattr_flags(0, follow)?;
+        // SAFETY: a null buffer with size 0 asks for the attribute size.
+        let size = match (fd, path) {
+            (Some(fd), None) => unsafe {
+                libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0, 0, options)
+            },
+            (None, Some(path)) => unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    options,
+                )
+            },
+            _ => return Err(errno::EINVAL),
+        };
+        if size < 0 {
+            return Err(last_errno());
+        }
+        let mut value = vec![0u8; size as usize];
+        // SAFETY: the buffer is valid for the requested size.
+        let n = match (fd, path) {
+            (Some(fd), None) => unsafe {
+                libc::fgetxattr(
+                    fd,
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    options,
+                )
+            },
+            (None, Some(path)) => unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    options,
+                )
+            },
+            _ => return Err(errno::EINVAL),
+        };
+        if n < 0 {
+            return Err(last_errno());
+        }
+        value.truncate(n as usize);
+        Ok(value)
+    }
+
+    fn xattr_list(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        follow: bool,
+    ) -> Result<Vec<u8>, i32> {
+        let options = xattr_flags(0, follow)?;
+        // SAFETY: a null buffer with size 0 asks for the list size.
+        let size = match (fd, path) {
+            (Some(fd), None) => unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0, options) },
+            (None, Some(path)) => unsafe {
+                libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, options)
+            },
+            _ => return Err(errno::EINVAL),
+        };
+        if size < 0 {
+            return Err(last_errno());
+        }
+        let mut value = vec![0u8; size as usize];
+        // SAFETY: the buffer is valid for the requested size.
+        let n = match (fd, path) {
+            (Some(fd), None) => unsafe {
+                libc::flistxattr(fd, value.as_mut_ptr().cast(), value.len(), options)
+            },
+            (None, Some(path)) => unsafe {
+                libc::listxattr(path.as_ptr(), value.as_mut_ptr().cast(), value.len(), options)
+            },
+            _ => return Err(errno::EINVAL),
+        };
+        if n < 0 {
+            return Err(last_errno());
+        }
+        value.truncate(n as usize);
+        Ok(value)
+    }
+
+    fn xattr_remove(
+        &self,
+        fd: Option<i32>,
+        path: Option<&CStr>,
+        name: &CStr,
+        follow: bool,
+    ) -> SysResult {
+        let options = xattr_flags(0, follow)?;
+        match (fd, path) {
+            (Some(fd), None) => {
+                check(unsafe { libc::fremovexattr(fd, name.as_ptr(), options) } as isize)
+            }
+            (None, Some(path)) => {
+                check(unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), options) } as isize)
+            }
+            _ => Err(errno::EINVAL),
+        }
+    }
+
     fn umask(&self, mask: u32) -> u32 {
         // SAFETY: no pointers.
         unsafe { libc::umask(mask as libc::mode_t) as u32 }
@@ -1482,6 +1644,29 @@ mod tests {
             Ok(0)
         );
         assert_ne!(h.fcntl(cloexec.as_raw_fd(), 1, 0).unwrap() & 1, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xattrs_round_trip_by_path_and_fd() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("champollion-xattr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let name = std::ffi::CString::new("user.champollion-test").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let h = DarwinHost::default();
+
+        assert_eq!(h.xattr_set(None, Some(&cpath), &name, b"hello", 0, true), Ok(0));
+        assert_eq!(h.xattr_get(None, Some(&cpath), &name, true), Ok(b"hello".to_vec()));
+        let list = h.xattr_list(None, Some(&cpath), true).unwrap();
+        assert!(list.split(|&b| b == 0).any(|n| n == name.to_bytes()));
+        assert_eq!(h.xattr_set(Some(file.as_raw_fd()), None, &name, b"bye", 2, true), Ok(0));
+        assert_eq!(h.xattr_get(Some(file.as_raw_fd()), None, &name, true), Ok(b"bye".to_vec()));
+        assert_eq!(h.xattr_remove(Some(file.as_raw_fd()), None, &name, true), Ok(0));
+        assert_eq!(h.xattr_get(None, Some(&cpath), &name, true), Err(errno::ENODATA));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

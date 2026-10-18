@@ -16,6 +16,7 @@
 #include <sys/sysmacros.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -82,6 +83,19 @@ int main(int argc, char **argv) {
                                    stat(copy, &st) == 0 &&
                                    st.st_atim.tv_sec > 1600000003 &&
                                    st.st_mtim.tv_sec == 1600000003);
+    char xbuf[16] = {0}, xlist[128] = {0};
+    CHECK("setxattr", setxattr(copy, "user.champollion-test", "hello", 5, 0) == 0);
+    CHECK("getxattr", getxattr(copy, "user.champollion-test", xbuf, sizeof xbuf) == 5 &&
+                          memcmp(xbuf, "hello", 5) == 0);
+    ssize_t xlen = listxattr(copy, xlist, sizeof xlist);
+    int xfound = 0;
+    if (xlen > 0) {
+        for (char *p = xlist; p < xlist + xlen; p += strlen(p) + 1) {
+            if (strcmp(p, "user.champollion-test") == 0) xfound = 1;
+        }
+    }
+    CHECK("listxattr", xlen > 0 && xfound);
+    CHECK("removexattr", removexattr(copy, "user.champollion-test") == 0);
 
     char range[4096];
     snprintf(range, sizeof range, "%s/range.txt", argc > 1 ? argv[1] : ".");
