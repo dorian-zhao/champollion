@@ -22,11 +22,16 @@ use crate::memory::{MemFault, Memory};
 /// userlands: every `vset*` in their loaders runs at m1 or a fractional LMUL.
 pub const VLEN_BYTES: u64 = 16;
 
+/// The JIT's one-word vector-state key: `vtype` in the low byte, `vl` above it.
+#[inline]
+pub fn vkey(vtype: u64, vl: u64) -> u64 {
+    vtype | vl << 8
+}
+
 /// `vl` for one `vset*`: validate `vtype`, set it with `vl`, and return the new `vl`.
 pub fn vset(cpu: &mut CpuState, avl: u64, bits: u64) -> u64 {
     let (vtype, vl) = vset_compute(avl, bits);
-    cpu.vtype = vtype;
-    cpu.vl = vl;
+    cpu.set_vstate(vtype, vl);
     vl
 }
 
@@ -841,8 +846,7 @@ mod tests {
     /// A CPU with `e8`/`m1` (or another vtype) and a chosen `vl`.
     fn machine(vtype: u64, vl: u64) -> CpuState {
         let mut c = CpuState::new(0);
-        c.vtype = vtype;
-        c.vl = vl;
+        c.set_vstate(vtype, vl);
         c
     }
 

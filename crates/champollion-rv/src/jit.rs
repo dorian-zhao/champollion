@@ -494,7 +494,7 @@ impl Jit {
                             );
                             loaded += 1;
                         }
-                        cpu.vl = loaded;
+                        cpu.set_vl(loaded);
                         cpu.instret += 1; // the fault-tolerant load retires
                         cpu.pc = site.guest_pc + 4;
                         continue;

@@ -34,6 +34,9 @@ pub struct CpuState {
     /// `vtype` as written: `vma` bit 7, `vta` bit 6, `vsew` bits 5:3, `vlmul` bits 2:0.
     /// `vstart` is not modeled and always reads zero.
     pub vtype: u64,
+    /// `vtype | vl << 8`: one word for the JIT's entry guard, which otherwise compares
+    /// both fields separately every time it enters a vector block.
+    pub vkey: u64,
     /// `fcsr`: `frm` in bits 7:5, `fflags` in bits 4:0. Kept last so `v`'s offset stays
     /// a multiple of 16 before it.
     pub fcsr: u32,
@@ -56,8 +59,24 @@ impl CpuState {
             v: [[0; 16]; 32],
             vl: 0,
             vtype: 0,
+            vkey: 0,
             fcsr: 0,
         }
+    }
+
+    /// Set the vector configuration and its combined guard key together.
+    #[inline]
+    pub fn set_vstate(&mut self, vtype: u64, vl: u64) {
+        self.vtype = vtype;
+        self.vl = vl;
+        self.vkey = crate::vector::vkey(vtype, vl);
+    }
+
+    /// Change `vl` alone (the fault-only-first forms do this), keeping the key exact.
+    #[inline]
+    pub fn set_vl(&mut self, vl: u64) {
+        self.vl = vl;
+        self.vkey = crate::vector::vkey(self.vtype, vl);
     }
 
     #[inline]

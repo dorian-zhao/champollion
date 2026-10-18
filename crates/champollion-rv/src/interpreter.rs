@@ -359,7 +359,7 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                                 if kind == VMemKind::FaultOnlyFirst {
                                     // The point of the ff form: stop at the first fault
                                     // and report the successful prefix in `vl`.
-                                    cpu.vl = i;
+                                    cpu.set_vl(i);
                                     break;
                                 }
                                 return Err(Trap::LoadFault { pc, fault });

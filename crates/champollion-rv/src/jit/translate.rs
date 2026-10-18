@@ -118,6 +118,7 @@ const RESERVED_ADDR: u32 = offset_of!(CpuState, reserved_addr) as u32;
 const FCSR: u32 = offset_of!(CpuState, fcsr) as u32;
 const VL_OFF: u32 = offset_of!(CpuState, vl) as u32;
 const VTYPE_OFF: u32 = offset_of!(CpuState, vtype) as u32;
+const VKEY_OFF: u32 = offset_of!(CpuState, vkey) as u32;
 
 fn v_offset(v: u8) -> u32 {
     (offset_of!(CpuState, v) + 16 * v as usize) as u32
@@ -3370,6 +3371,8 @@ impl Tx {
         self.a.str_off(SRC0, CTX, VTYPE_OFF);
         self.a.mov_imm(SRC0, vl);
         self.a.str_off(SRC0, CTX, VL_OFF);
+        self.a.mov_imm(SRC0, crate::vector::vkey(vtype, vl));
+        self.a.str_off(SRC0, CTX, VKEY_OFF);
         self.constant(rd, vl);
         // Later vector ops in this block run under the new configuration; if it is not
         // one this subset can express, the first of them ends the block for the
@@ -3406,6 +3409,9 @@ impl Tx {
         self.a.mov_imm(SRC1, vtype);
         self.a.str_off(SRC1, CTX, VTYPE_OFF);
         self.a.str_off(SRC0, CTX, VL_OFF);
+        self.a.lsl_imm(ADDR, SRC0, 8);
+        self.a.orr(ADDR, ADDR, SRC1);
+        self.a.str_off(ADDR, CTX, VKEY_OFF);
         self.commit(rd, d);
         self.vec = None;
     }
@@ -4236,15 +4242,16 @@ pub fn translate(
     // vset), leave to the interpreter at this pc.
     if guard {
         let (vtype, vl) = vstate;
-        tx.a.ldr_off(SRC0, CTX, VTYPE_OFF);
-        tx.a.mov_imm(SRC1, vtype);
-        tx.a.eor(SRC0, SRC0, SRC1);
-        tx.a.ldr_off(SRC1, CTX, VL_OFF);
-        tx.a.mov_imm(DST, vl);
-        tx.a.eor(SRC1, SRC1, DST);
-        tx.a.orr(SRC0, SRC0, SRC1);
+        let key = crate::vector::vkey(vtype, vl);
+        tx.a.ldr_off(SRC0, CTX, VKEY_OFF);
+        if key < 4096 {
+            tx.a.cmp_imm(SRC0, key as u32);
+        } else {
+            tx.a.mov_imm(SRC1, key);
+            tx.a.cmp(SRC0, SRC1);
+        }
         let to_tail = tx.a.pos();
-        tx.a.cbnz(SRC0, to_tail); // patched to the interpret tail by emit_tails
+        tx.a.b_cond(Cond::Ne, to_tail); // patched to the interpret tail by emit_tails
         tx.tails.push((to_tail, Tail::Interpret { pc, retired_before: 0 }));
     }
 
