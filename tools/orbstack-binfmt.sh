@@ -49,7 +49,9 @@ register() {
             set -eu
             cp /build/rvrun /usr/local/bin/rvrun-riscv64
             mount -t binfmt_misc none /proc/sys/fs/binfmt_misc 2>/dev/null || true
-            echo -1 > /proc/sys/fs/binfmt_misc/rvrun-riscv64 2>/dev/null || true
+            if [ -e /proc/sys/fs/binfmt_misc/rvrun-riscv64 ]; then
+                echo -1 > /proc/sys/fs/binfmt_misc/rvrun-riscv64
+            fi
             printf "%s\n" ":rvrun-riscv64:M::\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xf3\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/local/bin/rvrun-riscv64:POCF" \
                 > /proc/sys/fs/binfmt_misc/register || true
         '
@@ -75,7 +77,9 @@ uninstall() {
     require_orbstack
     docker run --rm --privileged --pid=host "$image" sh -c '
         mount -t binfmt_misc none /proc/sys/fs/binfmt_misc 2>/dev/null || true
-        echo -1 > /proc/sys/fs/binfmt_misc/rvrun-riscv64 2>/dev/null || true
+        if [ -e /proc/sys/fs/binfmt_misc/rvrun-riscv64 ]; then
+            echo -1 > /proc/sys/fs/binfmt_misc/rvrun-riscv64
+        fi
     '
     echo "removed rvrun-riscv64 from OrbStack"
 }
