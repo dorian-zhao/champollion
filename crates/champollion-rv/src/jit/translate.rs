@@ -2392,6 +2392,9 @@ impl Tx {
             if self.vec_regs != 1 {
                 return false;
             }
+            if op == VArithOp::Sll {
+                return self.vector_sll(true, vd, vs2, src);
+            }
             return self.vector_arith_masked(op, vd, vs2, src, bytes, bits);
         }
         if self.vec_regs > 1 {
@@ -2458,7 +2461,7 @@ impl Tx {
             return self.vector_rotate(vd, vs2, src, op == VArithOp::Rol);
         }
         if op == VArithOp::Sll {
-            return self.vector_sll(vd, vs2, src);
+            return self.vector_sll(false, vd, vs2, src);
         }
         if self.vec_regs != 1 {
             return false;
@@ -2748,10 +2751,13 @@ impl Tx {
 
     /// `vsll.vi` / `vsll.vx` / `vsll.vv`: the amount is reduced modulo the element width
     /// before NEON's signed per-lane shift sees it.
-    fn vector_sll(&mut self, vd: u8, vs2: u8, src: VSel) -> bool {
+    fn vector_sll(&mut self, mask: bool, vd: u8, vs2: u8, src: VSel) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
         let bits = bytes * 8;
         let regs = self.vec_regs;
+        if mask && (regs != 1 || vd == 0) {
+            return false;
+        }
         if !matches!(src, VSel::I(_) | VSel::X(_) | VSel::V(_)) {
             return false;
         }
@@ -2762,9 +2768,17 @@ impl Tx {
             }
             self.vector_amount(src, r as u8, bits, bytes, FB);
             self.a.vec_ushl(bits, FA, FA, FB);
-            self.v_str(FA, (vd + r as u8) & 31);
+            if mask {
+                // The shift amount is dead now; merge the old destination through v0.
+                self.v_ldr(FB, vd);
+                self.vector_mask_expand(bytes);
+                self.a.vec_bit(FB, FA, FR);
+                self.v_str(FB, vd);
+            } else {
+                self.v_str(FA, (vd + r as u8) & 31);
+            }
         }
-        self.vec_last = if regs == 1 { Some(vd) } else { None };
+        self.vec_last = if regs == 1 && !mask { Some(vd) } else { None };
         self.vec_m2 = None;
         true
     }

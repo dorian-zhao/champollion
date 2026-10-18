@@ -1903,6 +1903,12 @@ mod tests {
                     vse(f3, 7, 18),
                     vi(0b101001, 8, 1, 2), // vsra.vi v8, v1, 2, v0.t
                     vse(f3, 8, 19),
+                    vx(0b100101, 9, 1, 10), // vsll.vx v9, v1, a0, v0.t
+                    vse(f3, 9, 23),
+                    vi(0b100101, 10, 1, 3), // vsll.vi v10, v1, 3, v0.t
+                    vse(f3, 10, 24),
+                    vv(0b100101, 11, 1, 2), // vsll.vv v11, v1, v2, v0.t
+                    vse(f3, 11, 25),
                     vv(0b000000, 2, 2, 1), // vadd.vv v2, v2, v1, v0.t (vd == vs2)
                     vse(f3, 2, 20),
                     vv(0b000000, 2, 1, 2), // vadd.vv v2, v1, v2, v0.t (vd == vs1)
@@ -1936,6 +1942,9 @@ mod tests {
                         (19, DATA + 144),
                         (20, DATA + 160),
                         (21, DATA + 176),
+                        (23, DATA + 208),
+                        (24, DATA + 224),
+                        (25, DATA + 240),
                         (10, 3),
                     ] {
                         cpu.set_x(r, v);
@@ -1967,7 +1976,7 @@ mod tests {
                     None,
                     "{label}: masked arithmetic left the JIT"
                 );
-                for off in (64u64..=176).step_by(16) {
+                for off in (64u64..=240).step_by(16) {
                     let mut a = [0u8; 16];
                     let mut b = [0u8; 16];
                     mem_i.read_privileged(DATA + off, &mut a).unwrap();
