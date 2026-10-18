@@ -757,6 +757,12 @@ impl Asm {
         };
         self.r3(0x1e20_0000 | Self::fp_type(size) | opc, rd, rn, rm);
     }
+    /// `fmin`/`fmax` (NaN-propagating) and `fminnm`/`fmaxnm` (NaN-ignoring).
+    pub fn fp_minmax(&mut self, max: bool, numeric: bool, size: Fp, rd: Reg, rn: Reg, rm: Reg) {
+        let base = if size == Fp::D { 0x1e60_4800 } else { 0x1e20_4800 };
+        let op = (if max { 0 } else { 0x1000 }) | if numeric { 0x2000 } else { 0 };
+        self.emit(base | op | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
     pub fn fsqrt(&mut self, size: Fp, rd: Reg, rn: Reg) {
         self.emit(0x1e21_c000 | Self::fp_type(size) | (rn as u32) << 5 | rd as u32);
     }
@@ -819,6 +825,16 @@ impl Asm {
     }
     pub fn msr_fpsr(&mut self, rt: Reg) {
         self.emit(0xd51b_4420 | rt as u32);
+    }
+
+    /// `mrs rt, CNTVCT_EL0`: the virtual counter.
+    pub fn mrs_cntvct(&mut self, rt: Reg) {
+        self.emit(0xd53b_e040 | rt as u32);
+    }
+
+    /// `mrs rt, CNTFRQ_EL0`: the counter frequency in Hz.
+    pub fn mrs_cntfrq(&mut self, rt: Reg) {
+        self.emit(0xd53b_e000 | rt as u32);
     }
     /// `rbit wd, wn`: reverse the bits of a 32-bit value.
     pub fn rbit_w(&mut self, rd: Reg, rn: Reg) {

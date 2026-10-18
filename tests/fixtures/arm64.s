@@ -106,6 +106,14 @@ fadd s16, s17, s18
 fsub d16, d17, d18
 fmul s19, s20, s21
 fdiv d22, d23, d24
+fmin s16, s17, s18
+fmax s19, s20, s21
+fminnm s22, s23, s24
+fmaxnm s25, s26, s27
+fmin d16, d17, d18
+fmax d19, d20, d21
+fminnm d22, d23, d24
+fmaxnm d25, d26, d27
 fsqrt s16, s17
 fsqrt d18, d19
 fmadd s16, s17, s18, s19
@@ -130,6 +138,8 @@ mrs x0, fpcr
 msr fpcr, x1
 mrs x2, fpsr
 msr fpsr, x3
+mrs x16, cntvct_el0
+mrs x17, cntfrq_el0
 rbit w4, w5
 cmn w6, #1
 and w7, w8, #0x1f

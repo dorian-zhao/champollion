@@ -1009,6 +1009,267 @@ mod tests {
     }
 
     #[test]
+    fn fclass_matches_the_interpreter() {
+        fn fclass(fmt: u32, rd: u32, rs1: u32) -> u32 {
+            op_fp(0b11100, fmt, 0b001, rd, rs1, 0)
+        }
+        fn run(prog: &[u32], fill: &dyn Fn(&GuestMemory)) -> (CpuState, GuestMemory) {
+            let mem_i = setup(prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(11, DATA);
+            oracle.set_x(12, DATA + 0x200);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 0x200);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "fclass state");
+            assert_eq!(jit.stats.interpreted.get("FClass"), None, "fclass stays in the JIT");
+            (cpu, mem_j)
+        }
+
+        let s = [
+            0xff80_0000u32, // -inf
+            0xbfc0_0000,    // -normal
+            0x8000_0001,    // -subnormal
+            0x8000_0000,    // -0
+            0x0000_0000,    // +0
+            0x0000_0001,    // +subnormal
+            0x3fc0_0000,    // +normal
+            0x7f80_0000,    // +inf
+            0x7f80_0001,    // sNaN
+            0x7fc0_0000,    // qNaN
+        ];
+        let mut prog = Vec::new();
+        for (i, _) in s.iter().enumerate() {
+            prog.push(fload(0b010, 0, 11, 4 * i as i32));
+            prog.push(fclass(0, 10, 0));
+            prog.push(store(0b011, 12, 10, 8 * i as i32));
+        }
+        prog.push(ECALL);
+        let (_, mem) = run(&prog, &|mem| {
+            for (i, v) in s.iter().enumerate() {
+                mem.write_privileged(DATA + 4 * i as u64, &v.to_le_bytes()).unwrap();
+            }
+        });
+        let mut got = [0u8; 80];
+        mem.read_privileged(DATA + 0x200, &mut got).unwrap();
+        let want: Vec<u8> = (0..10).flat_map(|i| (1u64 << i).to_le_bytes()).collect();
+        assert_eq!(got.as_slice(), want.as_slice(), "single classes");
+
+        let d = [
+            0xfff0_0000_0000_0000u64, // -inf
+            0xbff8_0000_0000_0000,    // -1.5
+            0x8000_0000_0000_0001,    // -subnormal
+            0x8000_0000_0000_0000,    // -0
+            0x0000_0000_0000_0000,    // +0
+            0x0000_0000_0000_0001,    // +subnormal
+            0x3ff8_0000_0000_0000,    // +1.5
+            0x7ff0_0000_0000_0000,    // +inf
+            0x7ff0_0000_0000_0001,    // sNaN
+            0x7ff8_0000_0000_0000,    // qNaN
+        ];
+        let mut prog = Vec::new();
+        for (i, _) in d.iter().enumerate() {
+            prog.push(fload(0b011, 0, 11, 8 * i as i32));
+            prog.push(fclass(1, 10, 0));
+            prog.push(store(0b011, 12, 10, 8 * i as i32));
+        }
+        prog.push(ECALL);
+        let (_, mem) = run(&prog, &|mem| {
+            for (i, v) in d.iter().enumerate() {
+                mem.write_privileged(DATA + 8 * i as u64, &v.to_le_bytes()).unwrap();
+            }
+        });
+        mem.read_privileged(DATA + 0x200, &mut got).unwrap();
+        assert_eq!(got.as_slice(), want.as_slice(), "double classes");
+
+        // A raw, unboxed single reads as the canonical qNaN.
+        let prog = [fclass(0, 10, 0), store(0b011, 12, 10, 0), ECALL];
+        let mem_i = setup(&prog);
+        let mut oracle = CpuState::new(CODE);
+        oracle.f[0] = 0x1234_5678;
+        oracle.set_x(12, DATA + 0x200);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        let mut cpu = CpuState::new(CODE);
+        cpu.f[0] = 0x1234_5678;
+        cpu.set_x(12, DATA + 0x200);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        assert_eq!(cpu.x[10], 1 << 9, "unboxed single is a quiet NaN");
+    }
+
+    #[test]
+    fn fminmax_matches_the_interpreter() {
+        fn check(single: bool, a: u64, b: u64, max: bool, canonical_nan: bool, rd: u32) {
+            let (fmt, f3_load, step) = if single { (0, 0b010, 4) } else { (1, 0b011, 8) };
+            let f3 = match (max, canonical_nan) {
+                (false, false) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                (true, true) => 3,
+            };
+            let prog = [
+                fload(f3_load, 0, 11, 0),
+                fload(f3_load, 1, 11, step),
+                op_fp(0b00101, fmt, f3, rd, 0, 1),
+                fstore(f3_load, 12, rd, 0),
+                ECALL,
+            ];
+            let fill = |mem: &GuestMemory| {
+                if single {
+                    mem.write_privileged(DATA, &(a as u32).to_le_bytes()).unwrap();
+                    mem.write_privileged(DATA + 4, &(b as u32).to_le_bytes()).unwrap();
+                } else {
+                    mem.write_privileged(DATA, &a.to_le_bytes()).unwrap();
+                    mem.write_privileged(DATA + 8, &b.to_le_bytes()).unwrap();
+                }
+            };
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(11, DATA);
+            oracle.set_x(12, DATA + 0x100);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 0x100);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "fminmax state");
+            assert_eq!(jit.stats.interpreted.get("FMinMax"), None, "fminmax stays in the JIT");
+            let step = step as usize;
+            let mut got_bytes = [0u8; 8];
+            let mut want_bytes = [0u8; 8];
+            mem_j.read_privileged(DATA + 0x100, &mut got_bytes[..step]).unwrap();
+            mem_i.read_privileged(DATA + 0x100, &mut want_bytes[..step]).unwrap();
+            assert_eq!(&got_bytes[..step], &want_bytes[..step], "fminmax result");
+        }
+
+        let qnan = 0x7fc0_0000u64;
+        let snan = 0x7f80_0001u64;
+        for single in [true, false] {
+            let (one, two, zero, negative_zero, qnan, snan) = if single {
+                (1.5f32.to_bits() as u64, 2.5f32.to_bits() as u64, 0, 0x8000_0000, qnan, snan)
+            } else {
+                (
+                    1.5f64.to_bits(),
+                    2.5f64.to_bits(),
+                    0,
+                    0x8000_0000_0000_0000,
+                    0x7ff8_0000_0000_0000,
+                    0x7ff0_0000_0000_0001,
+                )
+            };
+            for max in [false, true] {
+                for canonical_nan in [false, true] {
+                    check(single, one, two, max, canonical_nan, 2);
+                    check(single, negative_zero, zero, max, canonical_nan, 2);
+                    check(single, qnan, one, max, canonical_nan, 2);
+                    check(single, snan, one, max, canonical_nan, 2);
+                    // The destination aliases the signaling-NaN source.
+                    check(single, snan, one, max, canonical_nan, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csr_frm_and_time_stay_in_the_jit() {
+        let csr = |rd: u32, n: u32| n << 20 | 0b010 << 12 | rd << 7 | 0x73;
+        let prog = [
+            csr(10, 0x002),           // a0 = frm
+            csr(11, 0xc01),           // a1 = time
+            csr(12, 0xc01),           // a2 = time again
+            store(0b011, 13, 10, 0),  // sd a0, 0(a3)
+            store(0b011, 13, 11, 8),  // sd a1, 8(a3)
+            store(0b011, 13, 12, 16), // sd a2, 16(a3)
+            ECALL,
+        ];
+        let init = |cpu: &mut CpuState| {
+            cpu.fcsr = 3 << 5; // frm = RZ, so the JIT can enter with a valid FPCR
+            cpu.set_x(13, DATA + 0x200);
+        };
+        let mem_i = setup(&prog);
+        let mut oracle = CpuState::new(CODE);
+        init(&mut oracle);
+        loop {
+            if interpreter::step(&mut oracle, &mem_i).is_err() {
+                break;
+            }
+        }
+        let mem_j = setup(&prog);
+        let mut cpu = CpuState::new(CODE);
+        init(&mut cpu);
+        let mut jit = Jit::new().unwrap();
+        let _ = jit.run(&mut cpu, &mem_j);
+        assert_eq!(cpu.x[10], 3, "frm");
+        assert!(cpu.x[11] > 0, "time is a positive 10 MHz tick count");
+        assert!(cpu.x[12] >= cpu.x[11], "time is monotonic");
+        assert_eq!(jit.stats.interpreted.get("Csr"), None, "CSR reads stay in the JIT");
+    }
+
+    #[test]
+    fn static_fcvt_from_int_rounding_stays_in_the_jit() {
+        // fcvt.d.l with RTZ and fcvt.s.l with RDN: the ambient frm is RNE, so these
+        // only work if the translator swaps FPCR around the conversion.
+        let prog = [
+            load(0b011, 11, 11, 0),         // ld a1, 0(a1)
+            op_fp(0b11010, 1, 1, 0, 11, 2), // fcvt.d.l ft0, a1, rtz
+            fstore(0b011, 12, 0, 0),        // fsd ft0, 0(a2)
+            op_fp(0b11010, 0, 2, 1, 11, 2), // fcvt.s.l ft1, a1, rdn
+            fstore(0b010, 12, 1, 8),        // fsw ft1, 8(a2)
+            ECALL,
+        ];
+        let value = i64::MAX;
+        let fill = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &value.to_le_bytes()).unwrap();
+        };
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        oracle.set_x(12, DATA + 0x100);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 0x100);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "static conversion rounding");
+        assert_eq!(jit.stats.interpreted.get("FCvtFromInt"), None, "conversion stays in the JIT");
+    }
+
+    #[test]
     fn fsgnj_single_matches_the_interpreter() {
         // Sign injection reads both operands with the NaN-box rule, and a double read
         // as a single produces the canonical NaN whose sign is then injected; the

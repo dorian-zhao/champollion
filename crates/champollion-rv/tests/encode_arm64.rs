@@ -114,6 +114,14 @@ fn matches_assembler() {
     a.fp_arith(FpOp::Sub, Fp::D, 16, 17, 18);
     a.fp_arith(FpOp::Mul, Fp::S, 19, 20, 21);
     a.fp_arith(FpOp::Div, Fp::D, 22, 23, 24);
+    a.fp_minmax(false, false, Fp::S, 16, 17, 18);
+    a.fp_minmax(true, false, Fp::S, 19, 20, 21);
+    a.fp_minmax(false, true, Fp::S, 22, 23, 24);
+    a.fp_minmax(true, true, Fp::S, 25, 26, 27);
+    a.fp_minmax(false, false, Fp::D, 16, 17, 18);
+    a.fp_minmax(true, false, Fp::D, 19, 20, 21);
+    a.fp_minmax(false, true, Fp::D, 22, 23, 24);
+    a.fp_minmax(true, true, Fp::D, 25, 26, 27);
     a.fsqrt(Fp::S, 16, 17);
     a.fsqrt(Fp::D, 18, 19);
     a.fma(FmaKind::Fmadd, Fp::S, 16, 17, 18, 19);
@@ -138,6 +146,8 @@ fn matches_assembler() {
     a.msr_fpcr(1);
     a.mrs_fpsr(2);
     a.msr_fpsr(3);
+    a.mrs_cntvct(16);
+    a.mrs_cntfrq(17);
     a.rbit_w(4, 5);
     a.cmn_imm_w(6, 1);
     a.and_imm_w(7, 8, 0x1f).unwrap();

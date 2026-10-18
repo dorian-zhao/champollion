@@ -617,6 +617,12 @@ impl Tx {
             Inst::Csr { op: CsrOp::Rs, csr, rd, src: 0, imm: false } => {
                 let d = self.dst(rd);
                 match csr {
+                    Csr::Frm => {
+                        self.a.ldr_off_w(d, CTX, FCSR);
+                        self.a.lsr_imm_w(d, d, 5);
+                        self.a.and_imm_w(d, d, 0b111).unwrap();
+                    }
+                    Csr::Time => self.time(d),
                     Csr::Vl => self.a.ldr_off(d, CTX, VL_OFF),
                     Csr::Vtype => self.a.ldr_off(d, CTX, VTYPE_OFF),
                     Csr::Vlenb => self.a.mov_imm(d, 16),
@@ -838,6 +844,20 @@ impl Tx {
                     self.commit(rd, d);
                 }
             }
+            Inst::FMinMax { max, canonical_nan, width, rd, rs1, rs2 } => {
+                let a = self.fsrc(width, rs1, FA);
+                let b = self.fsrc(width, rs2, FB);
+                let d = self.fdest(width, rd);
+                self.fminmax(max, canonical_nan, width, d, a, b);
+                self.fcommit(width, rd, d);
+            }
+            Inst::FClass { width, rd, rs1 } => {
+                if rd != 0 {
+                    let a = self.fsrc(width, rs1, FA);
+                    self.a.fmov_to_gpr(Fp::D, SRC0, a);
+                    self.fclass(width, SRC0, rd);
+                }
+            }
             // fcvt.d.s is exact, so its rounding mode never matters.
             Inst::FCvtFloat { to: FWidth::D, rd, rs1, .. }
             | Inst::FCvtFloat { to: FWidth::S, rd, rs1, rm: RM_DYN } => {
@@ -892,6 +912,23 @@ impl Tx {
                 let wide = matches!(from, IntType::L | IntType::Lu);
                 let d = self.fdest(to, rd);
                 self.a.cvt_from_int(signed, wide, fp(to), d, v);
+                self.fcommit(to, rd, d);
+            }
+            // A static rounding mode other than the ambient `frm`: swap FPCR around the
+            // conversion, then restore the block's mode. RMM has no ARM equivalent and
+            // stays on the interpreter.
+            Inst::FCvtFromInt { from, to, rd, rs1, rm }
+                if let Some(fpcr) = guest_fpcr(u32::from(rm)) =>
+            {
+                let v = self.src(rs1, SRC0);
+                let signed = matches!(from, IntType::W | IntType::L);
+                let wide = matches!(from, IntType::L | IntType::Lu);
+                let d = self.fdest(to, rd);
+                self.a.mrs_fpcr(SRC1);
+                self.a.mov_imm(DST, fpcr);
+                self.a.msr_fpcr(DST);
+                self.a.cvt_from_int(signed, wide, fp(to), d, v);
+                self.a.msr_fpcr(SRC1);
                 self.fcommit(to, rd, d);
             }
             Inst::Amo { op, width, rd, rs1, rs2, .. } => {
@@ -1005,6 +1042,222 @@ impl Tx {
         } else {
             self.fboxed &= !(1 << r);
         }
+    }
+
+    /// RISC-V `fclass`: a one-hot mask of the ten IEEE classes. Reads the raw bits after
+    /// [`Tx::fsrc`] has applied the single-precision NaN-box rule.
+    fn fclass(&mut self, w: FWidth, bits: Reg, rd: u8) {
+        let d = self.dst(rd);
+        let (exp_max, quiet, sign) = match w {
+            FWidth::S => (0xff, 0x0040_0000, 1u64 << 31),
+            FWidth::D => (0x7ff, 1u64 << 51, 1u64 << 63),
+        };
+        match w {
+            FWidth::S => {
+                self.a.ubfm_w(SRC1, bits, 23, 30); // exponent
+                self.a.ubfm_w(ADDR, bits, 0, 22); // fraction
+            }
+            FWidth::D => {
+                self.a.ubfm(SRC1, bits, 52, 62);
+                self.a.ubfm(ADDR, bits, 0, 51);
+            }
+        }
+
+        let mut done = Vec::new();
+        match w {
+            FWidth::S => self.a.cmp_imm_w(SRC1, exp_max),
+            FWidth::D => self.a.cmp_imm(SRC1, exp_max),
+        }
+        let not_nan = self.a.pos();
+        self.a.b_cond(Cond::Ne, not_nan); // patched after the NaN block
+        let nan = self.a.pos();
+        self.a.cbnz(ADDR, nan); // patched to the NaN block
+
+        // exp == all ones, frac == 0: infinity.
+        self.a.mov_imm(d, 7);
+        self.a.tst_imm(bits, sign).unwrap();
+        let b = self.a.pos();
+        self.a.b_cond(Cond::Eq, b);
+        done.push(b);
+        self.a.mov_imm(d, 0);
+        let b = self.a.pos();
+        self.a.b(0);
+        done.push(b);
+
+        let nan_label = self.a.pos();
+        self.a.patch(nan, nan_label);
+        self.a.mov_imm(d, 8); // signaling NaN
+        self.a.tst_imm(ADDR, quiet).unwrap();
+        let b = self.a.pos();
+        self.a.b_cond(Cond::Eq, b);
+        done.push(b);
+        self.a.mov_imm(d, 9); // quiet NaN
+        let b = self.a.pos();
+        self.a.b(0);
+        done.push(b);
+
+        let after_nan = self.a.pos();
+        self.a.patch(not_nan, after_nan);
+        match w {
+            FWidth::S => self.a.cmp_imm_w(SRC1, 0),
+            FWidth::D => self.a.cmp_imm(SRC1, 0),
+        }
+        let nonzero_exp = self.a.pos();
+        self.a.b_cond(Cond::Ne, nonzero_exp); // patched to the normal case
+
+        let subnormal = self.a.pos();
+        self.a.cbnz(ADDR, subnormal);
+        self.a.mov_imm(d, 4); // +0
+        self.a.tst_imm(bits, sign).unwrap();
+        let b = self.a.pos();
+        self.a.b_cond(Cond::Eq, b);
+        done.push(b);
+        self.a.mov_imm(d, 3); // -0
+        let b = self.a.pos();
+        self.a.b(0);
+        done.push(b);
+
+        let subnormal_label = self.a.pos();
+        self.a.patch(subnormal, subnormal_label);
+        self.a.mov_imm(d, 5); // positive subnormal
+        self.a.tst_imm(bits, sign).unwrap();
+        let b = self.a.pos();
+        self.a.b_cond(Cond::Eq, b);
+        done.push(b);
+        self.a.mov_imm(d, 2); // negative subnormal
+        let b = self.a.pos();
+        self.a.b(0);
+        done.push(b);
+
+        let normal_label = self.a.pos();
+        self.a.patch(nonzero_exp, normal_label);
+        self.a.mov_imm(d, 6); // positive normal
+        self.a.tst_imm(bits, sign).unwrap();
+        let b = self.a.pos();
+        self.a.b_cond(Cond::Eq, b);
+        done.push(b);
+        self.a.mov_imm(d, 1); // negative normal
+
+        let end = self.a.pos();
+        for branch in done {
+            self.a.patch(branch, end);
+        }
+        self.a.mov_imm(SRC0, 1);
+        self.a.lslv(d, SRC0, d);
+        self.commit(rd, d);
+    }
+
+    /// `fmin`/`fmax` and their Zfa `fminm`/`fmaxm` forms. ARM's minNum/maxNum cover
+    /// the ordinary case; a signaling NaN needs RISC-V's "return the other operand" fix-up,
+    /// and the Zfa forms replace every NaN result with the canonical quiet NaN.
+    fn fminmax(&mut self, max: bool, canonical_nan: bool, w: FWidth, d: Reg, a: Reg, b: Reg) {
+        // Keep the original operands alive when the destination aliases one of them:
+        // the NaN fix-up runs after the base min/max has written `d`.
+        let (mut a, mut b) = (a, b);
+        if d == a {
+            self.a.fmov_d(FC, a);
+            a = FC;
+            if d == b {
+                b = FC;
+            }
+        } else if d == b {
+            self.a.fmov_d(FC, b);
+            b = FC;
+        }
+        self.a.fmov_to_gpr(Fp::D, SRC0, a);
+        self.a.fmov_to_gpr(Fp::D, SRC1, b);
+        // Bit 1: NaN; bit 0: signaling NaN.
+        self.nan_flags(w, SRC0, SRC0);
+        self.nan_flags(w, SRC1, SRC1);
+        self.a.fp_minmax(max, !canonical_nan, fp(w), d, a, b);
+
+        if canonical_nan {
+            self.a.orr(ADDR, SRC0, SRC1);
+            self.a.tst_imm(ADDR, 2).unwrap();
+            let no_nan = self.a.pos();
+            self.a.b_cond(Cond::Eq, no_nan);
+            let quiet = match w {
+                FWidth::S => 0x7fc0_0000,
+                FWidth::D => 0x7ff8_0000_0000_0000,
+            };
+            self.a.mov_imm(SRC0, quiet);
+            self.a.fmov_from_gpr(fp(w), d, SRC0);
+            let end = self.a.pos();
+            self.a.patch(no_nan, end);
+            return;
+        }
+
+        // If a is a signaling NaN and b is a number, the result is b. The symmetric
+        // case follows; both-NaN stays with the host's minNum/maxNum result.
+        self.a.tst_imm(SRC0, 1).unwrap();
+        let check_b = self.a.pos();
+        self.a.b_cond(Cond::Eq, check_b);
+        self.a.tst_imm(SRC1, 2).unwrap();
+        self.a.b_cond(Cond::Ne, check_b);
+        self.a.fmov_d(d, b);
+        let done = self.a.pos();
+        self.a.b(0);
+
+        let check_b_label = self.a.pos();
+        self.a.patch(check_b, check_b_label);
+        self.a.tst_imm(SRC1, 1).unwrap();
+        let skip_b = self.a.pos();
+        self.a.b_cond(Cond::Eq, skip_b);
+        self.a.tst_imm(SRC0, 2).unwrap();
+        let skip_a = self.a.pos();
+        self.a.b_cond(Cond::Ne, skip_a);
+        self.a.fmov_d(d, a);
+        let end = self.a.pos();
+        self.a.patch(skip_b, end);
+        self.a.patch(skip_a, end);
+        self.a.patch(done, end);
+    }
+
+    /// Pack NaN information from raw bits: bit 1 means NaN, bit 0 means signaling NaN.
+    fn nan_flags(&mut self, w: FWidth, bits: Reg, out: Reg) {
+        let (exp_max, quiet) = match w {
+            FWidth::S => (0xff, 0x0040_0000),
+            FWidth::D => (0x7ff, 1u64 << 51),
+        };
+        match w {
+            FWidth::S => {
+                self.a.ubfm_w(ADDR, bits, 23, 30);
+                self.a.ubfm_w(DST, bits, 0, 22);
+            }
+            FWidth::D => {
+                self.a.ubfm(ADDR, bits, 52, 62);
+                self.a.ubfm(DST, bits, 0, 51);
+            }
+        }
+        match w {
+            FWidth::S => self.a.cmp_imm_w(ADDR, exp_max),
+            FWidth::D => self.a.cmp_imm(ADDR, exp_max),
+        }
+        self.a.cset(out, Cond::Eq);
+        match w {
+            FWidth::S => self.a.cmp_imm_w(DST, 0),
+            FWidth::D => self.a.cmp_imm(DST, 0),
+        }
+        self.a.cset(ADDR, Cond::Ne);
+        self.a.and(out, out, ADDR);
+        self.a.tst_imm(DST, quiet).unwrap();
+        self.a.cset(ADDR, Cond::Eq);
+        self.a.and(ADDR, out, ADDR);
+        self.a.lsl_imm(out, out, 1);
+        self.a.orr(out, out, ADDR);
+    }
+
+    /// The guest's `time` CSR: CNTVCT scaled to the 10 MHz timebase the interpreter uses.
+    fn time(&mut self, d: Reg) {
+        self.a.mrs_cntvct(SRC0);
+        self.a.mrs_cntfrq(SRC1);
+        self.a.udiv(ADDR, SRC0, SRC1);
+        self.a.msub(DST, ADDR, SRC1, SRC0);
+        self.a.mov_imm(SRC0, 10_000_000);
+        self.a.mul(ADDR, ADDR, SRC0);
+        self.a.mul(DST, DST, SRC0);
+        self.a.udiv(DST, DST, SRC1);
+        self.a.add(d, ADDR, DST);
     }
 
     /// Copy `f[r]`'s raw 64 bits into general register `g`.
@@ -2656,6 +2909,8 @@ fn f_single_reads(inst: Inst) -> [Option<u8>; 3] {
             [Some(rs1), Some(rs2), Some(rs3)]
         }
         Inst::FCmp { width: FWidth::S, rs1, rs2, .. } => [Some(rs1), Some(rs2), None],
+        Inst::FMinMax { width: FWidth::S, rs1, rs2, .. } => [Some(rs1), Some(rs2), None],
+        Inst::FClass { width: FWidth::S, rs1, .. } => [Some(rs1), None, None],
         // fcvt.d.s reads its single source with the boxing rule; both int conversions too.
         Inst::FCvtFloat { to: FWidth::D, rs1, .. } => [Some(rs1), None, None],
         Inst::FCvtToInt { from: FWidth::S, rs1, rm, .. } if rm != RM_DYN => [Some(rs1), None, None],
@@ -2676,6 +2931,7 @@ fn f_write(inst: Inst) -> Option<u8> {
         | Inst::FArith { rd, .. }
         | Inst::FSqrt { rd, .. }
         | Inst::FFma { rd, .. }
+        | Inst::FMinMax { rd, .. }
         | Inst::FSgnj { rd, .. }
         | Inst::FCvtFloat { rd, .. }
         | Inst::FCvtFromInt { rd, .. } => Some(rd),
