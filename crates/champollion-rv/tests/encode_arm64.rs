@@ -254,6 +254,9 @@ fn matches_assembler() {
     a.cnt16b(16, 17);
     a.addv16b(18, 19);
     a.cmeq_zero16b(20, 21);
+    a.vec_cmeq_zero(16, 24, 25);
+    a.vec_cmeq_zero(32, 26, 27);
+    a.vec_cmeq_zero(64, 28, 29);
     a.mvn16b(22, 23);
     a.rbit16b(16, 16);
     a.rbit16b(3, 5);

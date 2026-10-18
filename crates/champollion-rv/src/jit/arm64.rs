@@ -926,6 +926,10 @@ impl Asm {
     pub fn cmeq_zero16b(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x4e20_9800 | (rn as u32) << 5 | rd as u32);
     }
+    /// `cmeq vd.<T>, vn.<T>, #0`: all ones in elements equal to zero.
+    pub fn vec_cmeq_zero(&mut self, size: u32, rd: Reg, rn: Reg) {
+        self.emit(0x4e20_9800 | Self::vec_size(size) | (rn as u32) << 5 | rd as u32);
+    }
     pub fn mvn16b(&mut self, rd: Reg, rn: Reg) {
         self.emit(0x6e20_5800 | (rn as u32) << 5 | rd as u32);
     }

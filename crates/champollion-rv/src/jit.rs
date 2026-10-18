@@ -1851,6 +1851,133 @@ mod tests {
         }
     }
 
+    /// Masked lane-wise integer arithmetic, including both source alias shapes. A
+    /// destination that overlaps v0 is reserved by the spec and stays on the interpreter.
+    #[test]
+    fn masked_vector_arith_matches_the_interpreter() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle =
+            |f3: u32, vd: u32, rs1: u32| (1 << 25) | (f3 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse =
+            |f3: u32, vs3: u32, rs1: u32| (1 << 25) | (f3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
+            (f6 << 26) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vx = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
+            (f6 << 26) | (vs2 << 20) | (rs1 << 15) | (0b100 << 12) | (vd << 7) | 0x57
+        };
+        let vi = |f6: u32, vd: u32, vs2: u32, imm: u32| {
+            (f6 << 26) | (vs2 << 20) | (imm << 15) | (0b011 << 12) | (vd << 7) | 0x57
+        };
+
+        // (element bytes, vtype, vlmax, load/store funct3)
+        let cases = [
+            (1u32, 0xc0u32, 16u32, 0u32),
+            (2, 0xc8, 8, 0b101),
+            (4, 0xd0, 4, 0b110),
+            (8, 0xd8, 2, 0b111),
+        ];
+        for (bytes, vtype, avl, f3) in cases {
+            for mask in [[0x03u8, 0x5a], [0xff, 0x00]] {
+                let mut prog = vec![
+                    vsetivli(0, avl, vtype),
+                    vle(f3, 1, 11),        // v1 = a
+                    vle(f3, 2, 12),        // v2 = b
+                    vle(f3, 0, 13),        // v0 = mask
+                    vv(0b000000, 3, 1, 2), // vadd.vv v3, v1, v2, v0.t
+                    vse(f3, 3, 14),
+                    vv(0b000010, 4, 1, 2), // vsub.vv v4, v1, v2, v0.t
+                    vse(f3, 4, 15),
+                    vv(0b001001, 5, 1, 2), // vand.vv v5, v1, v2, v0.t
+                    vse(f3, 5, 16),
+                ];
+                // vmul tops out at 4s in NEON, so e64 keeps interpreting it.
+                if bytes != 8 {
+                    prog.push(vv(0b100101, 6, 1, 2)); // vmul.vv v6, v1, v2, v0.t
+                    prog.push(vse(f3, 6, 17));
+                }
+                prog.extend([
+                    vx(0b101000, 7, 1, 10), // vsrl.vx v7, v1, a0, v0.t
+                    vse(f3, 7, 18),
+                    vi(0b101001, 8, 1, 2), // vsra.vi v8, v1, 2, v0.t
+                    vse(f3, 8, 19),
+                    vv(0b000000, 2, 2, 1), // vadd.vv v2, v2, v1, v0.t (vd == vs2)
+                    vse(f3, 2, 20),
+                    vv(0b000000, 2, 1, 2), // vadd.vv v2, v1, v2, v0.t (vd == vs1)
+                    vse(f3, 2, 21),
+                    ECALL,
+                ]);
+                let data = |mem: &GuestMemory| {
+                    let mut a = [0u8; 16];
+                    let mut b = [0u8; 16];
+                    for i in 0..16 {
+                        a[i] = (i as u8).wrapping_mul(37).wrapping_add(11);
+                        b[i] = (i as u8).wrapping_mul(53).wrapping_add(7);
+                    }
+                    mem.write_privileged(DATA, &a).unwrap();
+                    mem.write_privileged(DATA + 16, &b).unwrap();
+                    let mut m = [0xffu8; 16];
+                    m[0] = mask[0];
+                    m[1] = mask[1];
+                    mem.write_privileged(DATA + 32, &m).unwrap();
+                };
+                let init = |cpu: &mut CpuState| {
+                    for (r, v) in [
+                        (11u8, DATA),
+                        (12, DATA + 16),
+                        (13, DATA + 32),
+                        (14, DATA + 64),
+                        (15, DATA + 80),
+                        (16, DATA + 96),
+                        (17, DATA + 112),
+                        (18, DATA + 128),
+                        (19, DATA + 144),
+                        (20, DATA + 160),
+                        (21, DATA + 176),
+                        (10, 3),
+                    ] {
+                        cpu.set_x(r, v);
+                    }
+                };
+                let mem_i = setup(&prog);
+                data(&mem_i);
+                let mut oracle = CpuState::new(CODE);
+                init(&mut oracle);
+                let want = loop {
+                    if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                        break t;
+                    }
+                };
+                let mem_j = setup(&prog);
+                data(&mem_j);
+                let mut cpu = CpuState::new(CODE);
+                init(&mut cpu);
+                let mut jit = Jit::new().unwrap();
+                let got = jit.run(&mut cpu, &mem_j);
+                let label = format!("e{} mask {:02x?}", bytes * 8, mask);
+                assert_eq!(got, want, "{label}: trap");
+                for r in 0..32 {
+                    assert_eq!(cpu.v[r], oracle.v[r], "{label}: v{r}");
+                }
+                assert_eq!(cpu, oracle, "{label}: state");
+                assert_eq!(
+                    jit.stats.interpreted.get("VArith"),
+                    None,
+                    "{label}: masked arithmetic left the JIT"
+                );
+                for off in (64u64..=176).step_by(16) {
+                    let mut a = [0u8; 16];
+                    let mut b = [0u8; 16];
+                    mem_i.read_privileged(DATA + off, &mut a).unwrap();
+                    mem_j.read_privileged(DATA + off, &mut b).unwrap();
+                    assert_eq!(a, b, "{label}: store at +{off} differs");
+                }
+            }
+        }
+    }
+
     #[test]
     fn vector_unary_ops_match_the_interpreter() {
         fn check(

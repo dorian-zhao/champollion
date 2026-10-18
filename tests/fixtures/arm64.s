@@ -238,6 +238,9 @@ add x9, x10, w11, uxtw #3
 cnt v16.16b, v17.16b
 addv b18, v19.16b
 cmeq v20.16b, v21.16b, #0
+cmeq v24.8h, v25.8h, #0
+cmeq v26.4s, v27.4s, #0
+cmeq v28.2d, v29.2d, #0
 mvn v22.16b, v23.16b
 rbit v16.16b, v16.16b
 rbit v3.16b, v5.16b

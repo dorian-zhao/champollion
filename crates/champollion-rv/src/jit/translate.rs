@@ -2345,7 +2345,10 @@ impl Tx {
         let bits = bytes * 8;
         self.vec_m2_b = None;
         if mask {
-            return false;
+            if self.vec_regs != 1 {
+                return false;
+            }
+            return self.vector_arith_masked(op, vd, vs2, src, bytes, bits);
         }
         if self.vec_regs > 1 {
             let regs = self.vec_regs;
@@ -2518,6 +2521,145 @@ impl Tx {
         self.v_str(FA, vd);
         self.vec_last = Some(vd);
         true
+    }
+
+    /// A masked lane-wise integer op at m1: compute every lane, then blend the old
+    /// destination back in where v0's bit is clear. Integer arithmetic has no flags, so
+    /// evaluating the inactive lanes is unobservable.
+    fn vector_arith_masked(
+        &mut self,
+        op: VArithOp,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+        bytes: u32,
+        bits: u32,
+    ) -> bool {
+        let supported = matches!(
+            op,
+            VArithOp::Add
+                | VArithOp::Rsub
+                | VArithOp::Sub
+                | VArithOp::And
+                | VArithOp::Andn
+                | VArithOp::Or
+                | VArithOp::Xor
+                | VArithOp::Mul
+                | VArithOp::Srl
+                | VArithOp::Sra
+        );
+        if !supported || (op == VArithOp::Mul && bits == 64) {
+            return false;
+        }
+        // The spec reserves masked arithmetic whose destination overlaps the mask
+        // register; leave those encodings to the interpreter rather than invent a
+        // semantics for them.
+        if vd == 0 {
+            return false;
+        }
+        // The destination is a source here too. Load it before anything can overwrite it,
+        // so the merge value wins over any source that aliases it.
+        self.v_ldr(FB, vd);
+        self.v_ldr(FA, vs2);
+        match (op, src) {
+            (VArithOp::Srl | VArithOp::Sra, VSel::I(imm)) => {
+                let k = u32::from(imm) & (bits - 1);
+                if k > 0 {
+                    if op == VArithOp::Srl {
+                        self.a.vec_ushr_imm(bits, FA, FA, k);
+                    } else {
+                        self.a.vec_sshr_imm(bits, FA, FA, k);
+                    }
+                }
+            }
+            (VArithOp::Srl | VArithOp::Sra, VSel::X(r)) => {
+                let x = self.src(r, SRC0);
+                self.a.mov_imm(SRC1, u64::from(bits - 1));
+                self.a.and(SRC1, x, SRC1);
+                self.a.sub(SRC1, XZR, SRC1);
+                self.a.vec_dup(FC, SRC1, bytes);
+                if op == VArithOp::Srl {
+                    self.a.vec_ushl(bits, FA, FA, FC);
+                } else {
+                    self.a.vec_sshl(bits, FA, FA, FC);
+                }
+            }
+            (VArithOp::Srl | VArithOp::Sra, VSel::V(vs1)) => {
+                self.v_ldr(FC, vs1);
+                self.a.mov_imm(SRC0, u64::from(bits - 1));
+                self.a.vec_dup(FR, SRC0, bytes);
+                self.a.vec_and(FC, FC, FR);
+                self.a.vec_dup(FR, XZR, bytes);
+                self.a.vec_sub(bits, FC, FR, FC);
+                if op == VArithOp::Srl {
+                    self.a.vec_ushl(bits, FA, FA, FC);
+                } else {
+                    self.a.vec_sshl(bits, FA, FA, FC);
+                }
+            }
+            _ => {
+                if !self.vector_operand(src, FC, bytes) {
+                    return false;
+                }
+                match op {
+                    VArithOp::Add => self.a.vec_add(bits, FA, FA, FC),
+                    VArithOp::Sub => self.a.vec_sub(bits, FA, FA, FC),
+                    VArithOp::Rsub => self.a.vec_sub(bits, FA, FC, FA),
+                    VArithOp::And => self.a.vec_and(FA, FA, FC),
+                    VArithOp::Andn => {
+                        self.a.mvn16b(FC, FC);
+                        self.a.vec_and(FA, FA, FC);
+                    }
+                    VArithOp::Or => self.a.vec_orr(FA, FA, FC),
+                    VArithOp::Mul => self.a.vec_mul(bits, FA, FA, FC),
+                    _ => self.a.vec_eor(FA, FA, FC),
+                }
+            }
+        }
+        self.vector_mask_expand(bytes);
+        self.a.vec_bit(FB, FA, FR);
+        self.v_str(FB, vd);
+        self.vec_last = None;
+        true
+    }
+
+    /// Expand the low `vlmax` bits of v0 into all-ones/all-zero elements of `FR`.
+    ///
+    /// Each mask byte becomes eight bytes holding its bits in the low bit of each byte;
+    /// repeated `zip1.16b` then doubles those bytes until they fill the element width.
+    fn vector_mask_expand(&mut self, bytes: u32) {
+        let groups = (16 / bytes).div_ceil(8);
+        self.a.ldr_off(SRC0, CTX, v_offset(0));
+        // Broadcast each byte with a multiply, then keep bit k of byte k: exactly the
+        // eight element selectors that byte holds.
+        self.a.mov_imm(ADDR, 0x0101_0101_0101_0101);
+        self.a.mov_imm(DST, 0x8040_2010_0804_0201);
+        for k in 0..groups {
+            if k == 0 {
+                self.a.and_imm(SRC1, SRC0, 0xff).unwrap();
+            } else {
+                self.a.lsr_imm(SRC1, SRC0, 8 * k);
+                self.a.and_imm(SRC1, SRC1, 0xff).unwrap();
+            }
+            self.a.mul(SRC1, SRC1, ADDR);
+            self.a.and(SRC1, SRC1, DST);
+            let dst = if k == 0 { FR } else { FC };
+            self.a.fmov_from_gpr(Fp::D, dst, SRC1);
+            if k > 0 {
+                self.a.vec_ins_last(FR, dst, 8);
+            }
+        }
+        // Each representative byte still holds its bit's value (1, 2, 4, ...); clamp it
+        // to one before duplicating it across the element.
+        self.a.movi16b_one(FC);
+        self.a.vec_umin(8, FR, FR, FC);
+        for _ in 0..bytes.trailing_zeros() {
+            self.a.vec_zip1_16b(FR, FR, FR);
+        }
+        // Element lanes are 1 where selected (0x0101.. after zipping); compare against
+        // zero and invert for the all-ones mask.
+        self.a.vec_cmeq_zero(bytes * 8, FR, FR);
+        self.a.mvn16b(FR, FR);
     }
 
     /// Zvbb rotates: a pair of signed shifts (NEON's `ushl` shifts left for positive
