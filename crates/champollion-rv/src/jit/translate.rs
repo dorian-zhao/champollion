@@ -2046,7 +2046,7 @@ impl Tx {
     /// Zvbb's single-source bit operations at m1 with a full `vl`.
     fn vector_unary(&mut self, op: VUnaryOp, mask: bool, vd: u8, vs2: u8) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
-        if mask || self.vec_regs != 1 {
+        if self.vec_regs != 1 {
             return false;
         }
         self.v_ldr(FA, vs2);
@@ -2089,7 +2089,16 @@ impl Tx {
                 }
             }
         }
-        self.v_str(FA, vd);
+        if mask {
+            // Compute first, then merge: the bit-reversal helpers borrow every scratch
+            // register, so the old destination can only be loaded afterwards.
+            self.v_ldr(FB, vd);
+            self.vector_mask_expand(bytes);
+            self.a.vec_bit(FB, FA, FR);
+            self.v_str(FB, vd);
+        } else {
+            self.v_str(FA, vd);
+        }
         true
     }
 

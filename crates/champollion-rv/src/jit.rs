@@ -1980,6 +1980,7 @@ mod tests {
 
     #[test]
     fn vector_unary_ops_match_the_interpreter() {
+        #[allow(clippy::too_many_arguments)]
         fn check(
             wf3: u32,
             vtype: u32,
@@ -1987,6 +1988,7 @@ mod tests {
             bytes: usize,
             sel: u32,
             data: Vec<u8>,
+            masked: bool,
             translated: bool,
         ) {
             let vsetivli = |rd: u32, avl: u32, vtype: u32| {
@@ -2000,21 +2002,28 @@ mod tests {
             };
             let vun = |sel: u32, vd: u32, vs2: u32| {
                 (0b010010 << 26)
-                    | (1 << 25)
+                    | (u32::from(!masked) << 25)
                     | (vs2 << 20)
                     | (sel << 15)
                     | (0b010 << 12)
                     | (vd << 7)
                     | 0x57
             };
-            let prog =
-                [vsetivli(0, avl, vtype), vle(wf3, 1, 11), vun(sel, 2, 1), vse(wf3, 2, 12), ECALL];
-            let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data).unwrap();
+            let mut prog = vec![vsetivli(0, avl, vtype), vle(wf3, 0, 13), vle(wf3, 1, 11)];
+            prog.extend([vun(sel, 2, 1), vse(wf3, 2, 12), ECALL]);
+            let fill = |mem: &GuestMemory| {
+                mem.write_privileged(DATA, &data).unwrap();
+                let mut m = [0xffu8; 16];
+                m[0] = 0x03;
+                m[1] = 0x5a;
+                mem.write_privileged(DATA + 0x300, &m).unwrap();
+            };
             let mem_i = setup(&prog);
             fill(&mem_i);
             let mut oracle = CpuState::new(CODE);
             oracle.set_x(11, DATA);
             oracle.set_x(12, DATA + 0x200);
+            oracle.set_x(13, DATA + 0x300);
             let want = loop {
                 if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
                     break t;
@@ -2025,6 +2034,7 @@ mod tests {
             let mut cpu = CpuState::new(CODE);
             cpu.set_x(11, DATA);
             cpu.set_x(12, DATA + 0x200);
+            cpu.set_x(13, DATA + 0x300);
             let mut jit = Jit::new().unwrap();
             let got = jit.run(&mut cpu, &mem_j);
             assert_eq!(got, want);
@@ -2053,11 +2063,15 @@ mod tests {
         for (sel, translated64) in
             [(8, true), (9, true), (10, true), (12, true), (13, true), (14, true)]
         {
-            check(0, 0xc0, 16, 16, sel, e8.clone(), true);
-            check(5, 0xc8, 8, 16, sel, e16.clone(), true);
-            check(6, 0xd0, 4, 16, sel, e32.clone(), true);
+            check(0, 0xc0, 16, 16, sel, e8.clone(), false, true);
+            check(5, 0xc8, 8, 16, sel, e16.clone(), false, true);
+            check(6, 0xd0, 4, 16, sel, e32.clone(), false, true);
             let translated = translated64 && sel != 12 && sel != 13;
-            check(7, 0xd8, 2, 16, sel, e64.clone(), translated);
+            check(7, 0xd8, 2, 16, sel, e64.clone(), false, translated);
+            check(0, 0xc0, 16, 16, sel, e8.clone(), true, true);
+            check(5, 0xc8, 8, 16, sel, e16.clone(), true, true);
+            check(6, 0xd0, 4, 16, sel, e32.clone(), true, true);
+            check(7, 0xd8, 2, 16, sel, e64.clone(), true, translated);
         }
     }
 
