@@ -10,6 +10,7 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/sysinfo.h>
@@ -40,6 +41,37 @@ int main(int argc, char **argv) {
     CHECK("fstat", fstat(fd, &st) == 0 && st.st_size == 11 && S_ISREG(st.st_mode));
     CHECK("close", close(fd) == 0);
     CHECK("stat", stat(path, &st) == 0 && st.st_size == 11);
+
+    // sendfile with an explicit offset, then utimensat/futimens.
+    char copy[4096];
+    snprintf(copy, sizeof copy, "%s/copy.txt", argc > 1 ? argv[1] : ".");
+    int src = open(path, O_RDONLY);
+    int dst = open(copy, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    off_t off = 0;
+    CHECK("sendfile", src >= 0 && dst >= 0 && sendfile(dst, src, &off, 11) == 11 &&
+                          off == 11 && pread(dst, buf, 11, 0) == 11 &&
+                          memcmp(buf, "champollion", 11) == 0);
+    close(src);
+    close(dst);
+    struct timespec times[2] = {
+        {.tv_sec = 1600000000, .tv_nsec = 0},
+        {.tv_sec = 1600000001, .tv_nsec = 0},
+    };
+    CHECK("utimensat", utimensat(AT_FDCWD, copy, times, 0) == 0 && stat(copy, &st) == 0 &&
+                           st.st_atim.tv_sec == 1600000000 &&
+                           st.st_mtim.tv_sec == 1600000001);
+    int copy_fd = open(copy, O_RDONLY);
+    CHECK("futimens", copy_fd >= 0 &&
+                          futimens(copy_fd, (struct timespec[]){{1600000002, 0}, {1600000003, 0}}) == 0 &&
+                          fstat(copy_fd, &st) == 0 && st.st_atim.tv_sec == 1600000002 &&
+                          st.st_mtim.tv_sec == 1600000003);
+    if (copy_fd >= 0) close(copy_fd);
+    struct timespec sentinels[2] = {{.tv_nsec = UTIME_NOW}, {.tv_nsec = UTIME_OMIT}};
+    CHECK("utimens sentinels", utimensat(AT_FDCWD, copy, sentinels, 0) == 0 &&
+                                   stat(copy, &st) == 0 &&
+                                   st.st_atim.tv_sec > 1600000003 &&
+                                   st.st_mtim.tv_sec == 1600000003);
+
     char exe[4096];
     ssize_t exe_len = readlink("/proc/self/exe", exe, sizeof exe);
     CHECK("exe", exe_len > 0 && exe[0] == '/' && (size_t)exe_len < sizeof exe);

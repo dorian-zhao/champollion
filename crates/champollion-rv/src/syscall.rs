@@ -97,6 +97,7 @@ syscalls! {
     WRITEV = 66 "writev",
     PREAD64 = 67 "pread64",
     PWRITE64 = 68 "pwrite64",
+    SENDFILE = 71 "sendfile",
     PSELECT6 = 72 "pselect6",
     PPOLL = 73 "ppoll",
     READLINKAT = 78 "readlinkat",
@@ -258,6 +259,14 @@ pub struct Identity {
     pub egid: u32,
 }
 
+/// One entry of the Linux `utimensat` `times[2]` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeSpec {
+    At(i64, i64),
+    Now,
+    Omit,
+}
+
 /// Host operating-system services the syscall layer needs.
 ///
 /// Arguments carry **Linux** values (flags, `whence`, clock ids, `AT_FDCWD`, ...); each
@@ -346,6 +355,12 @@ pub trait HostOs: Send + Sync {
         Err(errno::ENOSYS)
     }
     fn writev(&self, fd: i32, bufs: &[GuestBuf]) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `sendfile`: copy up to `count` bytes from `in_fd` to `out_fd`. With an explicit
+    /// offset, leave the input file position unchanged; otherwise advance it by the bytes
+    /// copied.
+    fn sendfile(&self, out_fd: i32, in_fd: i32, offset: Option<u64>, count: usize) -> SysResult {
         Err(errno::ENOSYS)
     }
     fn pread(&self, fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
@@ -487,6 +502,17 @@ pub trait HostOs: Send + Sync {
         Err(errno::ENOSYS)
     }
     fn fchmodat(&self, dirfd: i32, path: &CStr, mode: u32, flags: i32) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `utimensat`; `path == None` updates `dirfd` itself. Times carry the Linux
+    /// `UTIME_NOW`/`UTIME_OMIT` values, which a backend translates.
+    fn utimensat(
+        &self,
+        dirfd: i32,
+        path: Option<&CStr>,
+        times: Option<[TimeSpec; 2]>,
+        flags: i32,
+    ) -> SysResult {
         Err(errno::ENOSYS)
     }
     fn umask(&self, mask: u32) -> u32 {
@@ -723,6 +749,28 @@ fn read_timespec(p: &Process, addr: u64) -> Result<(i64, i64), i32> {
         return Err(errno::EINVAL);
     }
     Ok((sec, nsec))
+}
+
+/// Linux `UTIME_NOW` and `UTIME_OMIT`, the two non-range `tv_nsec` values.
+const UTIME_NOW: i64 = 1_073_741_823;
+const UTIME_OMIT: i64 = 1_073_741_822;
+
+fn read_utimens_times(p: &Process, addr: u64) -> Result<[TimeSpec; 2], i32> {
+    let mut b = [0u8; 32];
+    p.mem.read(addr, &mut b).map_err(efault)?;
+    let mut times = [TimeSpec::Now; 2];
+    for (i, slot) in times.iter_mut().enumerate() {
+        let at = i * 16;
+        let sec = i64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(b[at + 8..at + 16].try_into().unwrap());
+        *slot = match nsec {
+            UTIME_NOW => TimeSpec::Now,
+            UTIME_OMIT => TimeSpec::Omit,
+            0..1_000_000_000 => TimeSpec::At(sec, nsec),
+            _ => return Err(errno::EINVAL),
+        };
+    }
+    Ok(times)
 }
 
 /// asm-generic `struct flock`: l_type, l_whence (i16), l_start, l_len (i64), l_pid (i32).
@@ -1274,6 +1322,33 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             if nr == nr::READV { host.readv(fd, &bufs) } else { host.writev(fd, &bufs) }
         }
         nr::PREAD64 => host.pread(fd, buf(a[1], a[2], Prot::WRITE)?, a[3] as i64),
+        nr::SENDFILE => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                let offset = if a[2] == 0 {
+                    None
+                } else {
+                    let mut b = [0u8; 8];
+                    p.mem.read(a[2], &mut b).map_err(efault)?;
+                    let v = i64::from_le_bytes(b);
+                    if v < 0 {
+                        return Err(errno::EINVAL);
+                    }
+                    Some(v as u64)
+                };
+                let count = usize::try_from(a[3]).map_err(|_| errno::EINVAL)?;
+                if count > i64::MAX as usize {
+                    return Err(errno::EINVAL);
+                }
+                let n = host.sendfile(fd, a[1] as i32, offset, count)?;
+                if let Some(start) = offset {
+                    let end = start.checked_add(n).ok_or(errno::EINVAL)?;
+                    put(p, a[2], &end.to_le_bytes())?;
+                }
+                Ok(n)
+            }
+        }
         nr::OPENAT => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;
             let flags = a[2] as i32;
@@ -1327,6 +1402,25 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             let follow = a[3] & AT_SYMLINK_NOFOLLOW == 0;
             let st = host.fstatat(fd, &p.host_path(&path, follow), a[3] as i32)?;
             write_stat(p, a[2], &st)
+        }
+        nr::UTIMENSAT => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+                if a[3] & !AT_SYMLINK_NOFOLLOW != 0 {
+                    return Err(errno::EINVAL);
+                }
+                let path = if a[1] == 0 {
+                    None
+                } else {
+                    Some(p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?)
+                };
+                let times = if a[2] == 0 { None } else { Some(read_utimens_times(p, a[2])?) };
+                let host_path =
+                    path.as_ref().map(|path| p.host_path(path, a[3] & AT_SYMLINK_NOFOLLOW == 0));
+                host.utimensat(fd, host_path.as_deref(), times, a[3] as i32)
+            }
         }
         nr::STATX => {
             let path = p.mem.read_cstr(a[1], PATH_MAX).map_err(efault)?;

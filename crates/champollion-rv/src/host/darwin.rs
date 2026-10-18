@@ -7,7 +7,9 @@
 use std::ffi::CStr;
 
 use crate::memory::GuestBuf;
-use crate::syscall::{AT_FDCWD, Flock, HostOs, Identity, PollFd, Rusage, Stat, SysResult, errno};
+use crate::syscall::{
+    AT_FDCWD, Flock, HostOs, Identity, PollFd, Rusage, Stat, SysResult, TimeSpec, errno,
+};
 
 /// The Darwin backend. Guest fds are host fds; the only state kept here is for what Darwin
 /// lacks: eventfds (epoll instances are plain kqueues) and directory streams for
@@ -484,6 +486,86 @@ impl HostOs for DarwinHost {
         check(unsafe { libc::writev(fd, bufs.as_ptr().cast(), bufs.len() as i32) })
     }
 
+    fn sendfile(&self, out_fd: i32, in_fd: i32, offset: Option<u64>, count: usize) -> SysResult {
+        if count == 0 {
+            return Ok(0);
+        }
+        let start = match offset {
+            Some(start) => start,
+            None => {
+                // SAFETY: no pointers.
+                let pos = unsafe { libc::lseek(in_fd, 0, libc::SEEK_CUR) };
+                if pos < 0 {
+                    return Err(last_errno());
+                }
+                pos as u64
+            }
+        };
+        let mut buf = vec![0u8; count.clamp(1, 64 * 1024)];
+        let mut done = 0u64;
+        let mut error = None;
+        while (done as usize) < count {
+            let Some(at) = start.checked_add(done).filter(|&v| v <= i64::MAX as u64) else {
+                if done == 0 {
+                    return Err(errno::EINVAL);
+                }
+                break;
+            };
+            let want = (count - done as usize).min(buf.len());
+            // SAFETY: buf is valid for `want` bytes; the host validates the file offsets.
+            let n = unsafe { libc::pread(in_fd, buf.as_mut_ptr().cast(), want, at as libc::off_t) };
+            if n < 0 {
+                let e = last_errno();
+                if e == errno::EINTR {
+                    continue;
+                }
+                if done == 0 {
+                    return Err(e);
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            let mut written = 0usize;
+            while written < n as usize {
+                // SAFETY: the source range is inside `buf`; the kernel validates out_fd.
+                let w = unsafe {
+                    libc::write(out_fd, buf[written..].as_ptr().cast(), n as usize - written)
+                };
+                if w < 0 {
+                    let e = last_errno();
+                    if e == errno::EINTR {
+                        continue;
+                    }
+                    error = Some(e);
+                    break;
+                }
+                if w == 0 {
+                    break;
+                }
+                written += w as usize;
+            }
+            done += written as u64;
+            if written < n as usize || error.is_some() {
+                break;
+            }
+        }
+        if offset.is_none() && done > 0 {
+            // SAFETY: no pointers; the input fd is seekable when sendfile is meaningful.
+            let ret = unsafe { libc::lseek(in_fd, done as libc::off_t, libc::SEEK_CUR) };
+            if ret < 0 {
+                return Err(last_errno());
+            }
+        }
+        if done == 0
+            && let Some(e) = error
+        {
+            return Err(e);
+        }
+        Ok(done)
+    }
+
     fn pread(&self, fd: i32, buf: GuestBuf, offset: i64) -> SysResult {
         // SAFETY: the kernel validates the destination.
         check(unsafe { libc::pread(fd, buf.ptr.cast(), buf.len, offset) })
@@ -829,6 +911,38 @@ impl HostOs for DarwinHost {
             as isize)
     }
 
+    fn utimensat(
+        &self,
+        fd: i32,
+        path: Option<&CStr>,
+        times: Option<[TimeSpec; 2]>,
+        flags: i32,
+    ) -> SysResult {
+        let times = times.map(|times| {
+            times.map(|time| match time {
+                TimeSpec::At(sec, nsec) => {
+                    libc::timespec { tv_sec: sec as libc::time_t, tv_nsec: nsec as libc::c_long }
+                }
+                TimeSpec::Now => libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW },
+                TimeSpec::Omit => libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+            })
+        });
+        let ptr = times.as_ref().map_or(std::ptr::null(), |times| times.as_ptr());
+        match path {
+            Some(path) => {
+                let dflags = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+                    libc::AT_SYMLINK_NOFOLLOW
+                } else {
+                    0
+                };
+                // SAFETY: path is NUL-terminated and times, when present, has two entries.
+                check(unsafe { libc::utimensat(dirfd(fd), path.as_ptr(), ptr, dflags) } as isize)
+            }
+            // SAFETY: no path; futimens validates the descriptor and the optional array.
+            None => check(unsafe { libc::futimens(fd, ptr) } as isize),
+        }
+    }
+
     fn umask(&self, mask: u32) -> u32 {
         // SAFETY: no pointers.
         unsafe { libc::umask(mask as libc::mode_t) as u32 }
@@ -1118,6 +1232,69 @@ mod tests {
 
         let missing = std::ffi::CString::new(dir.join("nope").to_str().unwrap()).unwrap();
         assert_eq!(h.openat(AT_FDCWD, &missing, 0, 0), Err(errno::ENOENT));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sendfile_copies_from_an_offset_and_tracks_the_file_position() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("champollion-sendfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in");
+        std::fs::write(&input, b"hello world").unwrap();
+        let infile = std::fs::File::open(&input).unwrap();
+        let out1 = std::fs::File::create(dir.join("out1")).unwrap();
+        let out2 = std::fs::File::create(dir.join("out2")).unwrap();
+        let h = DarwinHost::default();
+
+        assert_eq!(h.sendfile(out1.as_raw_fd(), infile.as_raw_fd(), Some(6), 5), Ok(5));
+        assert_eq!(std::fs::read(dir.join("out1")).unwrap(), b"world");
+        assert_eq!(h.lseek(infile.as_raw_fd(), 0, libc::SEEK_CUR), Ok(0));
+
+        assert_eq!(h.sendfile(out2.as_raw_fd(), infile.as_raw_fd(), None, 5), Ok(5));
+        assert_eq!(std::fs::read(dir.join("out2")).unwrap(), b"hello");
+        assert_eq!(h.lseek(infile.as_raw_fd(), 0, libc::SEEK_CUR), Ok(5));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn utimensat_sets_times_and_translates_now_and_omit() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("champollion-utimens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let h = DarwinHost::default();
+        let at = 1_600_000_000;
+
+        assert_eq!(
+            h.utimensat(
+                AT_FDCWD,
+                Some(&cpath),
+                Some([TimeSpec::At(at, 0), TimeSpec::At(at + 1, 0)]),
+                0,
+            ),
+            Ok(0)
+        );
+        let st = h.fstatat(AT_FDCWD, &cpath, 0).unwrap();
+        assert_eq!((st.atime.0, st.mtime.0), (at, at + 1));
+
+        assert_eq!(
+            h.utimensat(AT_FDCWD, Some(&cpath), Some([TimeSpec::Now, TimeSpec::Omit]), 0),
+            Ok(0)
+        );
+        let st = h.fstatat(AT_FDCWD, &cpath, 0).unwrap();
+        assert!(st.atime.0 > at);
+        assert_eq!(st.mtime.0, at + 1);
+
+        assert_eq!(
+            h.utimensat(file.as_raw_fd(), None, Some([TimeSpec::At(at + 2, 0); 2]), 0),
+            Ok(0)
+        );
+        let st = h.fstat(file.as_raw_fd()).unwrap();
+        assert_eq!((st.atime.0, st.mtime.0), (at + 2, at + 2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
