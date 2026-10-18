@@ -510,6 +510,14 @@ pub enum Inst {
         vs2: u8,
         src: VSel,
     },
+    /// Zvbb widening shift left (`vwsll.vv`/`.vx`/`.vi`): the SEW-wide source is
+    /// shifted and zero-extended into a 2×SEW destination group.
+    VWShift {
+        mask: bool,
+        vd: u8,
+        vs2: u8,
+        src: VSel,
+    },
     /// Zicbom/Zicboz `cbo.*`: clean/flush/invalidate/zero the block at `x[rs1]`.
     Cbo {
         op: CboOp,

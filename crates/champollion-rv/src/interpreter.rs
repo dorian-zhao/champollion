@@ -508,6 +508,7 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
         Inst::VUnary { op, mask, vd, vs2 } => vector::exec_unary(cpu, op, mask, vd, vs2),
         Inst::VCompress { vd, vs2, vs1 } => vector::exec_compress(cpu, vd, vs2, vs1),
         Inst::VWiden { mask, vd, vs2, src } => vector::exec_widen(cpu, mask, vd, vs2, src),
+        Inst::VWShift { mask, vd, vs2, src } => vector::exec_wshift(cpu, mask, vd, vs2, src),
         Inst::VIndexLoad { width, mask, vd, rs1, vs2 } => {
             vector::exec_index_load(cpu, mem, width.bytes(), mask, vd, rs1, vs2)
                 .map_err(|fault| Trap::LoadFault { pc, fault })?;

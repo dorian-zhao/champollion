@@ -99,6 +99,9 @@ vmerge.vxm v1, v2, a0, v0
 vcompress.vm v1, v2, v3
 vwaddu.wv v1, v2, v3
 vwaddu.wx v1, v2, a0
+vwsll.vv v1, v2, v3
+vwsll.vx v1, v2, a0
+vwsll.vi v1, v2, 3
 vnsrl.wv v1, v2, v3
 vnsrl.wx v1, v2, a0
 vnsra.wv v1, v2, v3

@@ -2190,6 +2190,98 @@ mod tests {
     }
 
     #[test]
+    fn vwsll_stays_in_the_jit() {
+        fn check(wf3_src: u32, wf3_dst: u32, vtype: u32, avl: u32, bytes: usize, data: Vec<u8>) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vle = |wf3: u32, vd: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vwsll_vv = |vd: u32, vs2: u32, vs1: u32| {
+                (0x35 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+            };
+            let vwsll_vx = |vd: u32, vs2: u32, rs1: u32| {
+                (0x35 << 26)
+                    | (1 << 25)
+                    | (vs2 << 20)
+                    | (rs1 << 15)
+                    | (0b100 << 12)
+                    | (vd << 7)
+                    | 0x57
+            };
+            let vwsll_vi = |vd: u32, vs2: u32, imm: u32| {
+                (0x35 << 26)
+                    | (1 << 25)
+                    | (vs2 << 20)
+                    | (imm << 15)
+                    | (0b011 << 12)
+                    | (vd << 7)
+                    | 0x57
+            };
+            let prog = [
+                vsetivli(0, avl, vtype),
+                vle(wf3_src, 1, 11),
+                vle(wf3_src, 2, 12),
+                vwsll_vv(3, 1, 2),
+                vse(wf3_dst, 3, 13),
+                addi(13, 13, 16),
+                vse(wf3_dst, 4, 13),
+                addi(13, 13, 16),
+                vwsll_vx(5, 1, 15),
+                vse(wf3_dst, 5, 13),
+                addi(13, 13, 16),
+                vse(wf3_dst, 6, 13),
+                addi(13, 13, 16),
+                vwsll_vi(7, 1, 3),
+                vse(wf3_dst, 7, 13),
+                addi(13, 13, 16),
+                vse(wf3_dst, 8, 13),
+                ECALL,
+            ];
+            let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data).unwrap();
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 0x200), (15, 5)] {
+                oracle.set_x(r, v);
+            }
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 0x200), (15, 5)] {
+                cpu.set_x(r, v);
+            }
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "vwsll state");
+            assert_eq!(jit.stats.interpreted.get("VWShift"), None, "vwsll stays in the JIT");
+            let mut got_bytes = vec![0u8; bytes * 4];
+            let mut want_bytes = vec![0u8; bytes * 4];
+            mem_j.read_privileged(DATA + 0x200, &mut got_bytes).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut want_bytes).unwrap();
+            assert_eq!(got_bytes, want_bytes, "vwsll result");
+        }
+
+        let e8: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(17).wrapping_add(3)).collect();
+        let e16: Vec<u8> = (0u16..16)
+            .map(|i| i.wrapping_mul(7001).wrapping_add(9))
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        check(0, 5, 0xc0, 16, 96, e8);
+        check(5, 6, 0xc8, 8, 96, e16);
+    }
+
+    #[test]
     fn vector_shift_sub_mul_match_the_interpreter() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57

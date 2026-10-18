@@ -660,6 +660,11 @@ impl Tx {
                     return false;
                 }
             }
+            Inst::VWShift { mask, vd, vs2, src } => {
+                if !self.vector_wshift(mask, vd, vs2, src) {
+                    return false;
+                }
+            }
             Inst::VMask { op, vd, vs1, vs2 } => {
                 if !self.vector_mask(op, vd, vs1, vs2) {
                     return false;
@@ -2242,6 +2247,58 @@ impl Tx {
         true
     }
 
+    /// Zvbb `vwsll`: widen each SEW element to 2×SEW and shift it left by the masked
+    /// amount. e8→e16 and e16→e32 fit two NEON lanes per destination register; e32→e64
+    /// stays on the interpreter.
+    fn vector_wshift(&mut self, mask: bool, vd: u8, vs2: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if mask || self.vec_regs != 1 || !matches!(bytes, 1 | 2) {
+            return false;
+        }
+        self.v_ldr(FA, vs2);
+        self.a.vec_ext(FB, FA, FA, 8);
+        let amount = |tx: &mut Self| {
+            if let VSel::I(imm) = src {
+                tx.a.mov_imm(ADDR, u64::from(imm));
+                tx.a.vec_dup(FC, ADDR, bytes);
+                true
+            } else {
+                tx.vector_operand(src, FC, bytes)
+            }
+        };
+        if !amount(self) {
+            return false;
+        }
+        if bytes == 1 {
+            // Mask each byte amount to log2(16) = 4 bits, then split into two halves.
+            self.a.vec_shl_16b(FC, FC, 4);
+            self.a.vec_ushr_16b(FC, FC, 4);
+            self.a.vec_ext(FR, FC, FC, 8);
+            self.a.vec_shl_16b(FR, FR, 4);
+            self.a.vec_ushr_16b(FR, FR, 4);
+            self.a.vec_shift_long(false, 8, FA, FA);
+            self.a.vec_shift_long(false, 8, FB, FB);
+            self.a.vec_shift_long(false, 8, FC, FC);
+            self.a.vec_shift_long(false, 8, FR, FR);
+            self.a.vec_ushl(16, FA, FA, FC);
+            self.a.vec_ushl(16, FB, FB, FR);
+        } else {
+            // Mask 16-bit amounts to log2(32) = 5 bits, then widen both halves to 32-bit.
+            self.a.vec_movi_8h(FR, 31);
+            self.a.vec_and(FC, FC, FR);
+            self.a.vec_ext(FR, FC, FC, 8);
+            self.a.vec_shift_long(false, 16, FC, FC);
+            self.a.vec_shift_long(false, 16, FR, FR);
+            self.a.vec_shift_long(false, 16, FA, FA);
+            self.a.vec_shift_long(false, 16, FB, FB);
+            self.a.vec_ushl(32, FA, FA, FC);
+            self.a.vec_ushl(32, FB, FB, FR);
+        }
+        self.v_str(FA, vd);
+        self.v_str(FB, (vd + 1) & 31);
+        true
+    }
+
     /// A lane-wise unmasked arithmetic op, one NEON instruction per element width (the
     /// bitwise ones are element-size independent and use the byte forms).
     fn vector_arith(&mut self, op: VArithOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
@@ -3301,6 +3358,7 @@ fn is_vector(inst: Inst) -> bool {
             | Inst::VSegStore { .. }
             | Inst::VIndexStore { .. }
             | Inst::VWiden { .. }
+            | Inst::VWShift { .. }
     )
 }
 

@@ -1033,6 +1033,10 @@ impl Asm {
     pub fn vec_movi_zero(&mut self, rd: Reg) {
         self.emit(0x4f00_0400 | rd as u32);
     }
+    /// `movi v.8h, #imm` (an 8-bit replicated immediate).
+    pub fn vec_movi_8h(&mut self, rd: Reg, imm: u8) {
+        self.emit(0x4f00_8400 | u32::from(imm) << 5 | rd as u32);
+    }
     /// `ext vd.16b, vn.16b, vm.16b, #imm`: `vn[imm..16]` followed by `vm[0..imm]`
     /// (0..=15).
     pub fn vec_ext(&mut self, rd: Reg, rn: Reg, rm: Reg, imm: u32) {

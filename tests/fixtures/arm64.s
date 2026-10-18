@@ -133,6 +133,7 @@ sshll v24.4s, v25.4h, #0
 ushll v26.4s, v27.4h, #0
 sshll v28.2d, v29.2s, #0
 ushll v30.2d, v31.2s, #0
+movi v20.8h, #31
 fadd s16, s17, s18
 fsub d16, d17, d18
 fmul s19, s20, s21

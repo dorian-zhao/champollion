@@ -557,6 +557,23 @@ pub fn exec_widen(cpu: &mut CpuState, mask: bool, vd: u8, vs2: u8, src: VSel) {
     }
 }
 
+/// Zvbb's widening shift left: shift the SEW-wide source by an amount masked to
+/// log2(2×SEW) and write the zero-extended result to a 2×SEW destination group.
+pub fn exec_wshift(cpu: &mut CpuState, mask: bool, vd: u8, vs2: u8, src: VSel) {
+    let vl = cpu.vl;
+    let sew_b = sew_bytes(cpu);
+    let wide_b = sew_b * 2;
+    let bits = 8 * wide_b;
+    for i in 0..vl {
+        if mask && !mask_get(cpu, 0, i) {
+            continue;
+        }
+        let sh = src_value(cpu, src, i, sew_b, true) % bits;
+        let value = get_elem(cpu, vs2, i, sew_b) << sh;
+        set_elem(cpu, vd, i, wide_b, value);
+    }
+}
+
 /// Indexed load (`vluxeiN.v`): element `i` at `x[rs1] + zext(index[i])`; the index
 /// width is the instruction's, the loaded data is SEW wide. Masked-off elements are
 /// undisturbed and never accessed.
@@ -900,6 +917,13 @@ mod tests {
         load(&mut c, 3, &[0x01, 0xff], 1);
         exec_widen(&mut c, false, 1, 2, VSel::V(3));
         assert_eq!(elems(&c, 1, 2, 2), [0xff01, 0x0100]);
+
+        // vwsll at e8: the amount is masked to 4 bits, results are 16-bit.
+        let mut c = machine(0, 2);
+        load(&mut c, 2, &[0x81, 0x7f], 1);
+        load(&mut c, 3, &[4, 20], 1);
+        exec_wshift(&mut c, false, 1, 2, VSel::V(3));
+        assert_eq!(elems(&c, 1, 2, 2), [0x810, 0x7f0]);
     }
 
     #[test]
