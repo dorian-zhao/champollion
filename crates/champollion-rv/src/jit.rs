@@ -2190,6 +2190,138 @@ mod tests {
     }
 
     #[test]
+    fn vector_gather_wide_matches_the_interpreter() {
+        fn check(
+            prog: &[u32],
+            data: &dyn Fn(&GuestMemory),
+            init: &dyn Fn(&mut CpuState),
+        ) -> GuestMemory {
+            let mem_i = setup(prog);
+            data(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            init(&mut oracle);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(prog);
+            data(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            init(&mut cpu);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle);
+            assert_eq!(jit.stats.interpreted.get("VArith"), None);
+            mem_j
+        }
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle =
+            |wf3: u32, vd: u32, rs1: u32| (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |wf3: u32, vs3: u32, rs1: u32| {
+            (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+        };
+        let vv = |vd: u32, vs2: u32, vs1: u32| {
+            (0b001100 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+        };
+        let vi = |vd: u32, vs2: u32, imm: u32| {
+            (0b001100 << 26)
+                | (1 << 25)
+                | (vs2 << 20)
+                | (imm << 15)
+                | (0b011 << 12)
+                | (vd << 7)
+                | 0x57
+        };
+        let init = |cpu: &mut CpuState| {
+            for (r, v) in [(11u8, DATA), (12, DATA + 16), (13, DATA + 32)] {
+                cpu.set_x(r, v);
+            }
+        };
+
+        let table16: [u16; 8] = [0x1000, 0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006, 0x1007];
+        let index16: [u16; 8] = [7, 0, 8, 3, 3, 0, 99, 1];
+        let data16 = |mem: &GuestMemory| {
+            for (i, &x) in table16.iter().chain(index16.iter()).enumerate() {
+                mem.write_privileged(DATA + 2 * i as u64, &x.to_le_bytes()).unwrap();
+            }
+        };
+        let prog16 = [
+            vsetivli(0, 8, 0xc8),
+            vle(0b101, 1, 11),
+            vle(0b101, 2, 12),
+            vv(3, 1, 2),
+            vi(4, 1, 3),
+            vse(0b101, 3, 13),
+            addi(13, 13, 16),
+            vse(0b101, 4, 13),
+            ECALL,
+        ];
+        let mem = check(&prog16, &data16, &init);
+        let mut row = [0u8; 16];
+        mem.read_privileged(DATA + 32, &mut row).unwrap();
+        let got: Vec<u16> = row.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        assert_eq!(got[..4], [table16[7], table16[0], 0, table16[3]]);
+        mem.read_privileged(DATA + 48, &mut row).unwrap();
+        assert!(row.as_chunks::<2>().0.iter().all(|b| u16::from_le_bytes(*b) == table16[3]));
+
+        let table32: [u32; 4] = [0x1000_0001, 0x2000_0002, 0x3000_0003, 0x4000_0004];
+        let index32: [u32; 4] = [3, 0, 4, 1];
+        let data32 = |mem: &GuestMemory| {
+            for (i, &x) in table32.iter().chain(index32.iter()).enumerate() {
+                mem.write_privileged(DATA + 4 * i as u64, &x.to_le_bytes()).unwrap();
+            }
+        };
+        let prog32 = [
+            vsetivli(0, 4, 0xd0),
+            vle(0b110, 1, 11),
+            vle(0b110, 2, 12),
+            vv(3, 1, 2),
+            vi(4, 1, 2),
+            vse(0b110, 3, 13),
+            addi(13, 13, 16),
+            vse(0b110, 4, 13),
+            ECALL,
+        ];
+        let mem = check(&prog32, &data32, &init);
+        let mut row = [0u8; 16];
+        mem.read_privileged(DATA + 32, &mut row).unwrap();
+        let got: Vec<u32> = row.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
+        assert_eq!(got, [table32[3], table32[0], 0, table32[1]]);
+        mem.read_privileged(DATA + 48, &mut row).unwrap();
+        assert!(row.as_chunks::<4>().0.iter().all(|b| u32::from_le_bytes(*b) == table32[2]));
+
+        let table64: [u64; 2] = [0x1000_0000_0000_0001, 0x2000_0000_0000_0002];
+        let index64: [u64; 2] = [1, 2];
+        let data64 = |mem: &GuestMemory| {
+            for (i, &x) in table64.iter().chain(index64.iter()).enumerate() {
+                mem.write_privileged(DATA + 8 * i as u64, &x.to_le_bytes()).unwrap();
+            }
+        };
+        let prog64 = [
+            vsetivli(0, 2, 0xd8),
+            vle(0b111, 1, 11),
+            vle(0b111, 2, 12),
+            vv(3, 1, 2),
+            vi(4, 1, 1),
+            vse(0b111, 3, 13),
+            addi(13, 13, 16),
+            vse(0b111, 4, 13),
+            ECALL,
+        ];
+        let mem = check(&prog64, &data64, &init);
+        let mut row = [0u8; 16];
+        mem.read_privileged(DATA + 32, &mut row).unwrap();
+        let got: Vec<u64> = row.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect();
+        assert_eq!(got, [table64[1], 0]);
+        mem.read_privileged(DATA + 48, &mut row).unwrap();
+        assert!(row.as_chunks::<8>().0.iter().all(|b| u64::from_le_bytes(*b) == table64[1]));
+    }
+
+    #[test]
     fn vector_arith_chain_reuses_the_previous_destination() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57

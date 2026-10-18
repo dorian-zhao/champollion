@@ -1053,6 +1053,16 @@ impl Asm {
             0x4e20_9c00 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
         );
     }
+    /// `umin vd.8h/4s, vn, vm`: unsigned lane-wise minimum.
+    pub fn vec_umin(&mut self, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(
+            0x6e20_6c00 | Self::vec_size(size) | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32,
+        );
+    }
+    /// `cmhs vd.2d, vn, vm`: unsigned greater-than-or-equal mask, 64-bit lanes.
+    pub fn vec_cmhs_2d(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x6ee0_3c00 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
     /// `ins vd.s[0], vn.s[0]`: write lane 0 only. Unlike a scalar FP op, an element
     /// insert leaves the other bits alone — the NaN box above the single survives.
     pub fn vec_ins_s0(&mut self, rd: Reg, rn: Reg) {
@@ -1205,6 +1215,15 @@ mod tests {
         let mut a = Asm::new();
         a.vec_tbl(18, 16, 17);
         assert_eq!(a.code, [0x4e11_0212]);
+    }
+
+    #[test]
+    fn gather_helpers_match_assembler() {
+        let mut a = Asm::new();
+        a.vec_umin(16, 17, 17, 18);
+        a.vec_umin(32, 17, 17, 18);
+        a.vec_cmhs_2d(17, 17, 18);
+        assert_eq!(a.code, [0x6e72_6e31, 0x6eb2_6e31, 0x6ef2_3e31]);
     }
 
     /// The architecture's `DecodeBitMasks` for a 64-bit operation.

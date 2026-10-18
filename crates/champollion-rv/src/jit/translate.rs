@@ -1915,12 +1915,13 @@ impl Tx {
         true
     }
 
-    /// `vrgather.vi` / `vrgather.vv` at e8/m1: NEON `tbl` with a single 16-byte table
-    /// has exactly RVV's out-of-range-zero rule. Wider elements need a byte-index
-    /// expansion and stay on the interpreter for now.
+    /// `vrgather.vi` / `vrgather.vv` at m1: NEON `tbl` gathers bytes from the
+    /// 16-byte table. Wider elements expand each element index into its byte
+    /// indices; out-of-range indices become byte indices outside the table, so
+    /// `tbl` produces the architectural zero.
     fn vector_gather(&mut self, vd: u8, vs2: u8, src: VSel) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
-        if bytes != 1 {
+        if !matches!(bytes, 1 | 2 | 4 | 8) {
             return false;
         }
         if !matches!(src, VSel::I(_) | VSel::V(_)) {
@@ -1930,12 +1931,66 @@ impl Tx {
         match src {
             VSel::I(imm) => {
                 self.a.mov_imm(SRC0, u64::from(imm));
-                self.a.vec_dup(FB, SRC0, 1);
+                self.a.vec_dup(FB, SRC0, bytes);
             }
             VSel::V(vs1) => self.v_ldr(FB, vs1),
             _ => unreachable!("checked above"),
         }
-        self.a.vec_tbl(FC, FA, FB);
+        match bytes {
+            1 => self.a.vec_tbl(FC, FA, FB),
+            2 => {
+                self.a.mov_imm(SRC0, 8);
+                self.a.vec_dup(FC, SRC0, 2);
+                self.a.vec_umin(16, FB, FB, FC);
+                self.a.vec_add(16, FB, FB, FB);
+                self.a.mov_imm(SRC0, 8);
+                self.a.vec_dup(FC, SRC0, 2);
+                self.a.vec_ushl(16, FC, FB, FC);
+                self.a.vec_orr(FB, FB, FC);
+                self.a.mov_imm(SRC0, 0x0100);
+                self.a.vec_dup(FC, SRC0, 2);
+                self.a.vec_add(16, FB, FB, FC);
+                self.a.vec_tbl(FC, FA, FB);
+            }
+            4 => {
+                self.a.mov_imm(SRC0, 4);
+                self.a.vec_dup(FC, SRC0, 4);
+                self.a.vec_umin(32, FB, FB, FC);
+                self.a.vec_add(32, FB, FB, FB);
+                self.a.vec_add(32, FB, FB, FB);
+                self.a.mov_imm(SRC0, 8);
+                self.a.vec_dup(FC, SRC0, 4);
+                self.a.vec_ushl(32, FC, FB, FC);
+                self.a.vec_orr(FB, FB, FC);
+                self.a.mov_imm(SRC0, 16);
+                self.a.vec_dup(FC, SRC0, 4);
+                self.a.vec_ushl(32, FC, FB, FC);
+                self.a.vec_orr(FB, FB, FC);
+                self.a.mov_imm(SRC0, 0x0302_0100_0302_0100);
+                self.a.vec_dup(FC, SRC0, 8);
+                self.a.vec_add(8, FB, FB, FC);
+                self.a.vec_tbl(FC, FA, FB);
+            }
+            _ => {
+                self.a.mov_imm(SRC0, 2);
+                self.a.vec_dup(FC, SRC0, 8);
+                self.a.vec_cmhs_2d(FR, FB, FC);
+                self.a.vec_bit(FB, FC, FR);
+                self.a.vec_add(64, FB, FB, FB);
+                self.a.vec_add(64, FB, FB, FB);
+                self.a.vec_add(64, FB, FB, FB);
+                for shift in [8, 16, 32] {
+                    self.a.mov_imm(SRC0, shift);
+                    self.a.vec_dup(FC, SRC0, 8);
+                    self.a.vec_ushl(64, FC, FB, FC);
+                    self.a.vec_orr(FB, FB, FC);
+                }
+                self.a.mov_imm(SRC0, 0x0706_0504_0302_0100);
+                self.a.vec_dup(FC, SRC0, 8);
+                self.a.vec_add(8, FB, FB, FC);
+                self.a.vec_tbl(FC, FA, FB);
+            }
+        }
         self.v_str(FC, vd);
         self.vec_last = None;
         self.vec_m2 = None;
