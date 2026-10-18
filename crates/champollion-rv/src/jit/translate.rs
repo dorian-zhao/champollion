@@ -3639,16 +3639,25 @@ fn f_write(inst: Inst) -> Option<u8> {
 /// costs a few instructions each). Their boxing is assumed at entry and checked by the
 /// translation's head guard.
 fn scan_fboxed_reads(block: &[(Inst, u8)]) -> u32 {
-    let mut assumed = 0u32;
+    // A guard costs four instructions and a branch; without it every use pays a raw load
+    // and the canonical-NaN check instead of one lane duplicate. Assuming a register pays
+    // off only once it is read more than once.
+    let mut uses = [0u8; 32];
     let mut written = 0u32;
     for &(inst, _) in block {
         for r in f_single_reads(inst).into_iter().flatten() {
-            if written >> r & 1 == 0 && assumed.count_ones() < 2 {
-                assumed |= 1 << r;
+            if written >> r & 1 == 0 {
+                uses[r as usize] += 1;
             }
         }
         if let Some(w) = f_write(inst) {
             written |= 1 << w;
+        }
+    }
+    let mut assumed = 0u32;
+    for (r, &n) in uses.iter().enumerate() {
+        if n > 1 {
+            assumed |= 1 << r;
         }
     }
     assumed
