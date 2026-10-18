@@ -2282,6 +2282,140 @@ mod tests {
     }
 
     #[test]
+    fn m4_and_m8_arithmetic_stay_in_the_jit() {
+        fn check(vtype: u32, avl: u32, wf3: u32, bytes: usize) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vle = |wf3: u32, vd: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vadd = |vd: u32, vs2: u32, vs1: u32| {
+                (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+            };
+            let prog = [
+                vsetivli(0, avl, vtype),
+                vle(wf3, 1, 11),
+                vle(wf3, 9, 12),
+                vadd(17, 1, 9),
+                vse(wf3, 17, 13),
+                ECALL,
+            ];
+            let data: Vec<u8> = (0..bytes * 2).map(|i| (i * 37 + 11) as u8).collect();
+            let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data).unwrap();
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(11, DATA);
+            oracle.set_x(12, DATA + bytes as u64);
+            oracle.set_x(13, DATA + 0x200);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + bytes as u64);
+            cpu.set_x(13, DATA + 0x200);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "m4/m8 state");
+            assert_eq!(jit.stats.interpreted.get("VArith"), None, "m4/m8 arith stays in the JIT");
+            let mut got_bytes = vec![0u8; bytes];
+            let mut want_bytes = vec![0u8; bytes];
+            mem_j.read_privileged(DATA + 0x200, &mut got_bytes).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut want_bytes).unwrap();
+            assert_eq!(got_bytes, want_bytes, "m4/m8 result");
+        }
+
+        check(0xc2, 64, 0, 64); // e8 m4
+        check(0xc3, 128, 0, 128); // e8 m8
+        check(0xd2, 16, 6, 64); // e32 m4
+    }
+
+    #[test]
+    fn m4_memory_roundtrip() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle = |vd: u32, rs1: u32| (1 << 25) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |vs3: u32, rs1: u32| (1 << 25) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let prog = [vsetivli(0, 64, 0xc2), vle(1, 11), vse(1, 12), ECALL];
+        let data: Vec<u8> = (0..64).map(|i| (i * 37 + 11) as u8).collect();
+        let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data).unwrap();
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        oracle.set_x(12, DATA + 0x200);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 0x200);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        mem_j.read_privileged(DATA + 0x200, &mut a).unwrap();
+        mem_i.read_privileged(DATA + 0x200, &mut b).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn m4_vadd_vx() {
+        let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+            (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+        };
+        let vle = |vd: u32, rs1: u32| (1 << 25) | (rs1 << 15) | (vd << 7) | 0x07;
+        let vse = |vs3: u32, rs1: u32| (1 << 25) | (rs1 << 15) | (vs3 << 7) | 0x27;
+        let vadd_vx = |vd: u32, vs2: u32, rs1: u32| {
+            (1 << 25) | (vs2 << 20) | (rs1 << 15) | (0b100 << 12) | (vd << 7) | 0x57
+        };
+        let prog = [vsetivli(0, 64, 0xc2), vle(1, 11), vadd_vx(17, 1, 15), vse(17, 12), ECALL];
+        let data: Vec<u8> = (0..64).map(|i| (i * 37 + 11) as u8).collect();
+        let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data).unwrap();
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        oracle.set_x(12, DATA + 0x200);
+        oracle.set_x(15, 7);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 0x200);
+        cpu.set_x(15, 7);
+        let got = Jit::new().unwrap().run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle);
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        mem_j.read_privileged(DATA + 0x200, &mut a).unwrap();
+        mem_i.read_privileged(DATA + 0x200, &mut b).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn vector_shift_sub_mul_match_the_interpreter() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57

@@ -1864,7 +1864,7 @@ impl Tx {
                         }
                         None => {
                             if r != 0 {
-                                self.a.add_imm(ADDR, ADDR, r * 16);
+                                self.a.add_imm(ADDR, ADDR, 16);
                             }
                             self.accesses.push((self.a.pos(), pc, self.retired, access));
                             self.a.ldr_q_reg(dst, self.base_reg(), self.index_reg());
@@ -1912,7 +1912,7 @@ impl Tx {
                         }
                         None => {
                             if k != 0 {
-                                self.a.add_imm(ADDR, ADDR, k * 16);
+                                self.a.add_imm(ADDR, ADDR, 16);
                             }
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Load));
                             self.a.ldr_q_reg(dst, self.base_reg(), self.index_reg());
@@ -1966,7 +1966,7 @@ impl Tx {
                         }
                         None => {
                             if k != 0 {
-                                self.a.add_imm(ADDR, ADDR, k * 16);
+                                self.a.add_imm(ADDR, ADDR, 16);
                             }
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                             self.a.str_q_reg(src, self.base_reg(), self.index_reg());
@@ -2018,7 +2018,7 @@ impl Tx {
                         }
                         None => {
                             if r != 0 {
-                                self.a.add_imm(ADDR, ADDR, r * 16);
+                                self.a.add_imm(ADDR, ADDR, 16);
                             }
                             self.accesses.push((self.a.pos(), pc, self.retired, Access::Store));
                             self.a.str_q_reg(src, self.base_reg(), self.index_reg());
@@ -2303,9 +2303,70 @@ impl Tx {
     /// bitwise ones are element-size independent and use the byte forms).
     fn vector_arith(&mut self, op: VArithOp, vd: u8, vs2: u8, src: VSel, mask: bool) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
+        let bits = bytes * 8;
         self.vec_m2_b = None;
         if mask {
             return false;
+        }
+        if self.vec_regs > 1 {
+            let regs = self.vec_regs;
+            if !matches!(
+                op,
+                VArithOp::Add
+                    | VArithOp::Rsub
+                    | VArithOp::Sub
+                    | VArithOp::And
+                    | VArithOp::Andn
+                    | VArithOp::Or
+                    | VArithOp::Xor
+                    | VArithOp::Mul
+            ) || (op == VArithOp::Mul && bits == 64)
+            {
+                return false;
+            }
+            if !group_fits(vd, regs) || !group_fits(vs2, regs) || groups_overlap(vd, vs2, regs) {
+                return false;
+            }
+            if let VSel::V(vs1) = src
+                && (!group_fits(vs1, regs)
+                    || groups_overlap(vd, vs1, regs)
+                    || groups_overlap(vs2, vs1, regs))
+            {
+                return false;
+            }
+            self.vec_last = None;
+            self.vec_m2 = None;
+            for r in 0..regs {
+                self.v_ldr(FA, vs2 + r as u8);
+                let b = match src {
+                    VSel::V(vs1) => {
+                        self.v_ldr(FB, vs1 + r as u8);
+                        FB
+                    }
+                    _ => {
+                        if !self.vector_operand(src, FB, bytes) {
+                            return false;
+                        }
+                        FB
+                    }
+                };
+                match op {
+                    VArithOp::Add => self.a.vec_add(bits, FA, FA, b),
+                    VArithOp::Rsub => self.a.vec_sub(bits, FA, b, FA),
+                    VArithOp::Sub => self.a.vec_sub(bits, FA, FA, b),
+                    VArithOp::And => self.a.vec_and(FA, FA, b),
+                    VArithOp::Andn => {
+                        self.a.mvn16b(b, b);
+                        self.a.vec_and(FA, FA, b);
+                    }
+                    VArithOp::Or => self.a.vec_orr(FA, FA, b),
+                    VArithOp::Mul => self.a.vec_mul(bits, FA, FA, b),
+                    VArithOp::Xor => self.a.vec_eor(FA, FA, b),
+                    _ => unreachable!(),
+                }
+                self.v_str(FA, vd + r as u8);
+            }
+            return true;
         }
         if matches!(op, VArithOp::Rol | VArithOp::Ror) {
             return self.vector_rotate(vd, vs2, src, op == VArithOp::Rol);
@@ -2340,7 +2401,6 @@ impl Tx {
             self.vec_last = Some(vd);
             return true;
         }
-        let bits = bytes * 8;
         // Decide before emitting anything that guest state depends on.
         let supported = matches!(
             op,
@@ -3317,14 +3377,25 @@ fn vector_config((vtype, vl): (u64, u64)) -> Option<((u32, u32), u32)> {
     if vtype >> 63 != 0 || sew > 3 {
         return None;
     }
-    // m1 and m2 are the LMULs the translated subset handles; m4/m8 interpret.
+    // m1 through m8 are the LMULs the basic translated subset handles; operations
+    // without a group-aware path still fall back inside the block.
     let lmul = vtype & 7;
-    if lmul > 1 {
+    if lmul > 3 {
         return None;
     }
     let regs = 1u32 << lmul;
     let bytes = 1u32 << sew;
     if vl == u64::from(16 / bytes * regs) { Some(((sew as u32, bytes), regs)) } else { None }
+}
+
+/// A whole-register group that stays inside v0..v31. Groups that wrap are left to the
+/// interpreter rather than teaching every arithmetic path about modular register numbers.
+fn group_fits(v: u8, regs: u32) -> bool {
+    u32::from(v) + regs <= 32
+}
+
+fn groups_overlap(a: u8, b: u8, regs: u32) -> bool {
+    u32::from(a) < u32::from(b) + regs && u32::from(b) < u32::from(a) + regs
 }
 
 /// Whether the instruction reads or writes vector state, so its translation has to pin
