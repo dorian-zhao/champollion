@@ -41,7 +41,7 @@ docker run --rm --platform linux/riscv64 ubuntu:26.04 uname -m
 The registration script snapshots OrbStack's binfmt handler and runs a smoke
 test. Re-run `install` after restarting OrbStack or changing `rvrun`.
 Release-only installs, Docker bind mounts, common recipes, hash verification,
-and troubleshooting are in [docs/usage.md](docs/usage.md).
+and troubleshooting are in the [OrbStack guide](https://champollion.aqeo.dev/start/orbstack/).
 
 ### Performance
 
@@ -132,7 +132,7 @@ the binfmt table in its VM.
 
 For a release-only install (no checkout), the full walkthrough with the
 download command, Docker bind mounts, hash verification, and troubleshooting is
-in [docs/usage.md](docs/usage.md#recommended-on-macos-orbstack).
+in the [OrbStack guide](https://champollion.aqeo.dev/start/orbstack/).
 
 OrbStack is recommended for most users because it avoids a VM boot and image
 unpack on every run, keeps images warm, and uses the Docker workflow people
@@ -196,7 +196,6 @@ On Linux, guest memory sits at the same addresses as on the host. Therefore, gue
 | `tests` | Fixtures, riscv-tests, real programs, and sysroot setup |
 | `tools` | The profiler's report renderer, `linux.sh`, and the OrbStack binfmt setup helper |
 | `docs/design.md` | Design brief |
-| `docs/usage.md` | User guide, including the OrbStack and `rvcontainer` workflows |
 
 ## Testing
 
