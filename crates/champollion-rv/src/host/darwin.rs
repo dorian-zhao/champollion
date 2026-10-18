@@ -1140,14 +1140,7 @@ impl HostOs for DarwinHost {
         let options = xattr_flags(flags, follow)?;
         match (fd, path) {
             (Some(fd), None) => check(unsafe {
-                libc::fsetxattr(
-                    fd,
-                    name.as_ptr(),
-                    value.as_ptr().cast(),
-                    value.len(),
-                    0,
-                    options,
-                )
+                libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0, options)
             } as isize),
             (None, Some(path)) => check(unsafe {
                 libc::setxattr(
@@ -1177,14 +1170,7 @@ impl HostOs for DarwinHost {
                 libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0, 0, options)
             },
             (None, Some(path)) => unsafe {
-                libc::getxattr(
-                    path.as_ptr(),
-                    name.as_ptr(),
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    options,
-                )
+                libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, options)
             },
             _ => return Err(errno::EINVAL),
         };

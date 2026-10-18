@@ -1415,8 +1415,7 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
                 }
                 let mut value = vec![0u8; size];
                 p.mem.read(a[2], &mut value).map_err(efault)?;
-                let host_path =
-                    path.as_ref().map(|path| p.host_path(path, follow));
+                let host_path = path.as_ref().map(|path| p.host_path(path, follow));
                 host.xattr_set(fd, host_path.as_deref(), &name, &value, a[4] as i32, follow)
             }
         }
