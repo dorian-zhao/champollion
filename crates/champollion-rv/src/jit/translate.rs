@@ -3054,18 +3054,18 @@ impl Tx {
         true
     }
 
-    /// `vfredusum`/`vfredosum`: seed element 0 plus the source lanes, folded left to
-    /// right. At m1 f32 has four lanes and f64 two, so scalar FADD is both simple and
-    /// matches the ordered semantics.
+    /// `vfredusum`/`vfredosum`/`vfredmin`/`vfredmax`: seed element 0 plus the source
+    /// lanes, folded left to right. At m1 f32 has four lanes and f64 two, so scalar ops
+    /// are both simple and match the ordered semantics.
     fn vector_fred(&mut self, op: VFRedOp, vd: u8, vs1: u8, vs2: u8) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
         if self.vec_regs != 1
             || !matches!(bytes, 4 | 8)
-            || !matches!(op, VFRedOp::Usum | VFRedOp::Osum)
+            || !matches!(op, VFRedOp::Usum | VFRedOp::Osum | VFRedOp::Min | VFRedOp::Max)
         {
             return false;
         }
-        let (fp, lanes) = if bytes == 4 { (Fp::S, 4) } else { (Fp::D, 2) };
+        let (w, fp, lanes) = if bytes == 4 { (FWidth::S, Fp::S, 4) } else { (FWidth::D, Fp::D, 2) };
         self.v_ldr(FA, vs1);
         self.v_ldr(FB, vs2);
         self.a.fmov_to_gpr(fp, SRC0, FA);
@@ -3078,7 +3078,13 @@ impl Tx {
                 self.a.vec_umov_d(SRC0, FB, i);
                 self.a.fmov_from_gpr(Fp::D, FC, SRC0);
             }
-            self.a.fp_arith(FpOp::Add, fp, FA, FA, FC);
+            match op {
+                VFRedOp::Min | VFRedOp::Max => {
+                    self.fminmax(op == VFRedOp::Max, false, w, FR, FA, FC);
+                    self.a.fmov_d(FA, FR);
+                }
+                _ => self.a.fp_arith(FpOp::Add, fp, FA, FA, FC),
+            }
         }
         self.a.fmov_to_gpr(fp, SRC0, FA);
         self.v_ldr(FB, vd);

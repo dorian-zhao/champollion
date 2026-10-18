@@ -2493,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    fn vfred_ordered_sums_stay_in_the_jit() {
+    fn vfred_ops_stay_in_the_jit() {
         fn check(vtype: u32, avl: u32, wf3: u32, f6: u32, data: [u8; 16], seed: [u8; 16]) {
             let vsetivli = |rd: u32, avl: u32, vtype: u32| {
                 (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
@@ -2541,6 +2541,15 @@ mod tests {
         f32_data_arr.copy_from_slice(&f32_data);
         let mut f32_seed = [0u8; 16];
         f32_seed[..4].copy_from_slice(&7.0f32.to_le_bytes());
+        let pack32 = |v: [f32; 4]| {
+            let mut out = [0u8; 16];
+            for (i, x) in v.iter().enumerate() {
+                out[4 * i..4 * i + 4].copy_from_slice(&x.to_bits().to_le_bytes());
+            }
+            out
+        };
+        let f32_nan = pack32([f32::NAN, 2.0, 3.0, -1.0]);
+        let f32_snan = pack32([f32::from_bits(0x7f80_0001), 2.0, 3.0, -1.0]);
         let mut f64_data = [0u8; 16];
         f64_data[..8].copy_from_slice(&1.25f64.to_le_bytes());
         f64_data[8..].copy_from_slice(&(-3.5f64).to_le_bytes());
@@ -2548,8 +2557,16 @@ mod tests {
         f64_seed[..8].copy_from_slice(&2.0f64.to_le_bytes());
         check(0xd0, 4, 6, 1, f32_data_arr, f32_seed); // vfredusum f32
         check(0xd0, 4, 6, 3, f32_data_arr, f32_seed); // vfredosum f32
+        check(0xd0, 4, 6, 5, f32_data_arr, f32_seed); // vfredmin f32
+        check(0xd0, 4, 6, 7, f32_data_arr, f32_seed); // vfredmax f32
+        check(0xd0, 4, 6, 5, f32_nan, f32_seed); // vfredmin ignores a quiet NaN
+        check(0xd0, 4, 6, 7, f32_nan, f32_seed); // vfredmax ignores a quiet NaN
+        check(0xd0, 4, 6, 5, f32_snan, f32_seed); // vfredmin keeps the number, raises NV
+        check(0xd0, 4, 6, 7, f32_snan, f32_seed); // vfredmax keeps the number, raises NV
         check(0xd8, 2, 7, 1, f64_data, f64_seed); // vfredusum f64
         check(0xd8, 2, 7, 3, f64_data, f64_seed); // vfredosum f64
+        check(0xd8, 2, 7, 5, f64_data, f64_seed); // vfredmin f64
+        check(0xd8, 2, 7, 7, f64_data, f64_seed); // vfredmax f64
     }
 
     #[test]
