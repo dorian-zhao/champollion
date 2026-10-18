@@ -628,7 +628,7 @@ impl GuestMemory {
         let r = self.check_range(addr, len)?;
         let mut maps = self.maps_mut();
         self.unmap_locked(&mut maps, r.clone());
-        self.insert_locked(&mut maps, r, prot);
+        self.insert_locked(&mut maps, r, prot)?;
         drop(maps);
         self.settle();
         Ok(())
@@ -642,7 +642,12 @@ impl GuestMemory {
         if maps.is_any_mapped(r.clone()) {
             return Ok(false);
         }
-        self.insert_locked(&mut maps, r, prot);
+        // A private page cannot share a 16 KiB host page with a read-only shared mapping:
+        // the shared page's maximum protection refuses the write access it needs.
+        if Self::shared_host_conflict(&maps, self.host_page, &r).is_some() {
+            return Ok(false);
+        }
+        self.insert_locked(&mut maps, r, prot)?;
         Ok(true)
     }
 
@@ -653,9 +658,23 @@ impl GuestMemory {
             return Err(MapError::Invalid);
         }
         let mut maps = self.maps_mut();
-        let addr = maps.find_free(len, limit, self.lowest)?;
-        self.insert_locked(&mut maps, addr..addr + len, prot);
-        Ok(addr)
+        let mut limit = limit;
+        loop {
+            let addr = maps.find_free(len, limit, self.lowest)?;
+            if let Some(shared) =
+                Self::shared_host_conflict(&maps, self.host_page, &(addr..addr + len))
+            {
+                // Retry below the host page holding the shared mapping.
+                let page = shared & !(self.host_page - 1);
+                if page <= self.lowest {
+                    return Err(MapError::NoSpace);
+                }
+                limit = page;
+                continue;
+            }
+            self.insert_locked(&mut maps, addr..addr + len, prot)?;
+            return Ok(addr);
+        }
     }
 
     /// Unmap `[addr, addr + len)`. Unmapped pages in the range are ignored.
@@ -721,11 +740,12 @@ impl GuestMemory {
         self.maps().is_any_mapped(r)
     }
 
-    fn insert_locked(&self, maps: &mut Maps, r: Range<u64>, prot: Prot) {
-        self.commit_host(r.clone());
+    fn insert_locked(&self, maps: &mut Maps, r: Range<u64>, prot: Prot) -> Result<(), MapError> {
+        self.commit_host(r.clone())?;
         maps.0.insert(r.start, Mapping { end: r.end, prot, shared: false });
         self.fast_range_add(r.start, r.end, prot);
         self.changed(prot.contains(Prot::EXEC));
+        Ok(())
     }
 
     fn unmap_locked(&self, maps: &mut Maps, r: Range<u64>) {
@@ -759,11 +779,12 @@ impl GuestMemory {
         let mut maps = self.maps_mut();
         let r = self.check_range(addr, len)?;
         self.unmap_locked(&mut maps, r.clone());
-        let host_prot = if prot.contains(Prot::WRITE) {
-            libc::PROT_READ | libc::PROT_WRITE
-        } else {
-            libc::PROT_READ
-        };
+        // Private file mappings are copy-on-write, so asking the host for write access
+        // cannot reach the file. Ask for it even for read-only or executable segments:
+        // a read-only maximum protection would otherwise poison every later anonymous
+        // mapping that shares a 16 KiB host page with these pages, where `commit_host`
+        // must mprotect the whole page read/write.
+        let host_prot = libc::PROT_READ | libc::PROT_WRITE;
         // SAFETY: replaces whole host pages of our own reservation, which no other
         // mapping uses (they are free, or were just unmapped).
         let rc = unsafe {
@@ -785,7 +806,7 @@ impl GuestMemory {
                 _ => 12,
             }));
         }
-        self.insert_locked(&mut maps, r, prot);
+        self.insert_locked(&mut maps, r, prot)?;
         Ok(())
     }
 
@@ -873,8 +894,17 @@ impl GuestMemory {
         (r.start & !mask)..((r.end + mask) & !mask)
     }
 
-    fn commit_host(&self, r: Range<u64>) {
-        let hr = self.host_pages(r);
+    /// The start of a shared mapping whose host pages overlap `r`, if any. A private
+    /// mapping that shares a 16 KiB host page with a read-only file mapping cannot be made
+    /// writable: the file page's maximum protection refuses it.
+    fn shared_host_conflict(maps: &Maps, host_page: u64, r: &Range<u64>) -> Option<u64> {
+        let start = r.start & !(host_page - 1);
+        let end = r.end.checked_next_multiple_of(host_page).unwrap_or(u64::MAX);
+        maps.0.range(..end).find(|(_, m)| m.shared && m.end > start).map(|(&s, _)| s)
+    }
+
+    fn commit_host(&self, r: Range<u64>) -> Result<(), MapError> {
+        let hr = self.host_pages(r.clone());
         // SAFETY: the range lies inside our reservation. Making already-committed pages
         // read/write again is a no-op for their contents.
         let rc = unsafe {
@@ -884,7 +914,14 @@ impl GuestMemory {
                 libc::PROT_READ | libc::PROT_WRITE,
             )
         };
-        assert_eq!(rc, 0, "mprotect failed: {}", std::io::Error::last_os_error());
+        if rc != 0 {
+            // A read-only shared file page can share a host page with this private range;
+            // its maximum protection refuses the write access the range needs.
+            return Err(MapError::Host(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(12),
+            ));
+        }
+        Ok(())
     }
 
     /// Restore the zero invariant for a just-unmapped guest range: decommit host pages no
@@ -1413,5 +1450,24 @@ mod tests {
         assert_eq!(m.page_prot(text), Some(Prot::READ | Prot::EXEC), "library text");
         let mut b = [0u8; 4];
         m.fetch(text, &mut b).unwrap();
+    }
+
+    /// A private mapping must not land in a host page that a shared mapping already
+    /// occupies: a read-only file page's maximum protection refuses the write access the
+    /// private page needs in `commit_host`.
+    #[test]
+    fn private_maps_avoid_host_pages_shared_with_shared_mappings() {
+        let m = GuestMemory::new().unwrap();
+        if m.host_page == GUEST_PAGE_SIZE {
+            return; // 4 KiB host pages never mix two guest pages
+        }
+        let base = 0x10000;
+        let hp = m.host_page;
+        m.map_shared(Some(base), hp, 0, Prot::READ, None).unwrap();
+        // Free the first guest page; the rest of the mapping still owns the host page.
+        m.unmap(base, GUEST_PAGE_SIZE).unwrap();
+        assert_eq!(m.map_if_free(base, GUEST_PAGE_SIZE, Prot::RW), Ok(false));
+        let addr = m.map_anywhere(GUEST_PAGE_SIZE, base + hp, Prot::RW).unwrap();
+        assert!(addr + GUEST_PAGE_SIZE <= base, "placed {addr:#x} in the shared host page");
     }
 }
