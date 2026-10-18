@@ -1602,15 +1602,75 @@ impl Tx {
             | AluOp::Rev8
             | AluOp::Brev8
             | AluOp::OrcB => self.bit_unary(op, d, a),
-            // Zbkb/Zbc/Zbkx: interpreted only for now; the block falls back as a whole.
-            AluOp::Pack
-            | AluOp::Packh
-            | AluOp::Packw
-            | AluOp::Clmul
-            | AluOp::Clmulh
-            | AluOp::Clmulr
-            | AluOp::Xperm4
-            | AluOp::Xperm8 => return false,
+            // Zbkb: the low half of each source, packed.
+            AluOp::Pack => {
+                assert!(self.a.and_imm(ADDR, b, 0xffff_ffff).is_some());
+                self.a.lsl_imm(ADDR, ADDR, 32);
+                assert!(self.a.and_imm(d, a, 0xffff_ffff).is_some());
+                self.a.orr(d, d, ADDR);
+            }
+            AluOp::Packh => {
+                assert!(self.a.and_imm(ADDR, b, 0xff).is_some());
+                self.a.lsl_imm(ADDR, ADDR, 8);
+                assert!(self.a.and_imm(d, a, 0xff).is_some());
+                self.a.orr(d, d, ADDR);
+            }
+            AluOp::Packw => {
+                assert!(self.a.and_imm(ADDR, b, 0xffff).is_some());
+                self.a.lsl_imm_w(ADDR, ADDR, 16);
+                assert!(self.a.and_imm(d, a, 0xffff).is_some());
+                self.a.orr(d, d, ADDR);
+                self.a.sxtw(d, d);
+            }
+            // Zbc: one NEON polynomial multiply gives all 128 product bits.
+            AluOp::Clmul | AluOp::Clmulh | AluOp::Clmulr => {
+                self.vec_last = None;
+                self.vec_m2 = None;
+                self.vec_m2_b = None;
+                self.a.fmov_from_gpr(Fp::D, FA, a);
+                self.a.fmov_from_gpr(Fp::D, FB, b);
+                self.a.pmull_d(FC, FA, FB);
+                match op {
+                    AluOp::Clmul => self.a.fmov_to_gpr(Fp::D, d, FC),
+                    AluOp::Clmulh => self.a.umov_d1(d, FC),
+                    AluOp::Clmulr => {
+                        self.a.fmov_to_gpr(Fp::D, ADDR, FC);
+                        self.a.umov_d1(DST, FC);
+                        // clmulr is product bits 126..63, i.e. the 128-bit product
+                        // shifted right by 63. EXTR concatenates Rn (high) with Rm (low).
+                        self.a.extr(d, DST, ADDR, 63);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // Zbkx: NEON TBL does the lookup; out-of-range indices naturally produce
+            // zero because the table's unused upper half is zero.
+            AluOp::Xperm4 | AluOp::Xperm8 => {
+                self.vec_last = None;
+                self.vec_m2 = None;
+                self.vec_m2_b = None;
+                self.a.fmov_from_gpr(Fp::D, FA, a);
+                self.a.fmov_from_gpr(Fp::D, FB, b);
+                if op == AluOp::Xperm8 {
+                    self.a.vec_tbl(FC, FA, FB);
+                    self.a.fmov_to_gpr(Fp::D, d, FC);
+                } else {
+                    // a's 16 nibbles, in order, become the table.
+                    self.a.vec_shl_16b(FC, FA, 4);
+                    self.a.vec_ushr_16b(FC, FC, 4);
+                    self.a.vec_ushr_16b(FR, FA, 4);
+                    self.a.vec_zip1_16b(FA, FC, FR);
+                    // The low and high nibbles of b are the two index vectors.
+                    self.a.vec_shl_16b(FC, FB, 4);
+                    self.a.vec_ushr_16b(FC, FC, 4);
+                    self.a.vec_ushr_16b(FR, FB, 4);
+                    self.a.vec_tbl(FB, FA, FC);
+                    self.a.vec_tbl(FC, FA, FR);
+                    self.a.vec_shl_16b(FC, FC, 4);
+                    self.a.vec_orr(FB, FB, FC);
+                    self.a.fmov_to_gpr(Fp::D, d, FB);
+                }
+            }
         }
         self.commit(rd, d);
         true
@@ -3014,9 +3074,17 @@ fn is_vector(inst: Inst) -> bool {
 /// scratch-register caches stay valid across it.
 fn is_integer_only(inst: Inst) -> bool {
     match inst {
-        Inst::Op { op, .. } | Inst::OpImm { op, .. } => {
-            !matches!(op, AluOp::Cpop | AluOp::Brev8 | AluOp::OrcB)
-        }
+        Inst::Op { op, .. } | Inst::OpImm { op, .. } => !matches!(
+            op,
+            AluOp::Cpop
+                | AluOp::Brev8
+                | AluOp::OrcB
+                | AluOp::Clmul
+                | AluOp::Clmulh
+                | AluOp::Clmulr
+                | AluOp::Xperm4
+                | AluOp::Xperm8
+        ),
         Inst::Op32 { op, .. } => op != AluOp32::Cpop,
         Inst::OpImm32 { .. }
         | Inst::Load { .. }
@@ -3034,9 +3102,17 @@ fn is_integer_only(inst: Inst) -> bool {
 /// vector scratch registers.
 fn is_pure_integer_alu(inst: Inst) -> bool {
     match inst {
-        Inst::Op { op, .. } | Inst::OpImm { op, .. } => {
-            !matches!(op, AluOp::Cpop | AluOp::Brev8 | AluOp::OrcB)
-        }
+        Inst::Op { op, .. } | Inst::OpImm { op, .. } => !matches!(
+            op,
+            AluOp::Cpop
+                | AluOp::Brev8
+                | AluOp::OrcB
+                | AluOp::Clmul
+                | AluOp::Clmulh
+                | AluOp::Clmulr
+                | AluOp::Xperm4
+                | AluOp::Xperm8
+        ),
         Inst::Op32 { op, .. } => op != AluOp32::Cpop,
         Inst::OpImm32 { .. } | Inst::Lui { .. } | Inst::Auipc { .. } => true,
         _ => false,
@@ -3081,16 +3157,29 @@ fn plan_deferred_m2_stores(block: &[(Inst, u8)], pcs: &[u64], branch_targets: &[
 fn keeps_addr(inst: Inst) -> bool {
     // `ADDR` is scratch: the instructions whose translation writes it must say so, or a
     // later access would reuse a stale cached base.
-    use AluOp::{Bclr, Binv, Bset, Div, Divu, Mulhsu, Rem, Remu, Rol};
+    use AluOp::{Bclr, Binv, Bset, Clmulr, Div, Divu, Mulhsu, Pack, Packh, Packw, Rem, Remu, Rol};
     match inst {
         Inst::Lui { .. }
         | Inst::Auipc { .. }
         | Inst::OpImm { .. }
         | Inst::OpImm32 { .. }
         | Inst::Branch { .. } => true,
-        Inst::Op { op, .. } => {
-            !matches!(op, Mulhsu | Div | Divu | Rem | Remu | Rol | Bclr | Binv | Bset)
-        }
+        Inst::Op { op, .. } => !matches!(
+            op,
+            Mulhsu
+                | Div
+                | Divu
+                | Rem
+                | Remu
+                | Rol
+                | Bclr
+                | Binv
+                | Bset
+                | Pack
+                | Packh
+                | Packw
+                | Clmulr
+        ),
         Inst::Op32 { op, .. } => !matches!(
             op,
             AluOp32::Div | AluOp32::Divu | AluOp32::Rem | AluOp32::Remu | AluOp32::Rol

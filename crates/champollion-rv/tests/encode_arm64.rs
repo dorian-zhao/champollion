@@ -110,6 +110,12 @@ fn matches_assembler() {
     a.fmov_from_gpr(Fp::D, 17, 15);
     a.fmov_to_gpr(Fp::S, 14, 18);
     a.fmov_to_gpr(Fp::D, 15, 19);
+    a.pmull_d(18, 16, 17);
+    a.umov_d1(0, 18);
+    a.extr(1, 2, 3, 1);
+    a.vec_zip1_16b(16, 17, 18);
+    a.vec_shl_16b(18, 18, 4);
+    a.vec_ushr_16b(19, 19, 4);
     a.fp_arith(FpOp::Add, Fp::S, 16, 17, 18);
     a.fp_arith(FpOp::Sub, Fp::D, 16, 17, 18);
     a.fp_arith(FpOp::Mul, Fp::S, 19, 20, 21);

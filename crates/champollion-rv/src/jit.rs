@@ -1270,6 +1270,114 @@ mod tests {
     }
 
     #[test]
+    fn zbc_and_zbkb_ops_stay_in_the_jit() {
+        let prog = [
+            load(0b011, 13, 11, 0),   // a3 = a
+            load(0b011, 14, 11, 8),   // a4 = b
+            op(0b100, 4, 15, 13, 14), // pack a5, a3, a4
+            store(0b011, 12, 15, 0),
+            op(0b111, 4, 15, 13, 14), // packh
+            store(0b011, 12, 15, 8),
+            op_32(0b100, 4, 15, 13, 14), // packw
+            store(0b011, 12, 15, 16),
+            op(0b001, 5, 15, 13, 14), // clmul
+            store(0b011, 12, 15, 24),
+            op(0b011, 5, 15, 13, 14), // clmulh
+            store(0b011, 12, 15, 32),
+            op(0b010, 5, 15, 13, 14), // clmulr
+            store(0b011, 12, 15, 40),
+            ECALL,
+        ];
+        let a = 0x1122_3344_5566_7788u64;
+        let b = 0x99aa_bbcc_ddee_ff00u64;
+        assert!(matches!(
+            crate::decoder::decode(prog[12]),
+            Ok(crate::decoder::Inst::Op { op: crate::decoder::AluOp::Clmulr, .. })
+        ));
+        let fill = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &a.to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 8, &b.to_le_bytes()).unwrap();
+        };
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        oracle.set_x(12, DATA + 0x100);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 0x100);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "Zb* state");
+        assert_eq!(jit.stats.interpreted.get("Op"), None, "Zb* ops stay in the JIT");
+        let mut got_bytes = [0u8; 48];
+        let mut want_bytes = [0u8; 48];
+        mem_j.read_privileged(DATA + 0x100, &mut got_bytes).unwrap();
+        mem_i.read_privileged(DATA + 0x100, &mut want_bytes).unwrap();
+        assert_eq!(got_bytes, want_bytes, "Zb* results");
+    }
+
+    #[test]
+    fn zbkx_permutes_stay_in_the_jit() {
+        let prog = [
+            load(0b011, 13, 11, 0),
+            load(0b011, 14, 11, 8),
+            op(0b010, 20, 15, 13, 14), // xperm4
+            store(0b011, 12, 15, 0),
+            op(0b100, 20, 15, 13, 14), // xperm8
+            store(0b011, 12, 15, 8),
+            ECALL,
+        ];
+        let a = 0x0123_4567_89ab_cdefu64;
+        let b = 0xfedc_ba98_7654_3210u64;
+        assert!(matches!(
+            crate::decoder::decode(prog[2]),
+            Ok(crate::decoder::Inst::Op { op: crate::decoder::AluOp::Xperm4, .. })
+        ));
+        assert!(matches!(
+            crate::decoder::decode(prog[4]),
+            Ok(crate::decoder::Inst::Op { op: crate::decoder::AluOp::Xperm8, .. })
+        ));
+        let fill = |mem: &GuestMemory| {
+            mem.write_privileged(DATA, &a.to_le_bytes()).unwrap();
+            mem.write_privileged(DATA + 8, &b.to_le_bytes()).unwrap();
+        };
+        let mem_i = setup(&prog);
+        fill(&mem_i);
+        let mut oracle = CpuState::new(CODE);
+        oracle.set_x(11, DATA);
+        oracle.set_x(12, DATA + 0x100);
+        let want = loop {
+            if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                break t;
+            }
+        };
+        let mem_j = setup(&prog);
+        fill(&mem_j);
+        let mut cpu = CpuState::new(CODE);
+        cpu.set_x(11, DATA);
+        cpu.set_x(12, DATA + 0x100);
+        let mut jit = Jit::new().unwrap();
+        let got = jit.run(&mut cpu, &mem_j);
+        assert_eq!(got, want);
+        assert_eq!(cpu, oracle, "Zbkx state");
+        assert_eq!(jit.stats.interpreted.get("Op"), None, "Zbkx ops stay in the JIT");
+        let mut got_bytes = [0u8; 16];
+        let mut want_bytes = [0u8; 16];
+        mem_j.read_privileged(DATA + 0x100, &mut got_bytes).unwrap();
+        mem_i.read_privileged(DATA + 0x100, &mut want_bytes).unwrap();
+        assert_eq!(got_bytes, want_bytes, "Zbkx results");
+    }
+
+    #[test]
     fn fsgnj_single_matches_the_interpreter() {
         // Sign injection reads both operands with the NaN-box rule, and a double read
         // as a single produces the canonical NaN whose sign is then injected; the

@@ -745,6 +745,19 @@ impl Asm {
         let base = if size == Fp::D { 0x9e66_0000 } else { 0x1e26_0000 };
         self.emit(base | (rn as u32) << 5 | rd as u32);
     }
+    /// `pmull vd.1q, vn.1d, vm.1d`: the low 128 bits of a carry-less product.
+    pub fn pmull_d(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x0ee0_e000 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `umov rd, vn.d[1]`: the high 64-bit lane.
+    pub fn umov_d1(&mut self, rd: Reg, vn: Reg) {
+        self.emit(0x4e18_3c00 | (vn as u32) << 5 | rd as u32);
+    }
+    /// `extr rd, rn, rm, #lsb`: a 128-bit right shift's low word.
+    pub fn extr(&mut self, rd: Reg, rn: Reg, rm: Reg, lsb: u32) {
+        assert!(lsb < 64);
+        self.emit(0x93c0_0000 | lsb << 10 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
     fn fp_type(size: Fp) -> u32 {
         if size == Fp::D { 0x0040_0000 } else { 0 }
     }
@@ -1045,6 +1058,20 @@ impl Asm {
     /// zero fill. Bits 22:16 hold `2*size - imm`.
     pub fn vec_ushr_imm(&mut self, size: u32, rd: Reg, rn: Reg, imm: u32) {
         self.emit(0x6f00_0400 | (2 * size - imm) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `zip1 v.16b, vn.16b, vm.16b`: interleave the low eight bytes.
+    pub fn vec_zip1_16b(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0x4e00_3800 | (rm as u32) << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `shl v.16b, vn.16b, #imm`: shift each byte left.
+    pub fn vec_shl_16b(&mut self, rd: Reg, rn: Reg, imm: u32) {
+        assert!(imm < 8, "byte shift {imm}");
+        self.emit(0x4f08_5400 | imm << 16 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `ushr v.16b, vn.16b, #imm`: shift each byte right, zero fill.
+    pub fn vec_ushr_16b(&mut self, rd: Reg, rn: Reg, imm: u32) {
+        assert!((1..=8).contains(&imm), "byte shift {imm}");
+        self.emit(0x6f00_0400 | (16 - imm) << 16 | (rn as u32) << 5 | rd as u32);
     }
     /// `sshr`: the sign-filling counterpart of `vec_ushr_imm`.
     pub fn vec_sshr_imm(&mut self, size: u32, rd: Reg, rn: Reg, imm: u32) {

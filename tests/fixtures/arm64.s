@@ -102,6 +102,12 @@ fmov s16, w14
 fmov d17, x15
 fmov w14, s18
 fmov x15, d19
+pmull v18.1q, v16.1d, v17.1d
+umov x0, v18.d[1]
+extr x1, x2, x3, #1
+zip1 v16.16b, v17.16b, v18.16b
+shl v18.16b, v18.16b, #4
+ushr v19.16b, v19.16b, #4
 fadd s16, s17, s18
 fsub d16, d17, d18
 fmul s19, s20, s21
