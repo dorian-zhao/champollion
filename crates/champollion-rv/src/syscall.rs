@@ -39,6 +39,7 @@ pub mod errno {
     pub const ENAMETOOLONG: i32 = 36;
     pub const ENOSYS: i32 = 38;
     pub const ENOPROTOOPT: i32 = 92;
+    pub const EOPNOTSUPP: i32 = 95;
     pub const EAFNOSUPPORT: i32 = 97;
     pub const ETIMEDOUT: i32 = 110;
     pub const EINTR: i32 = 4;
@@ -78,6 +79,7 @@ syscalls! {
     SYMLINKAT = 36 "symlinkat",
     LINKAT = 37 "linkat",
     RENAMEAT = 38 "renameat",
+    FALLOCATE = 47 "fallocate",
     STATFS = 43 "statfs",
     FSTATFS = 44 "fstatfs",
     FTRUNCATE = 46 "ftruncate",
@@ -186,6 +188,8 @@ syscalls! {
     FADVISE64 = 223 "fadvise64",
     GETRANDOM = 278 "getrandom",
     STATX = 291 "statx",
+    COPY_FILE_RANGE = 285 "copy_file_range",
+    CLOSE_RANGE = 436 "close_range",
     RSEQ = 293 "rseq",
     PIDFD_OPEN = 434 "pidfd_open",
     CLONE3 = 435 "clone3",
@@ -493,6 +497,26 @@ pub trait HostOs: Send + Sync {
         Err(errno::ENOSYS)
     }
     fn ftruncate(&self, fd: i32, len: i64) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `fallocate`: mode 0 allocates and extends the file; other modes may return
+    /// `EOPNOTSUPP` when the host has no equivalent.
+    fn fallocate(&self, fd: i32, mode: i32, offset: i64, len: i64) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `copy_file_range`: copy up to `len` bytes, updating explicit offsets when given.
+    fn copy_file_range(
+        &self,
+        fd_in: i32,
+        off_in: Option<u64>,
+        fd_out: i32,
+        off_out: Option<u64>,
+        len: usize,
+    ) -> SysResult {
+        Err(errno::ENOSYS)
+    }
+    /// `close_range`; `cloexec` means set FD_CLOEXEC instead of closing.
+    fn close_range(&self, first: u32, last: u32, cloexec: bool) -> SysResult {
         Err(errno::ENOSYS)
     }
     fn fsync(&self, fd: i32, data_only: bool) -> SysResult {
@@ -1910,6 +1934,72 @@ fn call(p: &Process, t: &mut Thread, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         nr::FTRUNCATE => host.ftruncate(fd, a[1] as i64),
+        nr::FALLOCATE => passthrough(p, nr, a)
+            .unwrap_or_else(|| host.fallocate(fd, a[1] as i32, a[2] as i64, a[3] as i64)),
+        nr::COPY_FILE_RANGE => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                if a[5] != 0 {
+                    return Err(errno::EINVAL);
+                }
+                let read_off = if a[1] == 0 {
+                    None
+                } else {
+                    let mut b = [0u8; 8];
+                    p.mem.read(a[1], &mut b).map_err(efault)?;
+                    let v = i64::from_le_bytes(b);
+                    if v < 0 {
+                        return Err(errno::EINVAL);
+                    }
+                    Some(v as u64)
+                };
+                let write_off = if a[3] == 0 {
+                    None
+                } else {
+                    let mut b = [0u8; 8];
+                    p.mem.read(a[3], &mut b).map_err(efault)?;
+                    let v = i64::from_le_bytes(b);
+                    if v < 0 {
+                        return Err(errno::EINVAL);
+                    }
+                    Some(v as u64)
+                };
+                let len = usize::try_from(a[4]).map_err(|_| errno::EINVAL)?;
+                if len > i64::MAX as usize {
+                    return Err(errno::EINVAL);
+                }
+                let n = host.copy_file_range(fd, read_off, a[2] as i32, write_off, len)?;
+                if let Some(start) = read_off {
+                    put(p, a[1], &start.checked_add(n).ok_or(errno::EINVAL)?.to_le_bytes())?;
+                }
+                if let Some(start) = write_off {
+                    put(p, a[3], &start.checked_add(n).ok_or(errno::EINVAL)?.to_le_bytes())?;
+                }
+                Ok(n)
+            }
+        }
+        nr::CLOSE_RANGE => {
+            if let Some(result) = passthrough(p, nr, a) {
+                result
+            } else {
+                const CLOSE_RANGE_UNSHARE: u32 = 2;
+                const CLOSE_RANGE_CLOEXEC: u32 = 4;
+                let flags = a[2] as u32;
+                if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+                    return Err(errno::EINVAL);
+                }
+                if flags & CLOSE_RANGE_UNSHARE != 0 {
+                    return Err(errno::EINVAL); // no private fd-table copy in Direct mode
+                }
+                let first = a[0] as u32;
+                let last = a[1] as u32;
+                if first > last {
+                    return Err(errno::EINVAL);
+                }
+                host.close_range(first, last, flags & CLOSE_RANGE_CLOEXEC != 0)
+            }
+        }
         nr::FLOCK => host.flock(fd, a[1] as i32),
         nr::FSYNC => host.fsync(fd, false),
         nr::FDATASYNC => host.fsync(fd, true),

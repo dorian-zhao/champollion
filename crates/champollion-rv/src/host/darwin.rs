@@ -893,6 +893,179 @@ impl HostOs for DarwinHost {
         check(unsafe { libc::ftruncate(fd, len) } as isize)
     }
 
+    fn fallocate(&self, fd: i32, mode: i32, offset: i64, len: i64) -> SysResult {
+        if mode != 0 {
+            return Err(errno::EOPNOTSUPP);
+        }
+        if offset < 0 || len < 0 {
+            return Err(errno::EINVAL);
+        }
+        let end = offset.checked_add(len).ok_or(errno::EINVAL)?;
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: end,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: the fstore_t pointer is valid for the call.
+        let r = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+        if r < 0 {
+            let e = last_errno();
+            if e != errno::EOPNOTSUPP {
+                return Err(e);
+            }
+        }
+        // SAFETY: ftruncate has no pointer arguments.
+        check(unsafe { libc::ftruncate(fd, end) } as isize).map(|_| 0)
+    }
+
+    fn copy_file_range(
+        &self,
+        fd_in: i32,
+        off_in: Option<u64>,
+        fd_out: i32,
+        off_out: Option<u64>,
+        len: usize,
+    ) -> SysResult {
+        if len == 0 {
+            return Ok(0);
+        }
+        let start_in = match off_in {
+            Some(v) => v,
+            None => {
+                // SAFETY: no pointers.
+                let p = unsafe { libc::lseek(fd_in, 0, libc::SEEK_CUR) };
+                if p < 0 {
+                    return Err(last_errno());
+                }
+                p as u64
+            }
+        };
+        let start_out = match off_out {
+            Some(v) => v,
+            None => {
+                // SAFETY: no pointers.
+                let p = unsafe { libc::lseek(fd_out, 0, libc::SEEK_CUR) };
+                if p < 0 {
+                    return Err(last_errno());
+                }
+                p as u64
+            }
+        };
+        let mut buf = vec![0u8; len.clamp(1, 64 * 1024)];
+        let mut done = 0u64;
+        let mut error = None;
+        while (done as usize) < len {
+            let Some(at) = start_in.checked_add(done).filter(|&v| v <= i64::MAX as u64) else {
+                if done == 0 {
+                    return Err(errno::EINVAL);
+                }
+                break;
+            };
+            let want = (len - done as usize).min(buf.len());
+            // SAFETY: buf is valid for want bytes.
+            let n = unsafe { libc::pread(fd_in, buf.as_mut_ptr().cast(), want, at as libc::off_t) };
+            if n < 0 {
+                let e = last_errno();
+                if e == errno::EINTR {
+                    continue;
+                }
+                if done == 0 {
+                    return Err(e);
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            let mut written = 0usize;
+            while written < n as usize {
+                let Some(out_at) =
+                    start_out.checked_add(done + written as u64).filter(|&v| v <= i64::MAX as u64)
+                else {
+                    error = Some(errno::EINVAL);
+                    break;
+                };
+                // SAFETY: source range is inside buf.
+                let w = unsafe {
+                    libc::pwrite(
+                        fd_out,
+                        buf[written..].as_ptr().cast(),
+                        n as usize - written,
+                        out_at as libc::off_t,
+                    )
+                };
+                if w < 0 {
+                    let e = last_errno();
+                    if e == errno::EINTR {
+                        continue;
+                    }
+                    error = Some(e);
+                    break;
+                }
+                if w == 0 {
+                    break;
+                }
+                written += w as usize;
+            }
+            done += written as u64;
+            if written < n as usize || error.is_some() {
+                break;
+            }
+        }
+        if off_in.is_none() && done > 0 {
+            // SAFETY: no pointers.
+            if unsafe { libc::lseek(fd_in, done as libc::off_t, libc::SEEK_CUR) } < 0 {
+                return Err(last_errno());
+            }
+        }
+        if off_out.is_none() && done > 0 {
+            // SAFETY: no pointers.
+            if unsafe { libc::lseek(fd_out, done as libc::off_t, libc::SEEK_CUR) } < 0 {
+                return Err(last_errno());
+            }
+        }
+        if done == 0
+            && let Some(e) = error
+        {
+            return Err(e);
+        }
+        Ok(done)
+    }
+
+    fn close_range(&self, first: u32, last: u32, cloexec: bool) -> SysResult {
+        if first > last {
+            return Err(errno::EINVAL);
+        }
+        // SAFETY: getdtablesize has no arguments and no side effects.
+        let limit = unsafe { libc::getdtablesize() }.max(0) as u32;
+        if first >= limit {
+            return Ok(0);
+        }
+        for fd in first..=last.min(limit - 1) {
+            let fd = fd as i32;
+            if cloexec {
+                // SAFETY: fcntl reads a descriptor's flags.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if flags < 0 {
+                    if last_errno() == errno::EBADF {
+                        continue;
+                    }
+                    return Err(last_errno());
+                }
+                // SAFETY: no pointers.
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                    return Err(last_errno());
+                }
+            } else {
+                // SAFETY: closing an arbitrary fd is safe; EBADF means it was already closed.
+                unsafe { libc::close(fd) };
+            }
+        }
+        Ok(0)
+    }
+
     fn fsync(&self, fd: i32, _data_only: bool) -> SysResult {
         // SAFETY: no pointers.
         check(unsafe { libc::fsync(fd) } as isize)
@@ -1254,6 +1427,61 @@ mod tests {
         assert_eq!(h.sendfile(out2.as_raw_fd(), infile.as_raw_fd(), None, 5), Ok(5));
         assert_eq!(std::fs::read(dir.join("out2")).unwrap(), b"hello");
         assert_eq!(h.lseek(infile.as_raw_fd(), 0, libc::SEEK_CUR), Ok(5));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fallocate_copy_range_and_close_range() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("champollion-fileops-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in");
+        std::fs::write(&input, b"0123456789").unwrap();
+        let infile = std::fs::File::open(&input).unwrap();
+        let outfile = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.join("out"))
+            .unwrap();
+        let h = DarwinHost::default();
+        let size = h.fallocate(outfile.as_raw_fd(), 0, 0, 4096).unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(h.fstat(outfile.as_raw_fd()).unwrap().size, 4096);
+
+        let mut in_off = 2u64;
+        let mut out_off = 8u64;
+        assert_eq!(
+            h.copy_file_range(
+                infile.as_raw_fd(),
+                Some(in_off),
+                outfile.as_raw_fd(),
+                Some(out_off),
+                4,
+            ),
+            Ok(4)
+        );
+        in_off += 4;
+        out_off += 4;
+        assert_eq!((in_off, out_off), (6, 12));
+        let mut b = [0u8; 4];
+        assert_eq!(unsafe { libc::pread(outfile.as_raw_fd(), b.as_mut_ptr().cast(), 4, 8) }, 4);
+        assert_eq!(&b, b"2345");
+
+        let closee = std::fs::File::open(&input).unwrap();
+        assert_eq!(
+            h.close_range(closee.as_raw_fd() as u32, closee.as_raw_fd() as u32, false),
+            Ok(0)
+        );
+        assert_eq!(h.fstat(closee.as_raw_fd()), Err(errno::EBADF));
+        std::mem::forget(closee); // the fd is already closed; do not close a reused one
+        let cloexec = std::fs::File::open(&input).unwrap();
+        assert_eq!(
+            h.close_range(cloexec.as_raw_fd() as u32, cloexec.as_raw_fd() as u32, true),
+            Ok(0)
+        );
+        assert_ne!(h.fcntl(cloexec.as_raw_fd(), 1, 0).unwrap() & 1, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

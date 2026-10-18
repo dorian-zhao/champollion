@@ -12,6 +12,7 @@
 #include <sys/random.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -19,6 +20,16 @@
 #include <unistd.h>
 
 #define CHECK(name, cond) printf("%s %s\n", (cond) ? "ok" : "FAIL", name)
+
+#ifndef SYS_fallocate
+#define SYS_fallocate 47
+#endif
+#ifndef SYS_copy_file_range
+#define SYS_copy_file_range 285
+#endif
+#ifndef SYS_close_range
+#define SYS_close_range 436
+#endif
 
 int main(int argc, char **argv) {
     CHECK("argc", argc == 3);
@@ -71,6 +82,23 @@ int main(int argc, char **argv) {
                                    stat(copy, &st) == 0 &&
                                    st.st_atim.tv_sec > 1600000003 &&
                                    st.st_mtim.tv_sec == 1600000003);
+
+    char range[4096];
+    snprintf(range, sizeof range, "%s/range.txt", argc > 1 ? argv[1] : ".");
+    int range_fd = open(range, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    CHECK("fallocate", range_fd >= 0 && syscall(SYS_fallocate, range_fd, 0, 0, 4096) == 0 &&
+                           fstat(range_fd, &st) == 0 && st.st_size == 4096);
+    int range_in = open(path, O_RDONLY);
+    off_t range_in_off = 0, range_out_off = 0;
+    CHECK("copy_file_range", range_in >= 0 && range_fd >= 0 &&
+                                 syscall(SYS_copy_file_range, range_in, &range_in_off, range_fd,
+                                         &range_out_off, 11, 0) == 11 &&
+                                 range_in_off == 11 && range_out_off == 11);
+    close(range_in);
+    int close_fd = open(path, O_RDONLY);
+    CHECK("close_range", close_fd >= 0 && syscall(SYS_close_range, close_fd, close_fd, 0) == 0 &&
+                             fcntl(close_fd, F_GETFD) < 0 && errno == EBADF);
+    close(range_fd);
 
     char exe[4096];
     ssize_t exe_len = readlink("/proc/self/exe", exe, sizeof exe);
