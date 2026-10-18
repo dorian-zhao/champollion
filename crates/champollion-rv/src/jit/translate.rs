@@ -650,8 +650,8 @@ impl Tx {
                     return false;
                 }
             }
-            Inst::VMacc { add, vd, vs2, src } => {
-                if !self.vector_macc(add, vd, vs2, src) {
+            Inst::VMacc { add, mask, vd, vs2, src } => {
+                if !self.vector_macc(add, mask, vd, vs2, src) {
                     return false;
                 }
             }
@@ -2227,21 +2227,44 @@ impl Tx {
     }
 
     /// `vmacc` (`vd += vs2*src`) and `vmadd` (`vd = src*vd + vs2`) at m1.
-    fn vector_macc(&mut self, add: bool, vd: u8, vs2: u8, src: VSel) -> bool {
+    fn vector_macc(&mut self, add: bool, mask: bool, vd: u8, vs2: u8, src: VSel) -> bool {
         let Some((_, bytes)) = self.vec else { return false };
         if self.vec_regs != 1 || bytes == 8 {
             return false;
         }
+        if mask && vd == 0 {
+            return false;
+        }
+        let bits = bytes * 8;
         self.v_ldr(FA, vd);
         self.v_ldr(FB, vs2);
         if !self.vector_operand(src, FC, bytes) {
             return false;
         }
+        if mask {
+            // Mask the product and add it to the untouched accumulator: inactive lanes
+            // then keep vd exactly, and active lanes add their product in one step.
+            if add {
+                self.a.vec_mul(bits, FB, FB, FC);
+                self.vector_mask_expand(bytes);
+                self.a.vec_and(FB, FB, FR);
+                self.a.vec_add(bits, FA, FA, FB);
+            } else {
+                self.a.vec_mul(bits, FC, FC, FA);
+                self.a.vec_orr(FA, FC, FC);
+                self.vector_mask_expand(bytes);
+                self.a.vec_and(FA, FA, FR);
+                self.a.vec_add(bits, FA, FA, FB);
+            }
+            self.v_str(FA, vd);
+            self.vec_last = None;
+            return true;
+        }
         if add {
-            self.a.vec_mla(bytes * 8, FA, FB, FC);
+            self.a.vec_mla(bits, FA, FB, FC);
             self.v_str(FA, vd);
         } else {
-            self.a.vec_mla(bytes * 8, FB, FA, FC);
+            self.a.vec_mla(bits, FB, FA, FC);
             self.v_str(FB, vd);
         }
         true

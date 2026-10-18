@@ -437,6 +437,7 @@ pub enum Inst {
     /// (`vmadd` = vd = src × vd + vs2).
     VMacc {
         add: bool,
+        mask: bool,
         vd: u8,
         vs2: u8,
         src: VSel,

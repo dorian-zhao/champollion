@@ -59,6 +59,8 @@ vmacc.vv v1, v2, v3
 vmacc.vx v1, a0, v3
 vmadd.vv v1, v2, v3
 vmadd.vx v1, a0, v3
+vmacc.vv v1, v2, v3, v0.t
+vmadd.vx v1, a0, v3, v0.t
 vxor.vv v1, v2, v3
 vxor.vi v1, v2, 3
 vor.vv v1, v2, v3

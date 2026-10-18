@@ -437,10 +437,13 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                 vector::set_elem(cpu, vd, i, sew_b, v);
             }
         }
-        Inst::VMacc { add, vd, vs2, src } => {
+        Inst::VMacc { add, mask, vd, vs2, src } => {
             let sew_b = vector::sew_bytes(cpu);
-            let mask = if sew_b == 8 { u64::MAX } else { (1u64 << (8 * sew_b)) - 1 };
+            let elem_mask = if sew_b == 8 { u64::MAX } else { (1u64 << (8 * sew_b)) - 1 };
             for i in 0..cpu.vl {
+                if mask && !vector::mask_get(cpu, 0, i) {
+                    continue;
+                }
                 let s = match src {
                     VSel::V(reg) => vector::get_elem(cpu, reg, i, sew_b),
                     VSel::X(reg) => cpu.x(reg),
@@ -451,10 +454,10 @@ pub fn execute(cpu: &mut CpuState, mem: &impl Memory, inst: Inst, len: u64) -> R
                 let el = vector::get_elem(cpu, vs2, i, sew_b);
                 let v = if add {
                     // vmacc: vd += src × vs2.
-                    s.wrapping_mul(el).wrapping_add(old) & mask
+                    s.wrapping_mul(el).wrapping_add(old) & elem_mask
                 } else {
                     // vmadd: vd = src × vd + vs2.
-                    s.wrapping_mul(old).wrapping_add(el) & mask
+                    s.wrapping_mul(old).wrapping_add(el) & elem_mask
                 };
                 vector::set_elem(cpu, vd, i, sew_b, v);
             }

@@ -316,8 +316,8 @@ pub fn decode_op(w: u32) -> Result<Inst, DecodeError> {
                 vs2,
             }),
             // vmadd.vv / vmacc.vv.
-            0b101001 => Ok(Inst::VMacc { add: false, vd, vs2, src: VSel::V(vs1) }),
-            0b101101 => Ok(Inst::VMacc { add: true, vd, vs2, src: VSel::V(vs1) }),
+            0b101001 => Ok(Inst::VMacc { add: false, mask, vd, vs2, src: VSel::V(vs1) }),
+            0b101101 => Ok(Inst::VMacc { add: true, mask, vd, vs2, src: VSel::V(vs1) }),
             // vmul.vv / vwaddu.wv.
             0b100101 => arith(VArithOp::Mul, VSel::V(vs1)),
             0b110100 => Ok(Inst::VWiden { mask, vd, vs2, src: VSel::V(vs1) }),
@@ -338,8 +338,8 @@ pub fn decode_op(w: u32) -> Result<Inst, DecodeError> {
             0b110100 => Ok(Inst::VWiden { mask, vd, vs2, src: VSel::X(vs1) }),
             0b010000 => Ok(Inst::VmvSx { vd, rs1: vs1 }),
             0b001111 => arith(VArithOp::Slide1Down, VSel::X(vs1)),
-            0b101001 => Ok(Inst::VMacc { add: false, vd, vs2, src: VSel::X(vs1) }),
-            0b101101 => Ok(Inst::VMacc { add: true, vd, vs2, src: VSel::X(vs1) }),
+            0b101001 => Ok(Inst::VMacc { add: false, mask, vd, vs2, src: VSel::X(vs1) }),
+            0b101101 => Ok(Inst::VMacc { add: true, mask, vd, vs2, src: VSel::X(vs1) }),
             _ => Err(illegal(w)),
         },
         0b001 => decode_fp(w, f6, vd, vs2, vs1, mask, false),

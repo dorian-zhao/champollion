@@ -2170,7 +2170,7 @@ mod tests {
 
     #[test]
     fn vmacc_ops_stay_in_the_jit() {
-        fn check(wf3: u32, vtype: u32, avl: u32, data: Vec<u8>) {
+        fn check(wf3: u32, vtype: u32, avl: u32, data: Vec<u8>, masked: bool) {
             let vsetivli = |rd: u32, avl: u32, vtype: u32| {
                 (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
             };
@@ -2181,18 +2181,23 @@ mod tests {
                 (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
             };
             let vv = |f6: u32, vd: u32, vs2: u32, vs1: u32| {
-                (f6 << 26) | (1 << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | 0x57
+                (f6 << 26)
+                    | (u32::from(!masked) << 25)
+                    | (vs2 << 20)
+                    | (vs1 << 15)
+                    | (vd << 7)
+                    | 0x57
             };
             let vx = |f6: u32, vd: u32, vs2: u32, rs1: u32| {
                 (f6 << 26)
-                    | (1 << 25)
+                    | (u32::from(!masked) << 25)
                     | (vs2 << 20)
                     | (rs1 << 15)
                     | (0b100 << 12)
                     | (vd << 7)
                     | 0x57
             };
-            let prog = [
+            let mut prog = vec![
                 vsetivli(0, avl, vtype),
                 vle(wf3, 1, 11),
                 vle(wf3, 2, 12),
@@ -2200,6 +2205,11 @@ mod tests {
                 vle(wf3, 4, 13),
                 vle(wf3, 5, 13),
                 vle(wf3, 6, 13),
+            ];
+            if masked {
+                prog.insert(1, vle(wf3, 0, 16));
+            }
+            prog.extend([
                 vv(0b101101, 3, 1, 2),  // vmacc.vv v3, v1, v2
                 vv(0b101001, 4, 1, 2),  // vmadd.vv v4, v1, v2
                 vx(0b101101, 5, 1, 15), // vmacc.vx v5, v1, a5
@@ -2212,16 +2222,25 @@ mod tests {
                 addi(14, 14, 16),
                 vse(wf3, 6, 14),
                 ECALL,
-            ];
+            ]);
             let fill = |mem: &GuestMemory| {
                 mem.write_privileged(DATA, &data).unwrap();
+                let mut m = [0xffu8; 16];
+                m[0] = 0x03;
+                m[1] = 0x5a;
+                mem.write_privileged(DATA + 48, &m).unwrap();
             };
             let mem_i = setup(&prog);
             fill(&mem_i);
             let mut oracle = CpuState::new(CODE);
-            for (r, v) in
-                [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, DATA + 0x200), (15, 3)]
-            {
+            for (r, v) in [
+                (11u8, DATA),
+                (12, DATA + 16),
+                (13, DATA + 32),
+                (14, DATA + 0x200),
+                (15, 3),
+                (16, DATA + 48),
+            ] {
                 oracle.set_x(r, v);
             }
             let want = loop {
@@ -2232,9 +2251,14 @@ mod tests {
             let mem_j = setup(&prog);
             fill(&mem_j);
             let mut cpu = CpuState::new(CODE);
-            for (r, v) in
-                [(11u8, DATA), (12, DATA + 16), (13, DATA + 32), (14, DATA + 0x200), (15, 3)]
-            {
+            for (r, v) in [
+                (11u8, DATA),
+                (12, DATA + 16),
+                (13, DATA + 32),
+                (14, DATA + 0x200),
+                (15, 3),
+                (16, DATA + 48),
+            ] {
                 cpu.set_x(r, v);
             }
             let mut jit = Jit::new().unwrap();
@@ -2259,9 +2283,12 @@ mod tests {
             .map(|i| i.wrapping_mul(0x4000_0001).wrapping_add(7))
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        check(0, 0xc0, 16, e8);
-        check(5, 0xc8, 8, e16);
-        check(6, 0xd0, 4, e32);
+        check(0, 0xc0, 16, e8.clone(), false);
+        check(5, 0xc8, 8, e16.clone(), false);
+        check(6, 0xd0, 4, e32.clone(), false);
+        check(0, 0xc0, 16, e8, true);
+        check(5, 0xc8, 8, e16, true);
+        check(6, 0xd0, 4, e32, true);
     }
 
     #[test]
