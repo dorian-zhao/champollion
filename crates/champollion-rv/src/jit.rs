@@ -2282,6 +2282,76 @@ mod tests {
     }
 
     #[test]
+    fn vnarrow_stays_in_the_jit() {
+        fn check(vtype: u32, avl: u32, wf3: u32, f6: u32, source: [[u8; 16]; 2]) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vn = |f6: u32, vd: u32, vs2: u32, imm: u32| {
+                (f6 << 26)
+                    | (1 << 25)
+                    | (vs2 << 20)
+                    | (imm << 15)
+                    | (0b011 << 12)
+                    | (vd << 7)
+                    | 0x57
+            };
+            let prog = [vsetivli(0, avl, vtype), vn(f6, 3, 1, 3), vse(wf3, 3, 12), ECALL];
+            let mem_i = setup(&prog);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(12, DATA + 0x200);
+            oracle.v[1] = source[0];
+            oracle.v[2] = source[1];
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(12, DATA + 0x200);
+            cpu.v[1] = source[0];
+            cpu.v[2] = source[1];
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "vnarrow state");
+            assert_eq!(jit.stats.interpreted.get("VNarrow"), None, "vnarrow stays in the JIT");
+            let mut a = [0u8; 16];
+            let mut b = [0u8; 16];
+            mem_j.read_privileged(DATA + 0x200, &mut a).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut b).unwrap();
+            assert_eq!(a, b, "vnarrow result");
+        }
+
+        let mut s8 = [[0u8; 16]; 2];
+        for (r, row) in s8.iter_mut().enumerate() {
+            for (i, b) in row.iter_mut().enumerate() {
+                *b = (r * 16 + i).wrapping_mul(13).wrapping_add(7) as u8;
+            }
+        }
+        let mut s16 = [[0u8; 16]; 2];
+        for (r, row) in s16.iter_mut().enumerate() {
+            for (i, b) in row.iter_mut().enumerate() {
+                *b = (r * 16 + i).wrapping_mul(29).wrapping_add(3) as u8;
+            }
+        }
+        let mut s32 = [[0u8; 16]; 2];
+        for (r, row) in s32.iter_mut().enumerate() {
+            for (i, b) in row.iter_mut().enumerate() {
+                *b = (r * 16 + i).wrapping_mul(41).wrapping_add(5) as u8;
+            }
+        }
+        check(0xc0, 16, 0, 0x2c, s8); // vnsrl.vi e8
+        check(0xc0, 16, 0, 0x2d, s8); // vnsra.vi e8
+        check(0xc8, 8, 5, 0x2c, s16); // vnsrl.vi e16
+        check(0xd0, 4, 6, 0x2c, s32); // vnsrl.vi e32
+    }
+
+    #[test]
     fn m4_and_m8_arithmetic_stay_in_the_jit() {
         fn check(vtype: u32, avl: u32, wf3: u32, bytes: usize) {
             let vsetivli = |rd: u32, avl: u32, vtype: u32| {

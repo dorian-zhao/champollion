@@ -142,6 +142,9 @@ fn matches_assembler() {
     a.vec_shift_long(true, 32, 28, 29);
     a.vec_shift_long(false, 32, 30, 31);
     a.vec_movi_8h(20, 31);
+    a.vec_xtn(16, 21, 22);
+    a.vec_xtn(32, 23, 24);
+    a.vec_xtn(64, 25, 26);
     a.fp_arith(FpOp::Add, Fp::S, 16, 17, 18);
     a.fp_arith(FpOp::Sub, Fp::D, 16, 17, 18);
     a.fp_arith(FpOp::Mul, Fp::S, 19, 20, 21);

@@ -665,6 +665,11 @@ impl Tx {
                     return false;
                 }
             }
+            Inst::VNarrow { sra, mask, vd, vs2, src } => {
+                if !self.vector_narrow(sra, mask, vd, vs2, src) {
+                    return false;
+                }
+            }
             Inst::VMask { op, vd, vs1, vs2 } => {
                 if !self.vector_mask(op, vd, vs1, vs2) {
                     return false;
@@ -2296,6 +2301,35 @@ impl Tx {
         }
         self.v_str(FA, vd);
         self.v_str(FB, (vd + 1) & 31);
+        true
+    }
+
+    /// `vnsrl.vi`/`vnsra.vi`: shift the m2 source and narrow it into one m1 register.
+    fn vector_narrow(&mut self, sra: bool, mask: bool, vd: u8, vs2: u8, src: VSel) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if mask || self.vec_regs != 1 || !matches!(bytes, 1 | 2 | 4) {
+            return false;
+        }
+        let VSel::I(imm) = src else { return false };
+        if !group_fits(vs2, 2) {
+            return false;
+        }
+        let wide_bits = bytes * 16;
+        let sh = u32::from(imm) & (wide_bits - 1);
+        self.v_ldr2(FA, FB, vs2);
+        if sh > 0 {
+            if sra {
+                self.a.vec_sshr_imm(wide_bits, FA, FA, sh);
+                self.a.vec_sshr_imm(wide_bits, FB, FB, sh);
+            } else {
+                self.a.vec_ushr_imm(wide_bits, FA, FA, sh);
+                self.a.vec_ushr_imm(wide_bits, FB, FB, sh);
+            }
+        }
+        self.a.vec_xtn(wide_bits, FA, FA);
+        self.a.vec_xtn(wide_bits, FB, FB);
+        self.a.vec_ins_last(FA, FB, 8);
+        self.v_str(FA, vd);
         true
     }
 

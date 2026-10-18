@@ -1113,6 +1113,16 @@ impl Asm {
         };
         self.emit(0x6e20_2800 | size | (rn as u32) << 5 | rd as u32);
     }
+    /// `xtn`: narrow elements from 16→8, 32→16, or 64→32 bits.
+    pub fn vec_xtn(&mut self, from_bits: u32, rd: Reg, rn: Reg) {
+        let size = match from_bits {
+            16 => 0x0000_0000,
+            32 => 0x0040_0000,
+            64 => 0x0080_0000,
+            _ => panic!("xtn has no {from_bits}-bit source"),
+        };
+        self.emit(0x0e21_2800 | size | (rn as u32) << 5 | rd as u32);
+    }
     /// `sshr`: the sign-filling counterpart of `vec_ushr_imm`.
     pub fn vec_sshr_imm(&mut self, size: u32, rd: Reg, rn: Reg, imm: u32) {
         self.emit(0x4f00_0400 | (2 * size - imm) << 16 | (rn as u32) << 5 | rd as u32);
