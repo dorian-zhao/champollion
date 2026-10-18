@@ -6,7 +6,7 @@ silicon Macs, and arm64 Linux hosts.
 Champollion is a user-mode binary translator from riscv64 Linux to arm64. It started as a learning project, which aims at what Rosetta 2 does for x86 programs: no emulated machine, no guest kernel, just the program translated to native code and running at close to native speed. A guest runs in one of two modes, sharing one translator:
 
 - **Direct mode, on macOS:** `rvrun ./program` runs a riscv64 Linux executable directly as a Mac process and Linux system calls are translated to Darwin ones. The daily build → test → debug loop, with no VM to boot or sync.
-- **VM mode, against a real Linux kernel:** `rvcontainer run debian:trixie` runs riscv64 container images, each in a lightweight arm64 Linux VM whose kernel is the guest's — rvrun is registered as the kernel's handler for riscv64 programs and system calls pass straight through. On an arm64 Linux host the same Linux build runs directly, no VM needed: see [On arm64 Linux](#on-arm64-linux-binfmt_misc).
+- **VM mode, against a real Linux kernel:** on macOS, OrbStack runs riscv64 containers through its persistent arm64 Linux VM (recommended), while `rvcontainer` uses Apple's containerization stack. On an arm64 Linux host the same Linux build runs directly as the kernel's `binfmt_misc` handler: see [the arm64 Linux section](#on-an-arm64-linux-host-binfmt_misc).
 
 The name comes from Jean-François Champollion, who deciphered the Rosetta Stone 🪨.
 
@@ -19,26 +19,54 @@ The name comes from Jean-François Champollion, who deciphered the Rosetta Stone
 | Programs | Static and dynamically linked (musl or glibc), multithreaded, with signals, sockets, `fork`/`execve`, and shared memory |
 | Known to run | busybox, Lua, SQLite, Go programs, Rust test binaries, CPython 3.14 (Alpine), Debian trixie's userland (bash, coreutils, apt, dpkg, perl, python3), and Ubuntu 26.04's RVA23U64 userland |
 | Debugging | A GDB remote stub (`rvrun -g PORT`) |
+| Latest release | [v0.1.1](https://github.com/dorian-zhao/champollion/releases/tag/v0.1.1) |
 
 Milestones M1 through M5 (interpreter, JIT, threads, signals, dynamic linking) are complete. M6 (VM mode) is working. See [`docs/design.md`](docs/design.md) for the design, the milestones, and the [known gaps](docs/design.md#known-gaps).
 
+### Quick start: riscv64 containers with OrbStack (recommended on macOS)
+
+On Apple silicon, [OrbStack](https://orbstack.dev/) is the recommended VM-mode
+setup: it keeps a persistent arm64 Linux VM and uses the normal Docker CLI.
+From a checkout:
+
+```sh
+orb start
+docker context use orbstack
+tools/linux.sh build --release -p rvrun
+tools/orbstack-binfmt.sh install target/linux/release/rvrun
+docker run --rm --platform linux/riscv64 ubuntu:26.04 uname -m
+# riscv64
+```
+
+The registration script snapshots OrbStack's binfmt handler and runs a smoke
+test. Re-run `install` after restarting OrbStack or changing `rvrun`.
+Release-only installs, Docker bind mounts, common recipes, hash verification,
+and troubleshooting are in [docs/usage.md](docs/usage.md).
+
 ### Performance
 
-Compared with the same programs built natively for arm64 (Direct mode on a MacBook Pro M2 2022, 16G):
+The `tools/daily.sh` gate compares the same sources against native arm64 and
+Rosetta 2. Representative minima on a MacBook Pro M2 2022, October 18, 2026:
 
-| Benchmark | Slowdown vs. native |
-| --- | --- |
-| CPU-bound C (sieve, hashing, array traffic) | 1.5× |
-| n-body (floating point) | 1.37× |
-| Lua 5.4 script | 2.0× |
-| SQLite (300k-row insert, index, aggregates) | 1.87× |
+| Workload | vs. native arm64 | vs. Rosetta 2 |
+| --- | ---: | ---: |
+| hello | 2.36× slower | 0.73× (faster) |
+| Lua start | 2.49× slower | 0.82× (faster) |
+| Lua compute | 2.26× slower | 0.85× (faster) |
+| SQLite script | 2.33× slower | 1.35× slower |
+| SQLite CTE | 2.07× slower | 1.44× slower |
 
-The target is at most 2× slower than native. In the same Linux VM, rvrun runs Lua 4.8× and SQLite 4.2× faster than `qemu-riscv64`.
+Champollion beats Rosetta on startup and Lua, and is still behind on SQLite
+and the vector/GEMM workloads. The vector ALU and nanoGPT-shaped measurements
+are in [`CHANGELOG.md`](CHANGELOG.md). In the same Linux VM, rvrun runs Lua
+4.8× and SQLite 4.2× faster than `qemu-riscv64`.
 
 ## Requirements
 
 - Direct mode: a Mac with Apple silicon running macOS 14.4 or later, and Rust (stable, edition 2024).
-- VM mode: on macOS, macOS 26 or later and Xcode 26 or later for `rvcontainer`, plus Docker (OrbStack recommended) to build the Linux build; on an arm64 Linux host, just Docker for that build.
+- VM mode on macOS (recommended): [OrbStack](https://orbstack.dev/) on Apple silicon. It provides the arm64 Linux VM and the Docker CLI.
+- Alternative `rvcontainer` mode: macOS 26 or later and Xcode 26 or later. It boots a fresh VM per run and needs Docker only to build the Linux binary.
+- VM mode on an arm64 Linux host: Docker to build the Linux binary; no VM or macOS-specific launcher.
 - To rebuild the test programs: [`zig`](https://ziglang.org) 0.17 or later, used as a riscv64 C cross compiler.
 
 ## Direct mode: `rvrun`
@@ -76,9 +104,42 @@ Options and environment variables:
 
 ## VM mode
 
-VM mode runs the guest against a real Linux kernel, two ways: inside an arm64 Linux VM on a Mac (`rvcontainer`), or directly on an arm64 Linux host as the kernel's `binfmt_misc` handler.
+VM mode runs the guest against a real Linux kernel. On macOS, **OrbStack is the
+recommended path**; `rvcontainer` is an Apple-only alternative. On arm64 Linux,
+the Linux build is registered directly as the kernel's `binfmt_misc` handler.
 
-### On macOS: `rvcontainer`
+### On macOS (recommended): OrbStack
+
+OrbStack keeps a persistent arm64 Linux VM and exposes the normal Docker CLI.
+The Linux build registers as the VM's binfmt handler, so
+`docker run --platform linux/riscv64` works like a native Docker platform.
+
+From a checkout:
+
+```sh
+orb start
+docker context use orbstack
+tools/linux.sh build --release -p rvrun
+tools/orbstack-binfmt.sh install target/linux/release/rvrun
+docker run --rm --platform linux/riscv64 ubuntu:26.04 uname -m
+# riscv64
+```
+
+`tools/orbstack-binfmt.sh install` registers the handler and smoke-tests it
+with an Alpine riscv64 container. Re-run it after restarting OrbStack or
+replacing `rvrun`: OrbStack snapshots the handler at registration and keeps
+the binfmt table in its VM.
+
+For a release-only install (no checkout), the full walkthrough with the
+download command, Docker bind mounts, hash verification, and troubleshooting is
+in [docs/usage.md](docs/usage.md#recommended-on-macos-orbstack).
+
+OrbStack is recommended for most users because it avoids a VM boot and image
+unpack on every run, keeps images warm, and uses the Docker workflow people
+already have. `rvcontainer` remains useful for an Apple-only
+Virtualization.framework stack or for testing the launcher itself.
+
+### Alternative on macOS: `rvcontainer`
 
 `rvcontainer` is a small Swift launcher built on [apple/containerization](https://github.com/apple/containerization). It pulls an image's `linux/riscv64` variant and boots an arm64 Linux VM with Virtualization.framework and shares rvrun's Linux build into the VM and registers it with `binfmt_misc`, the same way Containerization registers Rosetta for amd64 images.
 
@@ -94,13 +155,13 @@ riscv64
 root@rv-1c2a90f3:/# apt-get update && apt-get install -y jq
 ```
 
-`rvcontainer run` accepts `-v HOST:CONTAINER` to share a directory, `-e NAME=VALUE`, `-w DIR`, `--cpus`, `--memory`, and `--no-network`. Containers have networking by default. Each run starts from a fresh copy of the image.
+`rvcontainer run` accepts `-v HOST:CONTAINER` to share a directory, `-e NAME=VALUE`, `-w DIR`, `--cpus`, `--memory`, and `--no-network`. Containers have networking by default. Each run starts a fresh VM and a fresh copy of the image; it is not a Docker/OrbStack replacement.
 
-### On arm64 Linux: `binfmt_misc`
+### On an arm64 Linux host: `binfmt_misc`
 
 On an arm64 Linux host the VM is the host itself: register the Linux build as the kernel's
 handler for riscv64 programs, and they run like native ones — including inside containers.
-This is the same registration `rvcontainer` performs inside its VM.
+This is the same registration OrbStack and `rvcontainer` perform inside their VMs.
 
 ```sh
 tools/linux.sh build --release -p rvrun       # produces target/linux/release/rvrun
@@ -133,8 +194,9 @@ On Linux, guest memory sits at the same addresses as on the host. Therefore, gue
 | `crates/softfloat` | Berkeley SoftFloat 3, the reference for floating-point semantics |
 | `launcher` | `rvcontainer`, VM mode's Swift launcher |
 | `tests` | Fixtures, riscv-tests, real programs, and sysroot setup |
-| `tools` | The profiler's report renderer and `linux.sh`, which runs cargo on arm64 Linux in a container |
+| `tools` | The profiler's report renderer, `linux.sh`, and the OrbStack binfmt setup helper |
 | `docs/design.md` | Design brief |
+| `docs/usage.md` | User guide, including the OrbStack and `rvcontainer` workflows |
 
 ## Testing
 
