@@ -116,6 +116,16 @@ fn matches_assembler() {
     a.vec_zip1_16b(16, 17, 18);
     a.vec_shl_16b(18, 18, 4);
     a.vec_ushr_16b(19, 19, 4);
+    a.vec_rev16(20, 21);
+    a.vec_rev32(22, 23);
+    a.vec_rev64(24, 25);
+    a.vec_clz(8, 26, 27);
+    a.vec_clz(16, 28, 29);
+    a.vec_clz(32, 30, 31);
+    a.vec_cnt(20, 21);
+    a.vec_uaddlp(8, 22, 23);
+    a.vec_uaddlp(16, 24, 25);
+    a.vec_uaddlp(32, 26, 27);
     a.fp_arith(FpOp::Add, Fp::S, 16, 17, 18);
     a.fp_arith(FpOp::Sub, Fp::D, 16, 17, 18);
     a.fp_arith(FpOp::Mul, Fp::S, 19, 20, 21);

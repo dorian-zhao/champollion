@@ -1852,6 +1852,89 @@ mod tests {
     }
 
     #[test]
+    fn vector_unary_ops_match_the_interpreter() {
+        fn check(
+            wf3: u32,
+            vtype: u32,
+            avl: u32,
+            bytes: usize,
+            sel: u32,
+            data: Vec<u8>,
+            translated: bool,
+        ) {
+            let vsetivli = |rd: u32, avl: u32, vtype: u32| {
+                (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57
+            };
+            let vle = |wf3: u32, vd: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vd << 7) | 0x07
+            };
+            let vse = |wf3: u32, vs3: u32, rs1: u32| {
+                (1 << 25) | (wf3 << 12) | (rs1 << 15) | (vs3 << 7) | 0x27
+            };
+            let vun = |sel: u32, vd: u32, vs2: u32| {
+                (0b010010 << 26)
+                    | (1 << 25)
+                    | (vs2 << 20)
+                    | (sel << 15)
+                    | (0b010 << 12)
+                    | (vd << 7)
+                    | 0x57
+            };
+            let prog =
+                [vsetivli(0, avl, vtype), vle(wf3, 1, 11), vun(sel, 2, 1), vse(wf3, 2, 12), ECALL];
+            let fill = |mem: &GuestMemory| mem.write_privileged(DATA, &data).unwrap();
+            let mem_i = setup(&prog);
+            fill(&mem_i);
+            let mut oracle = CpuState::new(CODE);
+            oracle.set_x(11, DATA);
+            oracle.set_x(12, DATA + 0x200);
+            let want = loop {
+                if let Err(t) = interpreter::step(&mut oracle, &mem_i) {
+                    break t;
+                }
+            };
+            let mem_j = setup(&prog);
+            fill(&mem_j);
+            let mut cpu = CpuState::new(CODE);
+            cpu.set_x(11, DATA);
+            cpu.set_x(12, DATA + 0x200);
+            let mut jit = Jit::new().unwrap();
+            let got = jit.run(&mut cpu, &mem_j);
+            assert_eq!(got, want);
+            assert_eq!(cpu, oracle, "VUnary state");
+            if translated {
+                assert_eq!(jit.stats.interpreted.get("VUnary"), None, "VUnary stays in the JIT");
+            }
+            let mut got_bytes = vec![0u8; bytes];
+            let mut want_bytes = vec![0u8; bytes];
+            mem_j.read_privileged(DATA + 0x200, &mut got_bytes).unwrap();
+            mem_i.read_privileged(DATA + 0x200, &mut want_bytes).unwrap();
+            assert_eq!(got_bytes, want_bytes, "VUnary result");
+        }
+
+        let e8: Vec<u8> = vec![
+            0, 1, 2, 3, 0x0f, 0x10, 0x55, 0x80, 0xaa, 0xfe, 0xff, 0x12, 0x34, 0x56, 0x78, 0x90,
+        ];
+        let e16: Vec<u8> = [0u16, 1, 0x00ff, 0x0100, 0x8000, 0xffff, 0x1234, 0xabcd]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let e32: Vec<u8> =
+            [0u32, 1, 0x8000_0000, 0xffff_ffff].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let e64: Vec<u8> =
+            [0u64, 0x8000_0000_0000_0001].iter().flat_map(|v| v.to_le_bytes()).collect();
+        for (sel, translated64) in
+            [(8, true), (9, true), (10, true), (12, true), (13, true), (14, true)]
+        {
+            check(0, 0xc0, 16, 16, sel, e8.clone(), true);
+            check(5, 0xc8, 8, 16, sel, e16.clone(), true);
+            check(6, 0xd0, 4, 16, sel, e32.clone(), true);
+            let translated = translated64 && sel != 12 && sel != 13;
+            check(7, 0xd8, 2, 16, sel, e64.clone(), translated);
+        }
+    }
+
+    #[test]
     fn vector_shift_sub_mul_match_the_interpreter() {
         let vsetivli = |rd: u32, avl: u32, vtype: u32| {
             (0b11 << 30) | (vtype << 20) | (avl << 15) | (0b111 << 12) | (rd << 7) | 0x57

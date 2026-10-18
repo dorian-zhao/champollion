@@ -1073,6 +1073,42 @@ impl Asm {
         assert!((1..=8).contains(&imm), "byte shift {imm}");
         self.emit(0x6f00_0400 | (16 - imm) << 16 | (rn as u32) << 5 | rd as u32);
     }
+    /// `rev16 v.16b`: reverse each 16-bit halfword's bytes.
+    pub fn vec_rev16(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e20_1800 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `rev32 v.16b`: reverse each 32-bit word's bytes.
+    pub fn vec_rev32(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x6e20_0800 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `rev64 v.16b`: reverse each 64-bit doubleword's bytes.
+    pub fn vec_rev64(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e20_0800 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `clz v.16b/8h/4s`: leading-zero count per element (no 2d form).
+    pub fn vec_clz(&mut self, bits: u32, rd: Reg, rn: Reg) {
+        let size = match bits {
+            8 => 0x0000_0000,
+            16 => 0x0040_0000,
+            32 => 0x0080_0000,
+            _ => panic!("vector clz has no {bits}-bit form"),
+        };
+        self.emit(0x6e20_4800 | size | (rn as u32) << 5 | rd as u32);
+    }
+    /// `cnt v.16b`: population count per byte.
+    pub fn vec_cnt(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0x4e20_5800 | (rn as u32) << 5 | rd as u32);
+    }
+    /// `uaddlp`: pairwise add long, widening 16b to 8h, 8h to 4s, or 4s to 2d.
+    pub fn vec_uaddlp(&mut self, from_bits: u32, rd: Reg, rn: Reg) {
+        let size = match from_bits {
+            8 => 0x0000_0000,
+            16 => 0x0040_0000,
+            32 => 0x0080_0000,
+            _ => panic!("uaddlp has no {from_bits}-bit source"),
+        };
+        self.emit(0x6e20_2800 | size | (rn as u32) << 5 | rd as u32);
+    }
     /// `sshr`: the sign-filling counterpart of `vec_ushr_imm`.
     pub fn vec_sshr_imm(&mut self, size: u32, rd: Reg, rn: Reg, imm: u32) {
         self.emit(0x4f00_0400 | (2 * size - imm) << 16 | (rn as u32) << 5 | rd as u32);

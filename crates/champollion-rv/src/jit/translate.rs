@@ -35,7 +35,7 @@ use crate::cpu::CpuState;
 use crate::decoder::{
     AluOp, AluOp32, AmoOp, AmoWidth, BranchCond, Csr, CsrOp, FArithOp, FCmpOp, FWidth, FmaOp, Inst,
     IntType, LoadWidth, RM_DYN, SgnjKind, StoreWidth, VArithOp, VCmpOp, VFArithOp, VFMaOp, VMaskOp,
-    VMemKind, VSel, VSetKind, VStoreKind,
+    VMemKind, VSel, VSetKind, VStoreKind, VUnaryOp,
 };
 use crate::memory::{
     CONTROL_OFFSET, FAST_RANGE_COUNT, FAST_RANGE_STRIDE, FAST_RANGES_OFFSET, GUARD_SIZE, GUEST_SIZE,
@@ -637,6 +637,11 @@ impl Tx {
             }
             Inst::VCmp { op, vd, vs2, src, mask } => {
                 if !self.vector_cmp(op, vd, vs2, src, mask) {
+                    return false;
+                }
+            }
+            Inst::VUnary { op, mask, vd, vs2 } => {
+                if !self.vector_unary(op, mask, vd, vs2) {
                     return false;
                 }
             }
@@ -2006,6 +2011,84 @@ impl Tx {
             }
             _ => false,
         }
+    }
+
+    /// Zvbb's single-source bit operations at m1 with a full `vl`.
+    fn vector_unary(&mut self, op: VUnaryOp, mask: bool, vd: u8, vs2: u8) -> bool {
+        let Some((_, bytes)) = self.vec else { return false };
+        if mask || self.vec_regs != 1 {
+            return false;
+        }
+        self.v_ldr(FA, vs2);
+        match op {
+            VUnaryOp::Rev8 => self.rev8_bytes(bytes, FA),
+            VUnaryOp::Brev8 => self.brev8(FA),
+            VUnaryOp::Brev => {
+                self.brev8(FA);
+                self.rev8_bytes(bytes, FA);
+            }
+            VUnaryOp::Clz => {
+                if bytes == 8 {
+                    return false; // NEON CLZ has no 2d form
+                }
+                self.a.vec_clz(bytes * 8, FA, FA);
+            }
+            VUnaryOp::Ctz => {
+                if bytes == 8 {
+                    return false;
+                }
+                self.brev8(FA);
+                self.rev8_bytes(bytes, FA);
+                self.a.vec_clz(bytes * 8, FA, FA);
+            }
+            VUnaryOp::Cpop => {
+                self.a.vec_cnt(FA, FA);
+                match bytes {
+                    1 => {}
+                    2 => self.a.vec_uaddlp(8, FA, FA),
+                    4 => {
+                        self.a.vec_uaddlp(8, FA, FA);
+                        self.a.vec_uaddlp(16, FA, FA);
+                    }
+                    8 => {
+                        self.a.vec_uaddlp(8, FA, FA);
+                        self.a.vec_uaddlp(16, FA, FA);
+                        self.a.vec_uaddlp(32, FA, FA);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        self.v_str(FA, vd);
+        true
+    }
+
+    /// Reverse bytes within each element (the `rev8` part of a `vrev8.v`).
+    fn rev8_bytes(&mut self, bytes: u32, r: Reg) {
+        match bytes {
+            1 => {}
+            2 => self.a.vec_rev16(r, r),
+            4 => self.a.vec_rev32(r, r),
+            8 => self.a.vec_rev64(r, r),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Reverse bits within every byte using a nibble table and NEON TBL.
+    fn brev8(&mut self, r: Reg) {
+        // Reverse-nibble table: [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15].
+        self.a.mov_imm(ADDR, 0x0e06_0a02_0c04_0800);
+        self.a.fmov_from_gpr(Fp::D, FB, ADDR);
+        self.a.mov_imm(ADDR, 0x0f07_0b03_0d05_0901);
+        self.a.fmov_from_gpr(Fp::D, FC, ADDR);
+        self.a.vec_ins_last(FB, FC, 8);
+        self.a.vec_shl_16b(FC, r, 4);
+        self.a.vec_ushr_16b(FC, FC, 4);
+        self.a.vec_ushr_16b(FR, r, 4);
+        self.a.vec_tbl(r, FB, FC);
+        self.a.vec_tbl(FC, FB, FR);
+        self.a.vec_shl_16b(r, r, 4);
+        self.a.vec_orr(r, r, FC);
     }
 
     /// A lane-wise unmasked arithmetic op, one NEON instruction per element width (the

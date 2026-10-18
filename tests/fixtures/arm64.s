@@ -108,6 +108,16 @@ extr x1, x2, x3, #1
 zip1 v16.16b, v17.16b, v18.16b
 shl v18.16b, v18.16b, #4
 ushr v19.16b, v19.16b, #4
+rev16 v20.16b, v21.16b
+rev32 v22.16b, v23.16b
+rev64 v24.16b, v25.16b
+clz v26.16b, v27.16b
+clz v28.8h, v29.8h
+clz v30.4s, v31.4s
+cnt v20.16b, v21.16b
+uaddlp v22.8h, v23.16b
+uaddlp v24.4s, v25.8h
+uaddlp v26.2d, v27.4s
 fadd s16, s17, s18
 fsub d16, d17, d18
 fmul s19, s20, s21
